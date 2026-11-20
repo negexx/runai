@@ -119,12 +119,21 @@ impl Diagnostic {
 /// The position is the start of the span: `path:line:col` points at where the
 /// problem is, not where the construct closes. Zero-width spans name their own
 /// position, which is what `RA012_MISSING_MODE` (`(0, 0)`) needs.
+///
+/// The span is a byte offset, which may land inside a multi-byte UTF-8
+/// character (transformed sources, `.tsx` text with non-ASCII JSX). Such an
+/// offset is floored to the nearest character boundary rather than slicing
+/// mid-character, which would panic. The column counts characters, not bytes,
+/// so non-ASCII earlier on the line does not inflate it.
 fn line_col(source: &str, span: (u32, u32)) -> (usize, usize) {
-    let start = (span.0 as usize).min(source.len());
+    let mut start = (span.0 as usize).min(source.len());
+    while start > 0 && !source.is_char_boundary(start) {
+        start -= 1;
+    }
     let before = &source[..start];
     let line = before.matches('\n').count() + 1;
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    (line, start - line_start + 1)
+    (line, before[line_start..].chars().count() + 1)
 }
 
 impl Serialize for Diagnostic {
@@ -235,6 +244,40 @@ mod tests {
     fn render_human_survives_spans_outside_the_source() {
         let out = sample().render_human("short", "a.tsx");
         assert!(out.contains("a.tsx:1:6"));
+    }
+
+    /// `é` is two bytes, so every byte offset after it is shifted by one.
+    const MULTIBYTE_SRC: &str = "const é = 1\n  const x = count()\n";
+
+    #[test]
+    fn render_human_counts_columns_in_characters() {
+        let mut diag = sample();
+        // Byte 13 starts line 2; `count` starts at byte 25, which is 12
+        // characters into line 2, so the 1-based column is 13.
+        diag.span = (25, 30);
+        let out = diag.render_human(MULTIBYTE_SRC, "src/multi.tsx");
+        assert!(out.starts_with("src/multi.tsx:2:13: error[RA001_UNTRACKED_READ]"));
+    }
+
+    #[test]
+    fn render_human_floors_spans_inside_a_multibyte_char() {
+        let mut diag = sample();
+        // Byte 7 is the second byte of `é` (bytes 6..8): not a char boundary.
+        // It floors to byte 6, so the column is that of `é`'s line, column 7.
+        diag.span = (7, 8);
+        let out = diag.render_human(MULTIBYTE_SRC, "src/multi.tsx");
+        assert!(out.starts_with("src/multi.tsx:1:7: error[RA001_UNTRACKED_READ]"));
+    }
+
+    #[test]
+    fn render_human_column_ignores_multibyte_width_on_the_same_line() {
+        let src = "  const é = count()\n";
+        let mut diag = sample();
+        // `count` starts at byte 13; a byte column would say 14, a character
+        // column says 13.
+        diag.span = (13, 18);
+        let out = diag.render_human(src, "src/same_line.tsx");
+        assert!(out.starts_with("src/same_line.tsx:1:13: error[RA001_UNTRACKED_READ]"));
     }
 
     #[test]
