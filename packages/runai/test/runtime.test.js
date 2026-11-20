@@ -256,14 +256,70 @@ test("a signal created in an owner stops retaining subscribers when disposed", (
   // subscriber that lives elsewhere. Disposal must make it release that edge.
   const stop = effect(() => { inner(); runs++ })
   expect(runs).toBe(1)
-  dispose()
-  inner(1)
-  expect(runs).toBe(1)
-  inner(2)
-  expect(runs).toBe(1)
+  // The write is deliberately a no-op; its dev warning is asserted by its own
+  // test, so silence it here rather than printing it as suite output.
+  const warn = console.warn
+  console.warn = () => {}
+  try {
+    dispose()
+    inner(1)
+    expect(runs).toBe(1)
+    inner(2)
+    expect(runs).toBe(1)
+  } finally {
+    console.warn = warn
+  }
   // A stale reference must not resurrect it either: the write is a no-op, so
   // the value it serves is still the one it had when its frame went away.
   expect(inner()).toBe(0)
+  stop()
+})
+
+test("a disposed signal is dropped from a live reader's deps, not just from its own subs", () => {
+  const deps = globalThis.__runaiDevDeps
+  expect(typeof deps).toBe("function")
+  const other = signal(0)
+  let inner
+  const dispose = owner(() => { inner = signal(0) })
+  let runs = 0
+  const stop = effect(() => { inner(); other(); runs++ })
+  expect(runs).toBe(1)
+  // The reader holds the signal in its own `deps` — the reverse edge. Clearing
+  // `node.subs` alone leaves this in place, and if the effect never reruns (a
+  // root-scope reader that only ever reads `other`) it pins `inner` — and, for a
+  // `<For>` row, the row's closure — for the reader's whole lifetime.
+  expect(deps(stop).includes(inner.node)).toBe(true)
+  dispose()
+  // No rerun in between: disposal itself must cut the reverse edge.
+  expect(runs).toBe(1)
+  expect(deps(stop).includes(inner.node)).toBe(false)
+  // And the reader still works: cutting the dead edge must not have unsubscribed
+  // it from the nodes that are still alive.
+  other(1)
+  expect(runs).toBe(2)
+  stop()
+})
+
+test("a write to a disposed signal is a dev warning, not a silent drop", () => {
+  let inner
+  const dispose = owner(() => { inner = signal(0) })
+  const stop = effect(() => { inner() })
+  const warn = console.warn
+  const seen = []
+  console.warn = (message) => seen.push(message)
+  try {
+    dispose()
+    inner(1)
+    // A teardown race must not crash: the write is still a no-op.
+    expect(inner()).toBe(0)
+  } finally {
+    console.warn = warn
+  }
+  // Silently dropping it would be undiagnosable, and this framework's product is
+  // diagnostics. One warning, naming the dev gate, no throw.
+  expect(seen.length).toBe(1)
+  expect(seen[0]).toMatch(/RUNAI_DEV/)
+  expect(seen[0]).toMatch(/disposed signal/)
   stop()
 })
 

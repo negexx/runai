@@ -43,6 +43,10 @@ if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
   // Disposer count of the frame currently running, for assertions made *inside*
   // an owner body, where its dispose function does not exist yet.
   globalThis.__runaiDevFrameStops = () => frame.stops.size
+  // The dependency nodes a live effect holds. Disposal must cut the *reverse*
+  // edge as well as the forward one, or a reader that never reruns pins the
+  // disposed node — and its `fn` — for its own lifetime.
+  globalThis.__runaiDevDeps = (stop) => (stop.node && stop.node.deps) || []
 }
 
 function openScope() {
@@ -88,15 +92,25 @@ function untrack(node) {
 // a derived created inside a row scope cannot keep that row's state alive in a
 // shared signal's `subs` after the row is gone.
 //
-// Disposal is terminal, not momentary: edges are dropped, but a surviving
-// reader still holds the node in its own `deps` and would re-add it to `subs`
-// on its next run via `track`. `dead` is what makes that impossible, and what
-// stops a disposed derived from recomputing on a later read.
+// Disposal is terminal, not momentary: edges are dropped in both directions, and
+// a surviving reader cannot re-add the node to `subs` on its next run via
+// `track`. `dead` is what makes that impossible, and what stops a disposed
+// derived from recomputing on a later read.
 function disposeNode(node) {
   if (node.dead) return
   node.dead = true
   if (node.deps) untrack(node)
-  if (node.subs) node.subs.clear()
+  // Cut the reverse edge too. Clearing `subs` stops the node notifying anyone,
+  // but a surviving reader still holds this node in its own `deps` — and if it
+  // never reruns it holds the node's `fn` (a `<For>` row's closure) forever.
+  // Disposal has to be terminal in both directions.
+  if (node.subs) {
+    for (const sub of node.subs) {
+      const i = sub.deps.indexOf(node)
+      if (i >= 0) sub.deps.splice(i, 1)
+    }
+    node.subs.clear()
+  }
 }
 
 // Register a node's release with the nearest frame, if that frame can ever be
@@ -215,8 +229,19 @@ export function signal(initial) {
       return node.value
     }
     // A disposed signal is inert: a surviving caller's stale reference must not
-    // resurrect it after its frame released it.
-    if (node.dead) return
+    // resurrect it after its frame released it. Defensible in production — a
+    // write to a released node is a teardown artefact, not a value error — but
+    // silently dropping it is undiagnosable, and this framework's product is
+    // diagnostics. Dev-only warning, not a throw: a teardown race must not turn
+    // into a crash.
+    if (node.dead) {
+      if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+        console.warn(
+          "RUNAI_DEV write to a disposed signal ignored: its owner was disposed, so this setter is stale. Move the write into a live scope's effect or handler.",
+        )
+      }
+      return
+    }
     const next = args[0]
     if (Object.is(next, node.value)) return
     node.value = next
@@ -272,6 +297,9 @@ export function effect(fn) {
     if (e.scope) disposeScope(e.scope)
   }
   parent.stops.add(stop)
+  // Dev-only handle for the tests' dependency probe, folded out of the measured
+  // bundle like every other dev check.
+  if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") stop.node = e
   try {
     execute(e)
   } catch (err) {
