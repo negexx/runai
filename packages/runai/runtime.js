@@ -32,6 +32,17 @@ const queue = new Set()
 if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
   globalThis.__runaiDevStops = () => root.stops.size
   globalThis.__runaiDevPropagate = () => propagations
+  // Subscriber count of a signal/derived node. Disposal must not merely cancel
+  // the edges it has now; a live reader must not be able to wire it back up.
+  globalThis.__runaiDevSubs = (accessor) =>
+    accessor.node && accessor.node.subs ? accessor.node.subs.size : 0
+  // Disposer count of an owner scope, so the owner-scope branch of `stop()` can
+  // be asserted directly instead of through the root tally.
+  globalThis.__runaiDevScopeStops = (dispose) =>
+    dispose.scope ? dispose.scope.stops.size : -1
+  // Disposer count of the frame currently running, for assertions made *inside*
+  // an owner body, where its dispose function does not exist yet.
+  globalThis.__runaiDevFrameStops = () => frame.stops.size
 }
 
 function openScope() {
@@ -60,7 +71,10 @@ function disposeScope(scope) {
 
 function track(node) {
   const t = tracker
-  if (!t || t.deps.includes(node)) return
+  // `node.dead` is what makes disposal terminal: a surviving reader may still
+  // hold this node in its `deps`, and without this check its next run would
+  // re-add the node to `subs`, resurrecting a disposed signal or derived.
+  if (!t || node.dead || t.deps.includes(node)) return
   t.deps.push(node)
   ;(node.subs || (node.subs = new Set())).add(t)
 }
@@ -73,7 +87,14 @@ function untrack(node) {
 // A disposed node forgets its own deps and stops retaining its subscribers, so
 // a derived created inside a row scope cannot keep that row's state alive in a
 // shared signal's `subs` after the row is gone.
+//
+// Disposal is terminal, not momentary: edges are dropped, but a surviving
+// reader still holds the node in its own `deps` and would re-add it to `subs`
+// on its next run via `track`. `dead` is what makes that impossible, and what
+// stops a disposed derived from recomputing on a later read.
 function disposeNode(node) {
+  if (node.dead) return
+  node.dead = true
   if (node.deps) untrack(node)
   if (node.subs) node.subs.clear()
 }
@@ -188,17 +209,24 @@ export function signal(initial) {
   // scope is released with that row: a disposed signal must stop retaining its
   // subscribers, and its closure must not outlive the frame.
   onDispose(() => disposeNode(node))
-  return (...args) => {
+  const read = (...args) => {
     if (args.length === 0) {
       track(node)
       return node.value
     }
+    // A disposed signal is inert: a surviving caller's stale reference must not
+    // resurrect it after its frame released it.
+    if (node.dead) return
     const next = args[0]
     if (Object.is(next, node.value)) return
     node.value = next
     propagate(node)
     flush()
   }
+  // Dev-only handle for the tests' subscriber-count probe, folded out of the
+  // measured bundle like every other dev check.
+  if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") read.node = node
+  return read
 }
 
 export function derived(fn) {
@@ -206,7 +234,7 @@ export function derived(fn) {
   // Same rule as `signal`: a derived created inside a row scope keeps the row's
   // state alive in a shared signal's `subs` set unless the frame can dispose it.
   onDispose(() => disposeNode(node))
-  return (...args) => {
+  const read = (...args) => {
     if (
       typeof process !== "undefined" &&
       process.env.NODE_ENV !== "production" &&
@@ -216,6 +244,9 @@ export function derived(fn) {
         "RUNAI_DEV derived is read-only: call the source signal's setter instead.",
       )
     }
+    // Terminal disposal: a disposed derived serves its last cached value and
+    // must neither recompute nor re-subscribe to the sources it was cut from.
+    if (node.dead) return node.cached
     // Subscribe before computing: if `fn` throws, the edge the reader needs to
     // be woken again must already exist. The residual limit is that the derived
     // only knows the deps it read before the throw, so a retry has to come from
@@ -224,6 +255,8 @@ export function derived(fn) {
     if (node.dirty) recompute(node)
     return node.cached
   }
+  if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") read.node = node
+  return read
 }
 
 export function effect(fn) {
@@ -262,7 +295,10 @@ export function owner(fn) {
   } finally {
     frame = prev
   }
-  return () => disposeScope(scope)
+  const dispose = () => disposeScope(scope)
+  if (typeof process !== "undefined" && process.env.NODE_ENV !== "production")
+    dispose.scope = scope
+  return dispose
 }
 
 // --- internals the emitter calls -------------------------------------------

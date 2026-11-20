@@ -261,7 +261,57 @@ test("a signal created in an owner stops retaining subscribers when disposed", (
   expect(runs).toBe(1)
   inner(2)
   expect(runs).toBe(1)
+  // A stale reference must not resurrect it either: the write is a no-op, so
+  // the value it serves is still the one it had when its frame went away.
+  expect(inner()).toBe(0)
   stop()
+})
+
+test("a disposed derived does not recompute or re-subscribe on a later read", () => {
+  const n = signal(1)
+  // A second signal the surviving reader also reads, so it can be woken without
+  // going through the disposed derived — that is the read that leaks.
+  const bump = signal(0)
+  const subs = globalThis.__runaiDevSubs
+  let computes = 0
+  let runs = 0
+  let d
+  const dispose = owner(() => { d = derived(() => { computes++; return n() }) })
+  const stop = effect(() => { bump(); runs++; d() })
+  expect([computes, runs]).toEqual([1, 1])
+  expect(subs(n)).toBe(1) // the derived subscribes to the source
+  expect(subs(d)).toBe(1) // and the surviving reader subscribes to the derived
+  dispose()
+  // Disposal severs the source edge and clears the derived's own subscribers.
+  expect(subs(n)).toBe(0)
+  expect(subs(d)).toBe(0)
+  // Wake the surviving reader. It still holds the disposed derived in `deps`,
+  // so its next run calls the accessor again: that read must not recompute the
+  // dead node and must not re-add it to the source's subscriber set.
+  bump(1)
+  expect(runs).toBe(2)
+  expect(computes).toBe(1)
+  expect(d()).toBe(1)
+  expect(computes).toBe(1)
+  expect(subs(n)).toBe(0)
+  expect(subs(d)).toBe(0)
+  stop()
+})
+
+test("a derived disposed while dirty serves its last value instead of recomputing", () => {
+  const n = signal(1)
+  let computes = 0
+  let d
+  const dispose = owner(() => { d = derived(() => { computes++; return n() }) })
+  expect(d()).toBe(1)
+  expect(computes).toBe(1)
+  // Dirty at disposal — the case the clean-at-disposal test cannot see. A
+  // momentary disposal would recompute here and serve 2.
+  n(2)
+  expect(computes).toBe(1)
+  dispose()
+  expect(d()).toBe(1)
+  expect(computes).toBe(1)
 })
 
 test("a stopped effect is not retained by the root scope", () => {
@@ -275,6 +325,71 @@ test("a stopped effect is not retained by the root scope", () => {
   // Every stop must remove itself from the frame's set: an island mount/dispose
   // cycle repeats this indefinitely, so growth here is a process-lifetime leak.
   expect(count()).toBe(base)
+})
+
+test("a stopped _on binding is not retained by the root scope", () => {
+  const count = globalThis.__runaiDevStops
+  const base = count()
+  const node = { addEventListener() {}, removeEventListener() {} }
+  const offs = []
+  for (let i = 0; i < 50; i++) offs.push(_on(node, "click", () => {}))
+  expect(count()).toBe(base + 50)
+  // `_on` returns a disposer the emitter is allowed to ignore. Ignoring it is
+  // fine (the owner covers it), but calling it must not leave the closure in the
+  // root frame — otherwise every island remount leaks 50 of them. Deleting an
+  // already-absent entry is idempotent, so the tally is the only way to see the
+  // difference between "removed" and "never registered".
+  for (const off of offs) off()
+  expect(count()).toBe(base)
+})
+
+test("a stopped effect is not retained by its owner scope", () => {
+  const rootCount = globalThis.__runaiDevStops
+  const scopeCount = globalThis.__runaiDevScopeStops
+  const frameStops = globalThis.__runaiDevFrameStops
+  // The non-root path is the one `<For>` rows take: a 50-row list inside one
+  // island scope must not accumulate closures in that scope either.
+  const n = signal(0)
+  let outer
+  let runs = 0
+  const dispose = owner(() => {
+    outer = effect(() => { n(); runs++ })
+  })
+  const rootBase = rootCount()
+  expect(runs).toBe(1)
+  // Stopping one effect while its owner is still alive must delete it from the
+  // scope it registered with, and from nowhere else.
+  outer()
+  expect(scopeCount(dispose)).toBe(0)
+  expect(rootCount()).toBe(rootBase)
+  n(1)
+  expect(runs).toBe(1)
+
+  // The same loop as the root test, but inside a live owner scope: rows that
+  // mount and unmount under one island must not accumulate in that scope, and
+  // the root tally must stay untouched by work that never registered there.
+  let live
+  const dispose2 = owner(() => {
+    const stops = []
+    for (let i = 0; i < 50; i++) stops.push(effect(() => {}))
+    expect(frameStops()).toBe(50)
+    for (const stop of stops) stop()
+    expect(frameStops()).toBe(0)
+    const node = { addEventListener() {}, removeEventListener() {} }
+    for (let i = 0; i < 50; i++) _on(node, "click", () => {})()
+    expect(frameStops()).toBe(0)
+    expect(rootCount()).toBe(rootBase)
+    live = effect(() => { n(); runs++ })
+  })
+  expect(scopeCount(dispose2)).toBe(1) // only `live` is still registered
+  // Disposing the owner disposes `live`, which deletes itself from the scope
+  // being walked, and must not grow either tally.
+  dispose2()
+  expect(scopeCount(dispose2)).toBe(0)
+  expect(rootCount()).toBe(rootBase)
+  const before = runs
+  n(2)
+  expect(runs).toBe(before)
 })
 
 test("an owner whose body throws still disposes what it created", () => {
@@ -397,30 +512,38 @@ test("_setAttr policy: null/undefined/false remove, everything else sets", () =>
 })
 
 test("_on binds a listener and is disposed by its owner", () => {
-  const handlers = new Map()
+  const handlers = new Set()
   const node = {
-    addEventListener: (name, handler) => handlers.set(name, handler),
-    removeEventListener: (name) => handlers.delete(name),
+    addEventListener: (name, handler) => handlers.add(handler),
+    removeEventListener: (name, handler) => handlers.delete(handler),
   }
   const seen = []
   const stop = owner(() => _on(node, "click", (event) => seen.push(event)))
-  handlers.get("click")(1)
+  handlers.forEach((handler) => handler(1))
   expect(seen).toEqual([1])
   stop()
   expect(handlers.size).toBe(0)
 })
 
 test("_on's own disposer removes the listener and is idempotent", () => {
-  const handlers = new Map()
+  const handlers = new Set()
+  let removed = 0
   const node = {
-    addEventListener: (name, handler) => handlers.set(name, handler),
-    removeEventListener: (name) => handlers.delete(name),
+    addEventListener: (name, handler) => handlers.add(handler),
+    removeEventListener: (name, handler) => {
+      removed++
+      handlers.delete(handler)
+    },
   }
-  const off = _on(node, "click", () => {})
+  const handler = () => {}
+  const off = _on(node, "click", handler)
   expect(handlers.size).toBe(1)
   off()
   expect(handlers.size).toBe(0)
-  // Stopping twice must not throw or resurrect the listener.
+  // Stopping twice must not throw or resurrect the listener, and must not run
+  // the teardown a second time: `stop.dead` is what makes the second call a
+  // no-op rather than a repeated `removeEventListener` + `stops.delete`.
   off()
   expect(handlers.size).toBe(0)
+  expect(removed).toBe(1)
 })
