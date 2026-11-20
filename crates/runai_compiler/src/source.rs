@@ -118,14 +118,22 @@ pub fn parse_tsx<'a>(
                     (span.start, span.end)
                 }),
                 message,
-                explain: format!(
-                    "The TSX parser rejected this file: {message}. The compiler reports the \
-                     parser's own words rather than guessing at what was meant.",
-                    message = diagnostic.message
-                ),
-                fix: "Rewrite the JSX so every tag closes and every attribute terminates: add the \
-                      missing `>` or `</tag>`, close any unterminated string inside an attribute, \
-                      and wrap adjacent sibling elements in a single parent element."
+                // No parser text here: `message` already carries it, and repeating it
+                // in the structured output would just say the same thing twice.
+                explain: "The parser rejected this file before it could be compiled. The compiler \
+                          reports the parser's own words in `message` instead of guessing at what \
+                          was meant, because a wrong guess sends the repair into the wrong part of \
+                          the file."
+                    .into(),
+                // The cause is not known: `parse_tsx` maps *every* parser diagnostic
+                // here, including non-JSX ones (`Cannot assign to this expression`).
+                // So the markup mistakes are offered as the usual causes in route
+                // files, not as the diagnosis.
+                fix: "Fix the syntax error the parser reported in `message`. In route files the \
+                      usual causes are an unclosed element, an unterminated string inside an \
+                      attribute, or adjacent sibling elements — add the missing `>` or closing \
+                      element, close the attribute string, or wrap the siblings in one parent \
+                      element."
                     .into(),
                 doc: Code::RA007.skill_file(),
                 patch: None,
@@ -162,15 +170,41 @@ fn raw_text(source: &str, span: Span) -> Option<&str> {
     source.get(span.start as usize..span.end as usize)
 }
 
-/// One leading and one trailing quote character removed, if present.
+/// Strip one pair of matching quote delimiters, if the text has one.
 ///
 /// The `body` fallback reads source text rather than Oxc's hoisted `directive`
 /// field, so it has to remove the delimiters itself to be quote-insensitive.
+/// Two deliberate rules:
+///
+/// - A failed trailing-quote check returns the *prefix-stripped* string, never
+///   `raw`. Returning `raw` would undo a successful prefix strip and hand back the
+///   still-quoted text — exactly the quote sensitivity this is meant to remove.
+/// - A mismatched pair (`"use static'`) is not a quoted string, so nothing is
+///   stripped: one quote alone is not a delimiter.
 fn strip_quotes(raw: &str) -> &str {
-    raw.strip_prefix(['"', '\''])
-        .unwrap_or(raw)
-        .strip_suffix(['"', '\''])
-        .unwrap_or(raw)
+    let Some(open) = raw
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|byte| matches!(byte, b'"' | b'\''))
+    else {
+        return raw;
+    };
+
+    let inner = &raw[1..];
+    match inner.as_bytes().last().copied() {
+        Some(close) if close == b'"' || close == b'\'' => {
+            if close == open {
+                &inner[..inner.len() - 1]
+            } else {
+                // Mismatched pair: not a quoted string, so strip nothing.
+                raw
+            }
+        }
+        // A one-sided quote is not a literal, but a prefix strip that did happen
+        // must not be undone.
+        _ => inner,
+    }
 }
 
 #[cfg(test)]
@@ -238,11 +272,12 @@ mod tests {
         assert!(errs[0].span.0 > 0, "span should point into the file");
     }
 
-    /// `explain` must carry the parser's own message, not only prose about JSX, so
-    /// a non-JSX syntax error still tells the agent what actually broke. The
-    /// expected text is read from a separate raw parse, not from our own output.
+    /// `message` is where the parser's own words live. A non-JSX syntax error must
+    /// still tell the agent what actually broke, and `explain` must not repeat the
+    /// same sentence in the same JSON object. The expected text is read from a
+    /// separate raw parse, not from our own output.
     #[test]
-    fn ra007_explain_carries_the_parser_message() {
+    fn ra007_message_carries_the_parser_message() {
         let alloc = oxc_allocator::Allocator::default();
         let src = "const a = <div>;\n";
 
@@ -256,10 +291,94 @@ mod tests {
 
         let errs = parse_tsx(&alloc, src).unwrap_err();
         assert!(
-            errs[0].explain.contains(&parser_message),
-            "explain did not carry the parser message {parser_message:?}: {:?}",
+            errs[0].message.contains(&parser_message),
+            "message did not carry the parser message {parser_message:?}: {:?}",
+            errs[0].message
+        );
+        assert!(
+            !errs[0].explain.contains(&parser_message),
+            "explain duplicates the parser message inside one diagnostic: {:?}",
             errs[0].explain
         );
+    }
+
+    /// `parse_tsx` maps every parser diagnostic to `RA007`, so the advice must not
+    /// assert a JSX cause. Oxc on `1 = 2` says `Cannot assign to this expression`
+    /// (verified by running); an unclosed-tag hunt would be a wasted repair round.
+    #[test]
+    fn non_jsx_parser_error_gets_honest_advice() {
+        let alloc = oxc_allocator::Allocator::default();
+        // Verified: Oxc reports `Cannot assign to this expression` for this fixture.
+        let src = "const a = 1 = 2;\n";
+        let errs = parse_tsx(&alloc, src).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, Code::RA007);
+        assert!(
+            errs[0].message.contains("Cannot assign to this expression"),
+            "message did not carry the parser's own words: {:?}",
+            errs[0].message
+        );
+        assert!(
+            !errs[0].fix.contains("tag"),
+            "fix asserts a JSX cause for a non-JSX error: {:?}",
+            errs[0].fix
+        );
+    }
+
+    /// The unlabelled branch is reachable: Oxc's nested-`ParserDiagnostic`
+    /// constructors `file_appears_to_be_binary()` and `overlong_source()` attach no
+    /// label at all. `U+FFFD` triggers the first one (verified by running). A NUL
+    /// byte does *not* — it is `Invalid Character` with a label — so the fixture is
+    /// the replacement character, not a NUL.
+    #[test]
+    fn unlabelled_diagnostic_says_it_has_no_location() {
+        let alloc = oxc_allocator::Allocator::default();
+        let src = "const a = \u{FFFD};\n";
+        let errs = parse_tsx(&alloc, src).unwrap_err();
+        assert_eq!(errs[0].code, Code::RA007);
+        assert!(
+            errs[0].message.contains("parser gave no source location"),
+            "unlabelled diagnostic claimed a location: {:?}",
+            errs[0].message
+        );
+        assert_eq!(errs[0].span, (0, 0));
+    }
+
+    /// When a diagnostic carries several labels, the span must be the primary one.
+    /// Oxc's `'extends' clause must precede 'implements' clause` is such a case and
+    /// does fire under `SourceType::tsx()`; the primary label is the *second* one
+    /// and covers `extends` (bytes 21..28), not the earlier `implements`.
+    #[test]
+    fn ra007_prefers_the_primary_label() {
+        let alloc = oxc_allocator::Allocator::default();
+        let src = "class A implements B extends C {}\n";
+        let errs = parse_tsx(&alloc, src).unwrap_err();
+        assert!(
+            errs[0].message.contains("must precede"),
+            "unexpected parser message: {:?}",
+            errs[0].message
+        );
+        assert_eq!(errs[0].span, (21, 28));
+        assert_eq!(&src[21..28], "extends");
+    }
+
+    /// `strip_quotes` must not fall back to `raw` after a successful prefix strip,
+    /// and must not accept mismatched delimiters.
+    #[test]
+    fn strip_quotes_is_symmetric_and_forgiving_of_one_sided_input() {
+        assert_eq!(strip_quotes("\"use static\""), "use static");
+        assert_eq!(strip_quotes("'use static'"), "use static");
+        // Prefix strips, suffix fails: keep the stripped form, not the quoted raw.
+        assert_eq!(strip_quotes("\"use static"), "use static");
+        assert_eq!(strip_quotes("'use static"), "use static");
+        // Mismatched delimiters are not a quoted string, so nothing is stripped.
+        assert_eq!(strip_quotes("\"use static'"), "\"use static'");
+        assert_eq!(strip_quotes("'use static\""), "'use static\"");
+        // Degenerate inputs must not panic or slice off a char boundary.
+        assert_eq!(strip_quotes(""), "");
+        // A lone opening quote is still stripped by the prefix rule, as it was before.
+        assert_eq!(strip_quotes("\""), "");
+        assert_eq!(strip_quotes("x"), "x");
     }
 
     /// `Directive::directive` is documented as the raw content with escapes left
