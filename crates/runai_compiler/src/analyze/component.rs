@@ -8,15 +8,36 @@
 //! function and validating the wrong thing.
 //!
 //! The route component must be a component — a function that returns JSX — and
-//! it must accept no props, because the route owns its own render and has no
-//! parent to supply anything.
+//! it must take at most one parameter, because that single parameter is the
+//! route's props object. The router supplies nothing, so a second parameter can
+//! never be filled.
 
 use oxc_ast::ast::{
-    ArrowFunctionBody, ExportDefaultDeclarationKind, Expression, Function, Program, Statement,
+    ArrowFunctionBody, ExportDefaultDeclaration, ExportDefaultDeclarationKind, Expression,
+    Function, Program, Statement,
 };
 use oxc_span::GetSpan;
 
 use crate::diagnostic::{Code, Diagnostic, Severity};
+
+/// Whether the default export is a function this milestone can analyze.
+///
+/// This distinction is load-bearing for `RA011`: "there is no default export" and
+/// "the default export is not a component" need different messages and different
+/// repairs. Telling an agent to add a default export when one already exists
+/// sends it into a duplicate-export parse error, which is the repair loop this
+/// diagnostic exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentKind {
+    /// A function declaration, function expression, or arrow function (possibly
+    /// parenthesized), or an identifier/`export { X as default }` that resolves
+    /// to one of those in the same file.
+    Function,
+    /// `export default` exists, but is not a function: a class, a literal, a
+    /// call, or an identifier that cannot be resolved in this file (an import or
+    /// a re-export from another module).
+    NotAFunction,
+}
 
 /// The shape of the route's default-exported component.
 ///
@@ -25,7 +46,13 @@ use crate::diagnostic::{Code, Diagnostic, Severity};
 /// program to answer them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentInfo<'a> {
-    /// The function's own name, or `"default"` when it is anonymous.
+    /// Whether the default export is a function at all. When it is
+    /// [`ComponentKind::NotAFunction`], every other field is meaningless: there
+    /// is no parameter list and no body to report, and the caller's only job is
+    /// to emit the "existing export is not a component" repair.
+    pub kind: ComponentKind,
+    /// The function's own name, `"default"` when it is anonymous, or the exported
+    /// identifier when [`ComponentKind::NotAFunction`] and one could be named.
     pub name: &'a str,
     /// How many declared parameters it takes, including a rest parameter.
     ///
@@ -44,6 +71,18 @@ pub struct ComponentInfo<'a> {
     /// body. A concise arrow body (`() => <p/>`) has no `FunctionBody` node, so
     /// this is the expression's span instead.
     pub body_span: (u32, u32),
+    /// Whether the default export *is* the function literal, rather than a name
+    /// exported as default.
+    ///
+    /// `export default function Page(props) {…}` and `export default (props) =>
+    /// …` are inline: the fix text may say `export default function Page(…)`
+    /// because there is nothing to add — the existing declaration is the one to
+    /// edit. `export default Page` and `export { Page as default }` are not:
+    /// there the function is declared elsewhere and already exported, so a fix
+    /// that says `export default …` would tell an agent to write a **second**
+    /// default export, which is a parse error. Only meaningful when
+    /// [`kind`](Self::kind) is [`ComponentKind::Function`].
+    pub inline_default: bool,
     /// Whether some `return` statement in the body returns JSX directly.
     ///
     /// Deliberately syntactic, not dataflow: a body that returns an identifier
@@ -59,64 +98,262 @@ pub struct ComponentInfo<'a> {
     /// as a missing component would be false.
     ///
     /// Only the top level of the body is scanned (`body.statements`), not nested
-    /// blocks: `if (x) return <p/>` is not detected.
+    /// blocks: `if (x) return <p/>`, a `switch` arm, or a `try` block is not
+    /// detected.
     pub returns_jsx: bool,
 }
 
-impl ComponentInfo<'_> {
+impl<'a> ComponentInfo<'a> {
     /// Whether this component may render as a route: at most one parameter and
     /// it returns JSX.
     fn is_route_component(&self) -> bool {
         self.params <= 1 && self.returns_jsx
     }
-}
 
-/// Find the route component in `program`: the default export, when it is a
-/// function.
-///
-/// Returns `None` when the file has no default export, or when the default
-/// export is not a function this milestone can analyze (a class, a component
-/// imported and re-exported, a plain object). Both are `RA011` at the caller,
-/// which is correct: a route whose default export is `export default {…}` has no
-/// route component either.
-pub fn find_route_component<'a>(program: &'a Program<'a>) -> Option<ComponentInfo<'a>> {
-    program.body.iter().find_map(|statement| match statement {
-        Statement::ExportDefaultDeclaration(declaration) => {
-            component_from_default(&declaration.declaration)
+    /// A legal identifier for this component in diagnostic text.
+    ///
+    /// An anonymous component's [`name`](Self::name) is `"default"`, which names
+    /// the export, not a binding: `function default(props) { ... }` is a parse
+    /// error because `default` is a reserved word. Emitting that verbatim sends
+    /// an agent following the fix into a syntax error it cannot interpret, so the
+    /// conventional route component name stands in.
+    pub fn display_name(&self) -> &'a str {
+        if self.name == "default" {
+            "Page"
+        } else {
+            self.name
         }
-        _ => None,
-    })
+    }
+
+    /// The same summary, marked as reached through a name rather than an inline
+    /// `export default function …`.
+    fn not_inline(mut self) -> Self {
+        self.inline_default = false;
+        self
+    }
 }
 
-/// Summarize one `export default …` declaration, if it is a function.
+/// Find the route component in `program`: its default export.
+///
+/// Returns `None` only when the file has no default export at all. When one
+/// exists but is not a function ([`ComponentKind::NotAFunction`]), a summary is
+/// still returned: presence and absence are different mistakes with different
+/// repairs, and telling an agent to add an export that already exists produces a
+/// duplicate-default-export parse error.
+pub fn find_route_component<'a>(program: &'a Program<'a>) -> Option<ComponentInfo<'a>> {
+    for statement in &program.body {
+        match statement {
+            Statement::ExportDefaultDeclaration(declaration) => {
+                return Some(component_from_default(program, declaration));
+            }
+            // `export { Page as default }`
+            Statement::ExportNamedDeclaration(declaration) => {
+                if let Some(info) = component_from_specifiers(program, &declaration.specifiers) {
+                    return Some(info);
+                }
+            }
+            // `export { Page as default } from "./page"`: a default export that
+            // lives in another module. The export exists, but its shape is not in
+            // this file, so it cannot be analyzed — and it must not be resolved
+            // against a *local* `Page`, which is a different binding.
+            Statement::ExportFromDeclaration(declaration) => {
+                if let Some(specifier) = default_specifier(&declaration.specifiers) {
+                    let local = specifier.local.name().as_str();
+                    return Some(not_a_component(local, specifier.span));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Summarize one `export default …` declaration.
+///
+/// Every accepted shape produces a summary: a function literal one describing the
+/// function, anything else [`ComponentKind::NotAFunction`]. `None` is not an
+/// option here because the export exists — only its shape varies.
 fn component_from_default<'a>(
-    declaration: &'a ExportDefaultDeclarationKind<'a>,
-) -> Option<ComponentInfo<'a>> {
-    match declaration {
+    program: &'a Program<'a>,
+    declaration: &'a ExportDefaultDeclaration<'a>,
+) -> ComponentInfo<'a> {
+    match &declaration.declaration {
         // `export default function Page(props) {…}`, the anonymous
         // `export default function (props) {…}` (the same node with no `id`),
         // and a function *expression*. Oxc has separate variants for the
         // declaration and expression forms, but they summarize identically.
         ExportDefaultDeclarationKind::FunctionDeclaration(function)
         | ExportDefaultDeclarationKind::FunctionExpression(function) => {
-            Some(component_from_function(function))
+            component_from_function(function, true)
         }
         // `export default (props) => <p/>`
         ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-            Some(component_from_arrow(arrow))
+            component_from_arrow(arrow, true)
         }
-        // `export default (props => <p/>)` and `export default (function (…) {…})`:
-        // parentheses are not part of the function, but they are part of the
-        // AST shape the parser produces (verified on 0.159.0), so unwrap them
-        // rather than calling a parenthesized component "missing".
+        // `export default (function Page() {…})`, `export default ((props) => …)`
+        // and `export default (Page)`: parentheses are not part of the function,
+        // but they are part of the AST shape the parser produces (verified on
+        // 0.159.0), so unwrap them rather than calling it "not a component".
         ExportDefaultDeclarationKind::ParenthesizedExpression(parenthesized) => {
-            match &parenthesized.expression {
-                Expression::ArrowFunctionExpression(arrow) => Some(component_from_arrow(arrow)),
-                Expression::FunctionExpression(function) => Some(component_from_function(function)),
-                _ => None,
-            }
+            component_from_expression(program, &parenthesized.expression, true, &mut Vec::new())
+        }
+        // `export default Page`: a valid route when `Page` is a component
+        // declared in this file. Resolving it is a body scan, not dataflow — if
+        // it is declared here we can summarize it exactly, and if it is imported
+        // we must not guess what it is.
+        //
+        // Resolved or not, the export is a *name*, not an inline declaration:
+        // the fix may not tell the agent to write `export default …` again.
+        ExportDefaultDeclarationKind::Identifier(identifier) => {
+            resolve_local(program, identifier.name.as_str())
+                .map(|info| info.not_inline())
+                .unwrap_or_else(|| not_a_component(identifier.name.as_str(), identifier.span))
+        }
+        // `export default 42`, `export default class X {}`, `export default
+        // pageFactory()`: an export, but nothing that renders.
+        other => not_a_component("default", other.span()),
+    }
+}
+
+/// Summarize a parenthesized default-export expression by what is inside it.
+///
+/// `inline_default` says whether the expression *is* the default export (it is,
+/// when this is reached from an `export default (…)`) or merely the initializer
+/// of a name that some export refers to.
+fn component_from_expression<'a>(
+    program: &'a Program<'a>,
+    expression: &'a Expression<'a>,
+    inline_default: bool,
+    seen: &mut Vec<&'a str>,
+) -> ComponentInfo<'a> {
+    match expression {
+        Expression::ArrowFunctionExpression(arrow) => component_from_arrow(arrow, inline_default),
+        Expression::FunctionExpression(function) => {
+            component_from_function(function, inline_default)
+        }
+        Expression::ParenthesizedExpression(parenthesized) => {
+            component_from_expression(program, &parenthesized.expression, inline_default, seen)
+        }
+        Expression::Identifier(identifier) => {
+            resolve_local_inner(program, identifier.name.as_str(), seen)
+                .unwrap_or_else(|| not_a_component(identifier.name.as_str(), identifier.span))
+        }
+        other => not_a_component("default", other.span()),
+    }
+}
+
+/// Summarize `export { X as default }` when the specifiers include one.
+///
+/// `Page` is resolved in this file the same way `export default Page` is. A
+/// re-export (`export { Page as default } from "./page"`) is handled separately:
+/// its binding is imported, not this file's `Page`.
+fn component_from_specifiers<'a>(
+    program: &'a Program<'a>,
+    specifiers: &'a oxc_allocator::Vec<'a, oxc_ast::ast::ExportSpecifier<'a>>,
+) -> Option<ComponentInfo<'a>> {
+    let specifier = default_specifier(specifiers)?;
+    let local = specifier.local.name().as_str();
+    Some(
+        resolve_local(program, local)
+            .map(|info| info.not_inline())
+            .unwrap_or_else(|| not_a_component(local, specifier.span)),
+    )
+}
+
+/// The specifier exported as `default`, if there is one.
+fn default_specifier<'a>(
+    specifiers: &'a oxc_allocator::Vec<'a, oxc_ast::ast::ExportSpecifier<'a>>,
+) -> Option<&'a oxc_ast::ast::ExportSpecifier<'a>> {
+    specifiers
+        .iter()
+        .find(|specifier| specifier.exported.name().as_str() == "default")
+}
+
+/// Resolve a name to a function declared in this file, if it is one.
+///
+/// Handles `function Page() {…}`, `const Page = () => …`, `const Page =
+/// function () {…}`, and parenthesized forms of those. This is a scan of
+/// `program.body`, not scope analysis: a name shadowed inside a block cannot be
+/// what a module-level export refers to, so the top level is the right place to
+/// look. A name declared by an import or a re-export is deliberately unresolved —
+/// its shape lives in another file.
+///
+/// The scan is order-insensitive on purpose. `export default Page` above `const
+/// Page = …` is a runtime `ReferenceError` (the binding is in its temporal dead
+/// zone), and a function declaration is hoisted, so a strict reading would
+/// resolve one and not the other. This milestone's question is "is this route a
+/// component?", and answering "it resolves to a component" for both is the
+/// useful answer: the ordering bug is a JavaScript error the parser cannot be
+/// asked about here, and it is not what `RA011` exists to report.
+fn resolve_local<'a>(program: &'a Program<'a>, name: &'a str) -> Option<ComponentInfo<'a>> {
+    resolve_local_inner(program, name, &mut Vec::new())
+}
+
+/// [`resolve_local`], tracking the names already followed.
+///
+/// `const Page = Page` and `const Page = (Page)` resolve a name to itself. Without
+/// the guard they recurse until the stack overflows; a self-reference is not a
+/// component, so it resolves to `None` and the caller reports the export as
+/// unanalyzable instead of crashing.
+fn resolve_local_inner<'a>(
+    program: &'a Program<'a>,
+    name: &'a str,
+    seen: &mut Vec<&'a str>,
+) -> Option<ComponentInfo<'a>> {
+    if seen.contains(&name) {
+        return None;
+    }
+    seen.push(name);
+
+    program.body.iter().find_map(|statement| match statement {
+        Statement::FunctionDeclaration(function) => function
+            .id
+            .as_ref()
+            .filter(|identifier| identifier.name == name)
+            .map(|_| component_from_function(function, false)),
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().find_map(|declarator| {
+                if !declarator
+                    .id
+                    .get_identifier_name()
+                    .is_some_and(|identifier| identifier.as_str() == name)
+                {
+                    return None;
+                }
+                match declarator.init.as_ref()? {
+                    Expression::ArrowFunctionExpression(arrow) => {
+                        Some(component_from_arrow(arrow, false))
+                    }
+                    Expression::FunctionExpression(function) => {
+                        Some(component_from_function(function, false))
+                    }
+                    Expression::ParenthesizedExpression(parenthesized) => Some(
+                        component_from_expression(program, &parenthesized.expression, false, seen),
+                    ),
+                    _ => None,
+                }
+            })
         }
         _ => None,
+    })
+}
+
+/// A default export that exists but is not a function this milestone can render.
+fn not_a_component<'a>(name: &'a str, span: oxc_span::Span) -> ComponentInfo<'a> {
+    ComponentInfo {
+        kind: ComponentKind::NotAFunction,
+        name,
+        // No function, so no parameters and no return: these fields are only
+        // read for `ComponentKind::Function`, and are stated as zero rather
+        // than fabricated from a call's arguments or a class's constructor.
+        params: 0,
+        has_props_type: false,
+        // Point at the export itself rather than an absent body, so the agent
+        // sees which declaration to replace.
+        body_span: span_of(span),
+        returns_jsx: false,
+        // There is no inline component to edit; the fix must say "replace".
+        inline_default: false,
     }
 }
 
@@ -124,6 +361,7 @@ fn component_from_default<'a>(
 /// expression.
 fn component_from_arrow<'a>(
     arrow: &'a oxc_ast::ast::ArrowFunctionExpression<'a>,
+    inline_default: bool,
 ) -> ComponentInfo<'a> {
     let returns_jsx = match &arrow.body {
         // `(props) => <p/>`: the JSX is the body, there is no `return` to find.
@@ -136,19 +374,25 @@ fn component_from_arrow<'a>(
     };
 
     ComponentInfo {
+        kind: ComponentKind::Function,
         name: "default",
         params: param_count(&arrow.params),
         has_props_type: has_single_annotated_param(&arrow.params),
         body_span: span_of(arrow.body.span()),
         returns_jsx,
+        inline_default,
     }
 }
 
 /// Summarize a [`Function`] node (declaration or expression).
-fn component_from_function<'a>(function: &'a Function<'a>) -> ComponentInfo<'a> {
+fn component_from_function<'a>(
+    function: &'a Function<'a>,
+    inline_default: bool,
+) -> ComponentInfo<'a> {
     let body = function.body.as_deref();
 
     ComponentInfo {
+        kind: ComponentKind::Function,
         // An anonymous function is still exported as `default`.
         name: function
             .id
@@ -163,6 +407,7 @@ fn component_from_function<'a>(function: &'a Function<'a>) -> ComponentInfo<'a> 
             None => span_of(function.span),
         },
         returns_jsx: body.is_some_and(|body| returns_jsx(body.statements.iter())),
+        inline_default,
     }
 }
 
@@ -225,15 +470,23 @@ fn span_of(span: oxc_span::Span) -> (u32, u32) {
 
 /// Validate the route component's export shape.
 ///
-/// Three separate questions, one code, because they have one repair shape —
-/// "make the default export a component":
+/// Four separate questions, one code, because they have one theme — "the default
+/// export is not a route component":
 ///
 /// - there is no default export at all,
-/// - the default export takes more than the no props a route may take,
-/// - the default export does not return JSX.
+/// - the default export is not a function this milestone can analyze,
+/// - the default export takes more parameters than a route can be given,
+/// - the default export does not return JSX directly.
+///
+/// Presence and absence are deliberately separate branches: their repairs differ,
+/// and telling an agent to add a default export that already exists produces a
+/// duplicate-export parse error.
 pub fn validate_route_component(info: Option<&ComponentInfo>) -> Vec<Diagnostic> {
     match info {
         None => vec![missing_component()],
+        Some(info) if info.kind == ComponentKind::NotAFunction => {
+            vec![existing_export_is_not_a_component(info)]
+        }
         Some(info) if info.is_route_component() => Vec::new(),
         Some(info) if info.params > 1 => vec![too_many_params(info)],
         Some(info) => vec![does_not_return_jsx(info)],
@@ -267,18 +520,19 @@ fn too_many_params(info: &ComponentInfo) -> Diagnostic {
         severity: Severity::Error,
         span: info.body_span,
         message: format!(
-            "route component `{name}` takes {params} parameters, but a route takes no props",
-            name = info.name,
+            "route component `{name}` takes {params} parameters, but a route takes at most one \
+             annotated `props` parameter",
+            name = info.display_name(),
             params = info.params,
         ),
-        explain: "A route is rendered by the router, not by a parent component, so nothing can \
-                  supply props. Data a route needs must be read inside the route rather than \
-                  passed into it."
+        explain: "A route is rendered by the router, not by a parent component, so the only value \
+                  that can reach it is its props object. A second parameter can never be filled, \
+                  and data the route needs must be read inside the route."
             .into(),
         fix: format!(
-            "Drop the extra parameters so `{name}` takes at most one, annotated \
-             `props: Record<never, never>`.",
-            name = info.name,
+            "Drop the extra parameters so `{name}` takes at most one annotated \
+             `props: Record<never, never>` parameter.",
+            name = info.display_name(),
         ),
         doc: Code::RA011.skill_file(),
         patch: None,
@@ -291,19 +545,63 @@ fn does_not_return_jsx(info: &ComponentInfo) -> Diagnostic {
         code: Code::RA011,
         severity: Severity::Error,
         span: info.body_span,
+        // "directly" is load-bearing: the component may well return JSX through
+        // a variable or a conditional. Only a direct `return <…/>` is recognized
+        // in this milestone, and the message must not assert what it cannot see.
         message: format!(
-            "route component `{name}` does not return JSX",
-            name = info.name
+            "route component `{name}` does not return JSX directly",
+            name = info.display_name()
         ),
-        explain: "A component is a function that returns JSX. Returning a value, a conditional, \
-                  or calling a renderer is not a component in this milestone, and the compiler \
-                  does not guess where a returned value's JSX comes from."
+        explain: "A component is a function that returns JSX. Only a direct `return <…/>` is \
+                  recognized in this milestone: a returned identifier, conditional, call, array, \
+                  or a `return` nested inside an `if` is not followed, because resolving what a \
+                  value renders requires type information this compiler does not have yet. The \
+                  repair is to return JSX from the component body itself, not to hunt for a bug \
+                  in the returned value."
             .into(),
         fix: format!(
             "Return JSX directly from `{name}`, e.g. `return <main>...</main>`, so the router \
              has markup to render.",
-            name = info.name,
+            name = info.display_name(),
         ),
+        doc: Code::RA011.skill_file(),
+        patch: None,
+    }
+}
+
+/// `RA011_BAD_ROUTE_EXPORT`: a default export exists, but it is not a component.
+///
+/// The repair must never say "add a default export": one already exists, and a
+/// second is a parse error. It says to replace the existing one instead.
+///
+/// The message claims only what is known. A class, a literal and a call are not
+/// functions, but an identifier may name a component imported from another
+/// module, which this milestone cannot see — so "not a component this compiler
+/// can analyze" rather than "is not a component".
+fn existing_export_is_not_a_component(info: &ComponentInfo) -> Diagnostic {
+    let message = if info.name == "default" {
+        "route file's default export is not a component the compiler can analyze".to_string()
+    } else {
+        format!(
+            "route file's default export `{name}` is not a component the compiler can analyze",
+            name = info.name,
+        )
+    };
+
+    Diagnostic {
+        code: Code::RA011,
+        severity: Severity::Error,
+        span: info.body_span,
+        message,
+        explain: "A page file's default export must be the route component — a function that \
+                  returns JSX. A class, a literal, a call, or a component imported from another \
+                  module is not analyzed as a component in this milestone, and the compiler does \
+                  not guess what a value declared elsewhere renders."
+            .into(),
+        fix: "Replace the existing default export with a component instead of declaring a second \
+              default export: `export default function Page(props: Record<never, never>) { ... }` \
+              returning JSX."
+            .into(),
         doc: Code::RA011.skill_file(),
         patch: None,
     }
@@ -421,17 +719,58 @@ mod tests {
         assert!(codes.is_empty());
     }
 
-    /// A default export that is not a function is not a route component.
+    /// A default export that is not a function is present but unanalyzable: the
+    /// diagnostic must say the existing export is the problem, not that one is
+    /// missing. Telling an agent to add a default export here produces a
+    /// duplicate-export parse error.
     #[test]
-    fn non_function_default_export_is_none() {
+    fn non_function_default_export_is_reported_as_not_a_component() {
+        for src in [
+            "export default 42\n",
+            "export default class Page {}\n",
+            "export default pageFactory()\n",
+            // An identifier that this file does not declare: it is imported, so
+            // its shape lives elsewhere and guessing would be a lie.
+            "export default Page\n",
+        ] {
+            let alloc = Allocator::default();
+            let (info, codes) = analyze(&alloc, src);
+            let info = info.expect("the export exists, so a summary is returned");
+            assert_eq!(info.kind, ComponentKind::NotAFunction, "{src}");
+            assert_eq!(codes, vec![Code::RA011], "{src}");
+        }
+    }
+
+    /// The two `RA011` repairs are different, and the difference is the whole
+    /// point: absent says "add", present-but-wrong must not.
+    #[test]
+    fn an_existing_export_is_never_told_to_add_one() {
         let alloc = Allocator::default();
-        let (info, codes) = analyze(&alloc, "export default 42\n");
-        assert!(info.is_none());
-        assert_eq!(codes, vec![Code::RA011]);
+        let program = parse_tsx(&alloc, "export default 42\n").unwrap();
+        let info = find_route_component(program);
+        let diagnostic = &validate_route_component(info.as_ref())[0];
+        assert!(!diagnostic.fix.contains("Add "), "{:?}", diagnostic.fix);
+        assert!(
+            diagnostic
+                .fix
+                .contains("Replace the existing default export"),
+            "{:?}",
+            diagnostic.fix
+        );
+        assert!(
+            !diagnostic
+                .message
+                .contains("has no default-exported component"),
+            "{:?}",
+            diagnostic.message
+        );
 
         let alloc = Allocator::default();
-        let (info, _) = analyze(&alloc, "export default class Page {}\n");
+        let program = parse_tsx(&alloc, "export function Page() { return <p/> }\n").unwrap();
+        let info = find_route_component(program);
+        let diagnostic = &validate_route_component(info.as_ref())[0];
         assert!(info.is_none());
+        assert!(diagnostic.fix.contains("Add "), "{:?}", diagnostic.fix);
     }
 
     /// A named export is not a route: picking it would validate the wrong node.
@@ -444,8 +783,73 @@ mod tests {
 
         let alloc = Allocator::default();
         let src = "const Page = () => <p/>\nexport { Page }\n";
-        let (info, _) = analyze(&alloc, src);
+        let (info, codes) = analyze(&alloc, src);
         assert!(info.is_none());
+        assert_eq!(codes, vec![Code::RA011]);
+    }
+
+    /// `export default Page` is a valid route when `Page` is a component declared
+    /// in the same file: resolving a module-level name is a body scan, not
+    /// dataflow, so it is done rather than guessed at.
+    #[test]
+    fn a_default_export_of_a_local_component_resolves() {
+        for src in [
+            "function Page(props: Props) { return <p/> }\nexport default Page\n",
+            "const Page = (props: Props) => <p/>\nexport default Page\n",
+            "const Page = (props: Props) => <p/>\nexport { Page as default }\n",
+            "const Page = (props: Props) => <p/>\nexport default (Page)\n",
+        ] {
+            let alloc = Allocator::default();
+            let (info, codes) = analyze(&alloc, src);
+            let info = info.expect("the export exists");
+            assert_eq!(info.kind, ComponentKind::Function, "{src}");
+            assert_eq!(info.params, 1, "{src}");
+            assert!(info.returns_jsx, "{src}");
+            assert!(codes.is_empty(), "{src}: {codes:?}");
+        }
+    }
+
+    /// The same shapes stay broken when the resolver cannot see the function:
+    /// `export { Page as default }` from another module is present but
+    /// unanalyzable, so it must be reported as exactly that.
+    #[test]
+    fn a_reexport_as_default_is_present_but_not_analyzable() {
+        let alloc = Allocator::default();
+        let src = "export { Page as default } from \"./page\"\n";
+        let (info, codes) = analyze(&alloc, src);
+        assert_eq!(info.unwrap().kind, ComponentKind::NotAFunction);
+        assert_eq!(codes, vec![Code::RA011]);
+    }
+
+    /// A default export resolving to something that is not a function is still
+    /// "present, not a component", even though the declaration was found.
+    #[test]
+    fn resolving_to_a_non_function_is_not_a_component() {
+        for src in [
+            "const Page = 42\nexport default Page\n",
+            "const Page = pageFactory()\nexport { Page as default }\n",
+        ] {
+            let alloc = Allocator::default();
+            let (info, codes) = analyze(&alloc, src);
+            assert_eq!(info.unwrap().kind, ComponentKind::NotAFunction, "{src}");
+            assert_eq!(codes, vec![Code::RA011], "{src}");
+        }
+    }
+
+    /// A self-referential declarator resolves no further. Without the visited-name
+    /// guard, following `const Page = Page` recurses until the stack overflows —
+    /// a crash in the analyzer for a file an agent can write by accident.
+    #[test]
+    fn a_self_referential_default_export_does_not_recurse() {
+        for src in [
+            "const Page = Page\nexport default Page\n",
+            "const Page = (Page)\nexport { Page as default }\n",
+        ] {
+            let alloc = Allocator::default();
+            let (info, codes) = analyze(&alloc, src);
+            assert_eq!(info.unwrap().kind, ComponentKind::NotAFunction, "{src}");
+            assert_eq!(codes, vec![Code::RA011], "{src}");
+        }
     }
 
     /// The first default export wins; a second is not consulted.
@@ -484,15 +888,46 @@ mod tests {
         assert_eq!(codes, vec![Code::RA011]);
     }
 
+    /// The message and the fix must state the same rule. They used to disagree —
+    /// "a route takes no props" against "takes at most one" — leaving the agent
+    /// to guess which one it should implement.
+    #[test]
+    fn too_many_params_states_one_rule_both_places() {
+        let alloc = Allocator::default();
+        let src = "export default function Page(a: A, b: B) { return <p/> }\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let info = find_route_component(program);
+        let diagnostic = &validate_route_component(info.as_ref())[0];
+        assert!(
+            diagnostic.message.contains("at most one"),
+            "{:?}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.fix.contains("at most one"),
+            "{:?}",
+            diagnostic.fix
+        );
+        assert!(
+            !diagnostic.message.contains("takes no props"),
+            "the message must not claim a stricter rule than the fix: {:?}",
+            diagnostic.message
+        );
+    }
+
     /// `returns_jsx` is syntactic: a returned identifier, conditional, call, or
     /// no return at all is not JSX in this milestone, and pretending otherwise
-    /// would be a guess.
+    /// would be a guess. The message must say "directly" — the code may well
+    /// return JSX, and asserting otherwise is what sends an agent hunting for a
+    /// bug that does not exist.
     #[test]
     fn returning_a_non_jsx_value_is_ra011() {
         for src in [
             "export default function Page(props: Props) { return View }\n",
             "export default function Page(props: Props) { return ready ? <p/> : <i/> }\n",
             "export default function Page(props: Props) { return render() }\n",
+            "export default function Page(props: Props) { return [<p/>] }\n",
+            "export default function Page(props: Props) { if (x) return <p/> }\n",
             "export default function Page(props: Props) {}\n",
         ] {
             let alloc = Allocator::default();
@@ -500,6 +935,77 @@ mod tests {
             assert!(!info.unwrap().returns_jsx, "{src}");
             assert_eq!(codes, vec![Code::RA011], "{src}");
         }
+    }
+
+    /// The diagnosis must not assert something the implementation cannot see:
+    /// these bodies *do* return JSX, just not directly.
+    #[test]
+    fn the_non_direct_return_message_is_honest() {
+        for src in [
+            "export default function Page(props: Props) { return View }\n",
+            "export default function Page(props: Props) { return ready ? <p/> : <i/> }\n",
+            "export default function Page(props: Props) { return [<p/>] }\n",
+            "export default function Page(props: Props) { if (x) return <p/> }\n",
+        ] {
+            let alloc = Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let info = find_route_component(program);
+            let diagnostic = &validate_route_component(info.as_ref())[0];
+            assert!(
+                diagnostic.message.contains("does not return JSX directly"),
+                "{src}: {:?}",
+                diagnostic.message
+            );
+            assert!(
+                diagnostic.explain.contains("direct `return"),
+                "the explain must name the limitation: {:?}",
+                diagnostic.explain
+            );
+        }
+    }
+
+    /// The controller ruling: a return type annotation is not a props type.
+    /// `P(): Record<never, never>` takes zero parameters, and `RA006` says so.
+    /// A future change that inspected `function.return_type` would pass every
+    /// other test in this file and fail this one.
+    ///
+    /// Run through the same two-pass shape Task 9's `analyze` uses: route
+    /// validation, then `check_props` for a default export that is a function.
+    #[test]
+    fn a_return_type_annotation_is_still_zero_params() {
+        let alloc = Allocator::default();
+        let src = "export default function P(): Record<never, never> { return <p/> }\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let info = find_route_component(program);
+        let info = info.unwrap();
+        assert_eq!(info.params, 0);
+        assert!(!info.has_props_type);
+
+        let mut codes: Vec<Code> = validate_route_component(Some(&info))
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        codes.extend(
+            crate::analyze::props::check_props(&info)
+                .iter()
+                .map(|diagnostic| diagnostic.code),
+        );
+        assert_eq!(codes, vec![Code::RA006]);
+    }
+
+    /// An async route is an ordinary function shape: the modifier changes nothing
+    /// about its params, body, or whether it returns JSX.
+    #[test]
+    fn async_component_is_analyzed_the_same_way() {
+        let alloc = Allocator::default();
+        let src = "export default async function Page(props: Props) { return <p/> }\n";
+        let (info, codes) = analyze(&alloc, src);
+        let info = info.unwrap();
+        assert_eq!(info.name, "Page");
+        assert_eq!(info.params, 1);
+        assert!(info.has_props_type);
+        assert!(info.returns_jsx);
+        assert!(codes.is_empty());
     }
 
     /// A fragment body is JSX too.

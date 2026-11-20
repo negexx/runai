@@ -6,8 +6,14 @@
 //! answers "nowhere" only in prose, not in types. So both cases are `RA006`:
 //! propless components declare `type Props = Record<never, never>` and take
 //! `props: Props`.
+//!
+//! The fix text is a snippet an agent copies, so it must be legal TypeScript and
+//! must edit the declaration that exists. Three details follow from that: an
+//! anonymous component is called `Page` rather than `default` (a reserved word),
+//! the signature names the existing declaration, and the export form in the
+//! snippet matches how the component is actually exported.
 
-use crate::analyze::component::ComponentInfo;
+use crate::analyze::component::{ComponentInfo, ComponentKind};
 use crate::diagnostic::{Code, Diagnostic, Severity};
 
 /// Check that `info`'s component declares its props type.
@@ -17,6 +23,13 @@ use crate::diagnostic::{Code, Diagnostic, Severity};
 /// elsewhere in the file does not satisfy this: the annotation belongs on the
 /// parameter, where the reader can see which type a given component takes.
 pub fn check_props(info: &ComponentInfo) -> Vec<Diagnostic> {
+    // A default export that is not a function has no props to type. `RA011`
+    // already says to replace it, and a second diagnostic demanding a type for a
+    // class or a literal would send the agent to edit the wrong thing.
+    if info.kind == ComponentKind::NotAFunction {
+        return Vec::new();
+    }
+
     match info.params {
         // `function Page() {…}` — no parameter, so no type. This is *not* clean:
         // "it takes nothing" is a fact about the code that the type should state.
@@ -33,21 +46,34 @@ pub fn check_props(info: &ComponentInfo) -> Vec<Diagnostic> {
 
 /// `RA006_UNANNOTATED_PROPS`: the component's props have no written type.
 fn unannotated_props(info: &ComponentInfo) -> Diagnostic {
+    // `default` names the export, not a binding: `function default(props)` is a
+    // parse error, so the text an agent copies must use a legal identifier.
+    let name = info.display_name();
+
+    // Where the fix names a signature, it must name the one that exists. When the
+    // component is exported through a name (`export default Page`, `export { Page
+    // as default }`), writing `export default function …` again is a duplicate
+    // default export — a parse error for an agent following the fix verbatim.
+    // There the repair is to annotate the existing declaration.
+    let signature = if info.inline_default {
+        format!("export default function {name}(props: Props)")
+    } else {
+        format!("function {name}(props: Props)")
+    };
+
     let fix = if info.params == 0 {
         // Propless. The type still has to be written down, so name the exact
         // type to declare — `Record<never, never>` is the "no props" object,
         // and an empty object type (`{}`) would accept anything.
         format!(
             "Declare `type Props = Record<never, never>` and take it as a parameter: \
-             `export default function {name}(props: Props) {{ ... }}`.",
-            name = info.name,
+             `{signature} {{ ... }}`."
         )
     } else {
         // Props exist but their shape is unstated.
         format!(
             "Add a type for `{name}`'s props — e.g. `type {name}Props = {{ id: string }}` — and \
-             annotate the parameter: `function {name}(props: {name}Props)`.",
-            name = info.name,
+             annotate the parameter: `function {name}(props: {name}Props)`."
         )
     };
 
@@ -56,12 +82,9 @@ fn unannotated_props(info: &ComponentInfo) -> Diagnostic {
         severity: Severity::Error,
         span: info.body_span,
         message: if info.params == 0 {
-            format!(
-                "component `{name}` takes no props, but does not declare that in a type",
-                name = info.name,
-            )
+            format!("component `{name}` takes no props, but does not declare that in a type")
         } else {
-            format!("component `{name}` has untyped props", name = info.name)
+            format!("component `{name}` has untyped props")
         },
         explain: "Props are the only way data enters a component, so their type is the written \
                   answer to \"where does this value come from?\". An unannotated parameter leaves \
@@ -111,6 +134,19 @@ mod tests {
         let d = check(src);
         assert_eq!(d[0].code, crate::diagnostic::Code::RA006);
         assert!(d[0].fix.contains("Record<never, never>"));
+    }
+
+    /// The message is what an agent triages on; it must name the same mistake the
+    /// fix repairs. It used to be asserted only through the fix.
+    #[test]
+    fn a_propless_message_says_the_props_are_undeclared() {
+        let src = "export default function Page() { return <p/> }\n";
+        let d = check(src);
+        assert_eq!(
+            d[0].message,
+            "component `Page` takes no props, but does not declare that in a type"
+        );
+        assert!(d[0].explain.contains("type"), "{}", d[0].explain);
     }
 
     #[test]
@@ -171,6 +207,104 @@ mod tests {
 
         let typed = "export default (props: Props) => <p/>\n";
         assert!(check(typed).is_empty());
+    }
+
+    /// An anonymous component is named `"default"`, which is the export's name,
+    /// not a binding. Emitting it verbatim gives `function default(props)` — a
+    /// parse error that sends an agent following the fix into a loop it cannot
+    /// diagnose. Both branches must use a legal identifier.
+    #[test]
+    fn an_anonymous_component_gets_a_legal_identifier_in_the_fix() {
+        for src in [
+            // concice arrow, block arrow, anonymous function declaration
+            "export default () => <p/>\n",
+            "export default () => { return <p/> }\n",
+            "export default function () { return <p/> }\n",
+        ] {
+            let d = check(src);
+            assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
+            assert!(
+                !d[0].fix.contains("function default"),
+                "{src} emitted an illegal identifier: {:?}",
+                d[0].fix
+            );
+            assert!(
+                d[0].fix.contains("function Page(props: Props)"),
+                "{src}: {:?}",
+                d[0].fix
+            );
+            assert!(
+                !d[0].message.contains("`default`"),
+                "{src}: {:?}",
+                d[0].message
+            );
+        }
+    }
+
+    /// The untyped branch has the same defect and the same repair: a legal name
+    /// for the alias and the annotation.
+    #[test]
+    fn an_anonymous_component_with_untyped_props_gets_a_legal_identifier() {
+        for src in [
+            "export default (props) => <p/>\n",
+            "export default function (props) { return <p/> }\n",
+        ] {
+            let d = check(src);
+            assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
+            assert!(
+                !d[0].fix.contains("function default"),
+                "{src} emitted an illegal identifier: {:?}",
+                d[0].fix
+            );
+            assert!(!d[0].fix.contains("defaultProps"), "{src}: {:?}", d[0].fix);
+            assert!(d[0].fix.contains("type PageProps"), "{src}: {:?}", d[0].fix);
+        }
+    }
+
+    /// A default export that is not a function has no props to annotate.
+    /// `RA011` already owns that repair; a second diagnostic demanding a type
+    /// would send the agent to edit a class or a literal.
+    #[test]
+    fn a_non_function_default_export_gets_no_props_diagnostic() {
+        for src in ["export default 42\n", "export default class Page {}\n"] {
+            let alloc = oxc_allocator::Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let info = find_route_component(program).unwrap();
+            assert!(check_props(&info).is_empty(), "{src}");
+        }
+    }
+
+    /// When the component reaches its default export through a name, the fix must
+    /// not tell the agent to write `export default function Page(…)`: that is a
+    /// second default export, i.e. a parse error for anyone who follows the text
+    /// verbatim. The repair names the existing declaration instead.
+    #[test]
+    fn a_named_default_export_fix_does_not_add_a_second_export() {
+        for src in [
+            "function Page() { return <p/> }\nexport default Page\n",
+            "function Page() { return <p/> }\nexport { Page as default }\n",
+        ] {
+            let d = check(src);
+            assert!(
+                !d[0].fix.contains("export default function"),
+                "{src}: {:?}",
+                d[0].fix
+            );
+            assert!(
+                d[0].fix.contains("`function Page(props: Props)"),
+                "{src}: {:?}",
+                d[0].fix
+            );
+        }
+
+        // An inline default export is the thing to edit, and says so.
+        let d = check("export default function Page() { return <p/> }\n");
+        assert!(
+            d[0].fix
+                .contains("`export default function Page(props: Props)"),
+            "{:?}",
+            d[0].fix
+        );
     }
 
     /// Every `RA006` points at its own skill file, so Task 15's generated docs
