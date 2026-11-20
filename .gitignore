@@ -4,3 +4,4 @@ dist/
 .runai/
 .superpowers/
 *.Zone.Identifier
+.worktrees/
