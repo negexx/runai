@@ -1,0 +1,7 @@
+{
+  "name": "runai",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "runtime.js",
+  "types": "index.d.ts"
+}

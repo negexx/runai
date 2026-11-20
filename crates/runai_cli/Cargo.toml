@@ -1,0 +1,11 @@
+[package]
+name = "runai_cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "runai"
+path = "src/main.rs"
+
+[dependencies]
+runai_compiler = { path = "../runai_compiler" }
