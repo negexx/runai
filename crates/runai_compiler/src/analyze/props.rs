@@ -307,6 +307,109 @@ mod tests {
         );
     }
 
+    /// The fix names the **binding**, not a conventional `Page`.
+    ///
+    /// `component_from_arrow` hardcoded `name: "default"`, and every earlier test
+    /// happened to call its binding `Page`, which hid the difference. For a real
+    /// file — `const AboutPage = (props) => <p/>; export default AboutPage` — the
+    /// fix said `function Page(props: Props)`: applying that verbatim declares a
+    /// new, unused `Page` and leaves `AboutPage` exactly as untyped as before, so
+    /// the next run reports `RA006` again. The name in the text must be one the
+    /// agent can find in this file.
+    #[test]
+    fn a_resolved_default_export_is_named_by_its_binding_not_page() {
+        for (src, expected_fix) in [
+            (
+                "const AboutPage = (props) => <p/>\nexport default AboutPage\n",
+                "function AboutPage(props: AboutPageProps)",
+            ),
+            (
+                "const AboutPage = (props) => <p/>\nexport { AboutPage as default }\n",
+                "function AboutPage(props: AboutPageProps)",
+            ),
+            (
+                "const AboutPage = () => <p/>\nexport default AboutPage\n",
+                "`function AboutPage(props: Props)",
+            ),
+            (
+                "const AboutPage = () => <p/>\nexport { AboutPage as default }\n",
+                "`function AboutPage(props: Props)",
+            ),
+            (
+                // The name may also reach the export through parentheses.
+                "const AboutPage = () => <p/>\nexport default (AboutPage)\n",
+                "`function AboutPage(props: Props)",
+            ),
+            (
+                // A named function expression is scoped to its own body: the
+                // module binding the agent can edit is the declarator's.
+                "const AboutPage = function Actual() { return <p/> }\nexport default AboutPage\n",
+                "`function AboutPage(props: Props)",
+            ),
+            (
+                // Following an alias lands on the declaration that has the
+                // parameter, which is named `AboutPage`, not the alias.
+                "const Alias = (AboutPage)\nconst AboutPage = () => <p/>\nexport default Alias\n",
+                "`function AboutPage(props: Props)",
+            ),
+        ] {
+            let d = check(src);
+            assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
+            assert!(
+                d[0].fix.contains(expected_fix),
+                "{src}: expected the binding's name in the fix: {:?}",
+                d[0].fix
+            );
+            assert!(
+                !d[0].fix.contains("function default"),
+                "{src}: illegal identifier: {:?}",
+                d[0].fix
+            );
+            assert!(
+                !d[0].fix.contains("function Page("),
+                "{src}: the fix names a binding this file does not declare: {:?}",
+                d[0].fix
+            );
+            assert!(
+                d[0].message.contains("`AboutPage`"),
+                "{src}: the message must name the binding: {:?}",
+                d[0].message
+            );
+        }
+    }
+
+    /// Applying the renamed fix is clean on the next run — the repair loop this
+    /// is about. `AboutPage` is the binding the fix names, so annotating *it*
+    /// clears `RA006` instead of leaving the original unannotated.
+    #[test]
+    fn the_renamed_fix_can_be_applied() {
+        let src = "type Props = Record<never, never>\nconst AboutPage = (props: Props) => <p/>\nexport default AboutPage\n";
+        assert!(check(src).is_empty(), "{:?}", check(src));
+
+        let src = "type Props = Record<never, never>\nconst AboutPage = (props: Props) => <p/>\nexport { AboutPage as default }\n";
+        assert!(check(src).is_empty(), "{:?}", check(src));
+    }
+
+    /// The other half of the rule: a genuinely anonymous component has no binding
+    /// name, so `Page` remains the only honest stand-in. Renaming must not turn
+    /// `export default (props) => <p/>` into something invented from thin air.
+    #[test]
+    fn an_anonymous_default_export_still_yields_page() {
+        for src in [
+            "export default (props) => <p/>\n",
+            "export default (() => <p/>)\n",
+        ] {
+            let d = check(src);
+            assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
+            assert!(d[0].message.contains("`Page`"), "{src}: {:?}", d[0].message);
+            assert!(
+                !d[0].message.contains("`default`"),
+                "{src}: {:?}",
+                d[0].message
+            );
+        }
+    }
+
     /// Every `RA006` points at its own skill file, so Task 15's generated docs
     /// and these paths cannot drift apart.
     #[test]

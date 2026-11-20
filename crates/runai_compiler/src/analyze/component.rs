@@ -51,8 +51,13 @@ pub struct ComponentInfo<'a> {
     /// is no parameter list and no body to report, and the caller's only job is
     /// to emit the "existing export is not a component" repair.
     pub kind: ComponentKind,
-    /// The function's own name, `"default"` when it is anonymous, or the exported
+    /// The name a reader of the file can find: the function's own name, the
+    /// binding that holds it (`const AboutPage = (props) => …`), or the exported
     /// identifier when [`ComponentKind::NotAFunction`] and one could be named.
+    ///
+    /// `"default"` means genuinely anonymous — `export default (props) => <p/>`
+    /// declares no name at all — and only then does [`display_name`](Self::display_name)
+    /// substitute the conventional `Page`.
     pub name: &'a str,
     /// How many declared parameters it takes, including a rest parameter.
     ///
@@ -129,6 +134,21 @@ impl<'a> ComponentInfo<'a> {
     /// `export default function …`.
     fn not_inline(mut self) -> Self {
         self.inline_default = false;
+        self
+    }
+
+    /// The same summary, renamed to the binding that holds it.
+    ///
+    /// A function's own name is only one of the ways a reader can refer to it:
+    /// `const AboutPage = (props) => <p/>` is anonymous, yet the file names it
+    /// `AboutPage`, and `export default (props) => <p/>` genuinely has no name.
+    /// Resolving a binding therefore renames the summary, so diagnostic text
+    /// points at the declaration the agent must edit instead of inventing a
+    /// `Page` that is not in the file. Not renaming here would make a fix for
+    /// `export default AboutPage` say `function Page(props: Props)` and leave
+    /// `AboutPage` unannotated — the next run would report the same code again.
+    fn with_name(mut self, name: &'a str) -> Self {
+        self.name = name;
         self
     }
 }
@@ -291,6 +311,11 @@ fn resolve_local<'a>(program: &'a Program<'a>, name: &'a str) -> Option<Componen
 
 /// [`resolve_local`], tracking the names already followed.
 ///
+/// The resolved summary is named after the declaration that holds the parameters,
+/// so diagnostic text can point at it: a declarator names its literal
+/// (`const AboutPage = (props) => …`), while a function declaration and a
+/// followed alias already carry the right name.
+///
 /// `const Page = Page` and `const Page = (Page)` resolve a name to itself. Without
 /// the guard they recurse until the stack overflows; a self-reference is not a
 /// component, so it resolves to `None` and the caller reports the export as
@@ -306,6 +331,8 @@ fn resolve_local_inner<'a>(
     seen.push(name);
 
     program.body.iter().find_map(|statement| match statement {
+        // The `id == name` filter means the summary already carries the right
+        // name: a function declaration's `id` *is* the binding.
         Statement::FunctionDeclaration(function) => function
             .id
             .as_ref()
@@ -320,18 +347,37 @@ fn resolve_local_inner<'a>(
                 {
                     return None;
                 }
-                match declarator.init.as_ref()? {
+                // A function literal is anonymous (`const AboutPage = (props) =>
+                // …` has no function name at all), so the *declarator* names it.
+                // Without this, the summary says `"default"` and every diagnostic
+                // talks about a `Page` that does not exist in the file — an agent
+                // following the fix would annotate a new binding and leave the real
+                // one untouched.
+                //
+                // The declarator names the literal even when the literal names
+                // itself (`const AboutPage = function Actual() {…}`): `Actual` is
+                // scoped to the function body, so the module binding an agent can
+                // find and edit is `AboutPage`. A followed name (`const Alias =
+                // Page`) keeps the declaration it resolves to, because that is
+                // where the parameters live.
+                let init = declarator.init.as_ref()?;
+                let info = match init {
                     Expression::ArrowFunctionExpression(arrow) => {
-                        Some(component_from_arrow(arrow, false))
+                        component_from_arrow(arrow, false)
                     }
                     Expression::FunctionExpression(function) => {
-                        Some(component_from_function(function, false))
+                        component_from_function(function, false)
                     }
-                    Expression::ParenthesizedExpression(parenthesized) => Some(
-                        component_from_expression(program, &parenthesized.expression, false, seen),
-                    ),
-                    _ => None,
-                }
+                    Expression::ParenthesizedExpression(parenthesized) => {
+                        component_from_expression(program, &parenthesized.expression, false, seen)
+                    }
+                    _ => return None,
+                };
+                Some(if is_function_literal(init) {
+                    info.with_name(name)
+                } else {
+                    info
+                })
             })
         }
         _ => None,
@@ -458,6 +504,23 @@ fn is_jsx_expression(expression: &Expression<'_>) -> bool {
         Expression::JSXElement(_) | Expression::JSXFragment(_) => true,
         Expression::ParenthesizedExpression(parenthesized) => {
             is_jsx_expression(&parenthesized.expression)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an expression *is* a function literal, seeing through parentheses.
+///
+/// The distinction matters when a declarator is named: `const AboutPage =
+/// (props) => …` and `const Alias = (AboutPage)` both resolve to a function, but
+/// only the first gives that function a name a reader can find — the second
+/// aliases a declaration that is already named, and the parameters to annotate
+/// belong to it.
+fn is_function_literal(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
+        Expression::ParenthesizedExpression(parenthesized) => {
+            is_function_literal(&parenthesized.expression)
         }
         _ => false,
     }
@@ -1032,6 +1095,86 @@ mod tests {
             let (info, codes) = analyze(&alloc, src);
             assert!(info.unwrap().returns_jsx, "{src}");
             assert!(codes.is_empty(), "{src}");
+        }
+    }
+
+    /// `RA011`'s text for an anonymous component was pinned only through `RA006`.
+    /// The agent triages on this message, so it must name a symbol it can act on:
+    /// `default` is a reserved word and names the export, not anything in the
+    /// file. `Page` is the conventional stand-in for a component that genuinely
+    /// has no binding name.
+    #[test]
+    fn an_anonymous_component_is_named_page_in_ra011() {
+        for (src, expected_fragment) in [
+            (
+                // Two parameters: the complaint is about the signature.
+                "export default (a, b) => <p/>\n",
+                "route component `Page` takes 2 parameters",
+            ),
+            (
+                // No direct JSX return: the complaint is about the body.
+                "export default function () { return View }\n",
+                "route component `Page` does not return JSX directly",
+            ),
+            (
+                // A concise arrow whose body is a call.
+                "export default () => render()\n",
+                "route component `Page` does not return JSX directly",
+            ),
+        ] {
+            let alloc = Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let info = find_route_component(program);
+            let diagnostic = &validate_route_component(info.as_ref())[0];
+            assert_eq!(diagnostic.code, Code::RA011, "{src}");
+            assert!(
+                diagnostic.message.contains(expected_fragment),
+                "{src}: {:?}",
+                diagnostic.message
+            );
+            assert!(
+                !diagnostic.message.contains("`default`")
+                    && !diagnostic.fix.contains("function default"),
+                "{src}: illegal identifier in the text: {:?} / {:?}",
+                diagnostic.message,
+                diagnostic.fix
+            );
+        }
+    }
+
+    /// `RA011` names the binding too. A file whose component is `AboutPage` must
+    /// not be told that `Page` has the wrong signature — there is no `Page` to
+    /// edit, and the diagnostic would send the agent to invent one.
+    #[test]
+    fn a_resolved_component_is_named_by_its_binding_in_ra011() {
+        for (src, expected) in [
+            (
+                "const AboutPage = (a: A, b: B) => <p/>\nexport default AboutPage\n",
+                "route component `AboutPage` takes 2 parameters",
+            ),
+            (
+                "const AboutPage = (props: Props) => { return View }\nexport { AboutPage as default }\n",
+                "route component `AboutPage` does not return JSX directly",
+            ),
+        ] {
+            let alloc = Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let info = find_route_component(program);
+            let info = info.unwrap();
+            assert_eq!(info.name, "AboutPage", "{src}");
+            assert_eq!(info.display_name(), "AboutPage", "{src}");
+            let diagnostic = &validate_route_component(Some(&info))[0];
+            assert_eq!(diagnostic.code, Code::RA011, "{src}");
+            assert!(
+                diagnostic.message.contains(expected),
+                "{src}: {:?}",
+                diagnostic.message
+            );
+            assert!(
+                !diagnostic.fix.contains("`Page`"),
+                "{src}: {:?}",
+                diagnostic.fix
+            );
         }
     }
 
