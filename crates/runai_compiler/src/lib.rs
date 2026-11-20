@@ -1,6 +1,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod diagnostic;
+pub mod source;
 
 #[cfg(test)]
 mod tests {
