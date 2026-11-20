@@ -116,15 +116,15 @@ impl Diagnostic {
 
 /// The 1-based `(line, column)` a diagnostic names, clamped to the source.
 ///
-/// The position is the end of the span, so a span covering a construct names
-/// the line the construct closes on. Zero-width spans name their own position,
-/// which is what `RA012_MISSING_MODE` (`(0, 0)`) needs.
+/// The position is the start of the span: `path:line:col` points at where the
+/// problem is, not where the construct closes. Zero-width spans name their own
+/// position, which is what `RA012_MISSING_MODE` (`(0, 0)`) needs.
 fn line_col(source: &str, span: (u32, u32)) -> (usize, usize) {
-    let end = (span.0.max(span.1) as usize).min(source.len());
-    let before = &source[..end];
+    let start = (span.0 as usize).min(source.len());
+    let before = &source[..start];
     let line = before.matches('\n').count() + 1;
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    (line, end - line_start + 1)
+    (line, start - line_start + 1)
 }
 
 impl Serialize for Diagnostic {
@@ -184,7 +184,9 @@ mod tests {
     #[test]
     fn human_output_names_the_line_and_the_fix() {
         let src = "function A() {\n  const x = count()\n}\n";
-        let out = sample().render_human(src, "src/routes/index.page.tsx");
+        let mut diag = sample();
+        diag.span = (27, 32); // `count`, which starts on line 2
+        let out = diag.render_human(src, "src/routes/index.page.tsx");
         assert!(out.contains("RA001_UNTRACKED_READ"));
         assert!(out.contains("src/routes/index.page.tsx:2"));
         assert!(out.contains("Wrap it: const doubled"));
@@ -222,8 +224,11 @@ mod tests {
     #[test]
     fn render_human_reports_path_line_and_column() {
         let src = "function A() {\n  const x = count()\n}\n";
-        let out = sample().render_human(src, "src/routes/index.page.tsx");
-        assert!(out.starts_with("src/routes/index.page.tsx:2:1: error[RA001_UNTRACKED_READ]"));
+        let mut diag = sample();
+        // `count` begins at byte 27, which is line 2, column 13.
+        diag.span = (27, 32);
+        let out = diag.render_human(src, "src/routes/index.page.tsx");
+        assert!(out.starts_with("src/routes/index.page.tsx:2:13: error[RA001_UNTRACKED_READ]"));
     }
 
     #[test]
