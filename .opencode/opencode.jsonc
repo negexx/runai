@@ -1,0 +1,58 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Project model: everything runs on CommandCode DeepSeek V4.1 Flash.
+  "model": "commandcode/deepseek/deepseek-v4.1-flash",
+
+  "agents": {
+    "build": {
+      "model": "commandcode/deepseek/deepseek-v4.1-flash"
+    },
+    "plan": {
+      "model": "commandcode/deepseek/deepseek-v4.1-flash"
+    },
+    "general": {
+      "model": "commandcode/deepseek/deepseek-v4.1-flash"
+    },
+    "explore": {
+      "model": "commandcode/deepseek/deepseek-v4.1-flash"
+    }
+  },
+
+  // Project-level safety rails. Global rules still apply first.
+  "permissions": [
+    { "action": "shell", "resource": "npm publish *", "effect": "ask" },
+    { "action": "shell", "resource": "git push *", "effect": "ask" },
+    { "action": "edit", "resource": ".env", "effect": "deny" },
+    { "action": "edit", "resource": ".env.*", "effect": "deny" },
+    { "action": "edit", "resource": ".env.example", "effect": "allow" }
+  ],
+
+  "commands": {
+    "review": {
+      "description": "Review current changes for correctness and regressions",
+      "agent": "code-reviewer",
+      "template": "Review $ARGUMENTS. Cover the working tree and staged changes. Report findings in severity order with file and line references, plus missing tests. Do not modify files."
+    },
+    "verify": {
+      "description": "Run the full verification suite and report evidence",
+      "agent": "verifier",
+      "template": "Verify the current repository state$ARGUMENTS. Detect the package manager and run install-free typecheck, lint, tests, and build. Report each command with its exit status and the relevant output. Do not modify files."
+    },
+    "test": {
+      "description": "Write or extend tests using red/green TDD",
+      "agent": "test-engineer",
+      "template": "Add or fix tests for $ARGUMENTS using strict TDD: write the failing test first, run it and observe the failure, implement the minimum change, then rerun until green. Report every command and result."
+    },
+    "security": {
+      "description": "Audit the change for security and supply-chain risk",
+      "agent": "security-auditor",
+      "template": "Audit $ARGUMENTS for security risk: secrets, injection, path traversal, unsafe deserialization, dependency provenance, and CI supply chain. Report findings by severity with evidence. Do not modify files."
+    },
+    "plan-feature": {
+      "description": "Design a feature and produce an implementation plan",
+      "agent": "architect",
+      "template": "Use superpowers:brainstorming to understand the goal behind $ARGUMENTS, then write a design document under docs/superpowers/specs/ and an implementation plan under docs/superpowers/plans/. Ask before writing either document."
+    }
+  }
+}
