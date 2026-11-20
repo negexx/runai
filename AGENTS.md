@@ -13,8 +13,12 @@ the `skill` tool before starting the work it covers.
 | Writing or fixing any Rust test; adding coverage; compiler crate tests | `rust-testing` |
 | Writing, debugging, or de-flaking Playwright / E2E / acceptance tests | `playwright-best-practices` |
 | Designing an agent eval, an eval dataset, or comparing eval runs | `google-agents-cli-eval` |
-| Wondering whether a skill already exists for something | `find-skills` |
 | Non-trivial feature work, planning, TDD, debugging a failure | superpowers skills (already installed as a plugin) |
+
+Do not install further skills without explicit approval for each one. A skill is an
+instruction set an agent executes with full tool access, so an unreviewed install is
+arbitrary code execution by proxy. The `find-skills` workflow is deliberately not wired
+to this project.
 
 Loading a skill and then not applying it is worse than skipping it: it costs context and
 still produces the wrong shape.
