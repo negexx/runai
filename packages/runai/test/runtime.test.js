@@ -188,16 +188,93 @@ test("a derived that reads itself throws instead of recursing forever", () => {
 
 test("a read inside an event handler is untracked and returns the value at call time", () => {
   const n = signal(0)
+  // A signal the effect does NOT read. If the handler's read leaked into the
+  // effect's dependency list, writing `side` would rerun the effect and `runs`
+  // would grow — that is the observable failure this test now really catches.
+  const side = signal("s")
   const seen = []
-  // No effect, no owner: exactly the situation of a click handler. A tracker
-  // left behind by a previous flush would subscribe this read to nothing useful.
-  const onClick = () => seen.push(n())
+  let runs = 0
+  // A live effect runs first, so the tracking machinery is genuinely in use. With
+  // no effect ever created, `tracker` is null whichever way the runtime is
+  // written, so the assertion below could not fail for the reason it claims.
+  const stop = effect(() => { n(); runs++ })
+  const onClick = () => seen.push(n(), side())
   onClick()
   n(1)
   onClick()
-  expect(seen).toEqual([0, 1])
-  // And the read must not have been replayed by the write.
-  expect(seen.length).toBe(2)
+  expect(seen).toEqual([0, "s", 1, "s"])
+  expect(runs).toBe(2)
+  const before = runs
+  side("t")
+  expect(runs).toBe(before) // the handler's read was not tracked
+  expect(seen.length).toBe(4) // and the write did not replay the handler
+  stop()
+})
+
+test("a throwing derived leaves its reader subscribed, so a later write retries it", () => {
+  const n = signal(1)
+  const d = derived(() => {
+    if (n() === 1) throw new Error("boom")
+    return n()
+  })
+  let runs = 0
+  const stop = effect(() => {
+    runs++
+    try { d() } catch { /* the user sees one error, then a retry */ }
+  })
+  expect(() => n(2)).not.toThrow()
+  // Subscribing before the throw is what keeps the effect reachable: without it
+  // the effect is inert for the rest of its life and the UI freezes.
+  expect(runs).toBe(2)
+  expect(d()).toBe(2)
+  stop()
+})
+
+test("a derived is untracked from its source when its owner is disposed", () => {
+  const n = signal(1)
+  let computes = 0
+  let d
+  const dispose = owner(() => {
+    d = derived(() => { computes++; return n() })
+  })
+  expect(d()).toBe(1)
+  expect(computes).toBe(1)
+  dispose()
+  // Disposal must drop the edge, not merely stop calling the derived: a write
+  // to `n` would otherwise make the derived dirty and the read recompute.
+  n(2)
+  expect(computes).toBe(1)
+  expect(d()).toBe(1)
+  expect(computes).toBe(1)
+})
+
+test("a signal created in an owner stops retaining subscribers when disposed", () => {
+  let inner
+  let runs = 0
+  const dispose = owner(() => { inner = signal(0) })
+  // An effect outside the owner reads it, so the disposed signal holds a
+  // subscriber that lives elsewhere. Disposal must make it release that edge.
+  const stop = effect(() => { inner(); runs++ })
+  expect(runs).toBe(1)
+  dispose()
+  inner(1)
+  expect(runs).toBe(1)
+  inner(2)
+  expect(runs).toBe(1)
+  stop()
+})
+
+test("a stopped effect is not retained by the root scope", () => {
+  const count = globalThis.__runaiDevStops
+  expect(typeof count).toBe("function")
+  const base = count()
+  const stops = []
+  for (let i = 0; i < 50; i++) stops.push(effect(() => {}))
+  expect(count()).toBe(base + 50)
+  for (const stop of stops) stop()
+  // Every stop must remove itself from the frame's set: an island mount/dispose
+  // cycle repeats this indefinitely, so growth here is a process-lifetime leak.
+  expect(count()).toBe(base)
 })
 
 test("an owner whose body throws still disposes what it created", () => {
@@ -269,6 +346,56 @@ test("_setAttr applies reactively and removes a falsy attribute", () => {
   stop()
 })
 
+test("propagation through a deep diamond is linear, not exponential", () => {
+  const n = signal(1)
+  // 20 levels of two deriveds both reading the level above: naively the walk
+  // visits the last level once per inbound path, 2^20 times per write.
+  const visits = globalThis.__runaiDevPropagate
+  expect(typeof visits).toBe("function")
+  let level = null
+  for (let i = 0; i < 20; i++) {
+    const prev = level
+    level = prev
+      ? [derived(() => prev[0]() + prev[1]() + 1), derived(() => prev[0]() - prev[1]())]
+      : [derived(() => n() + 1), derived(() => n() - 1)]
+  }
+  let runs = 0
+  const stop = effect(() => { level[0](); level[1](); runs++ })
+  const before = visits()
+  n(2)
+  expect(runs).toBe(2)
+  // 40 derived nodes, each visited once: bounded well below 2^20.
+  expect(visits() - before).toBeLessThanOrEqual(40)
+  stop()
+})
+
+test("_setAttr policy: null/undefined/false remove, everything else sets", () => {
+  const attrs = new Map()
+  const node = {
+    setAttribute: (name, value) => attrs.set(name, String(value)),
+    removeAttribute: (name) => attrs.delete(name),
+  }
+  const v = signal(null)
+  _setAttr(node, "data-x", () => v())
+  expect(attrs.has("data-x")).toBe(false)
+  // null and undefined both mean "no attribute", like false.
+  v(undefined)
+  expect(attrs.has("data-x")).toBe(false)
+  v(false)
+  expect(attrs.has("data-x")).toBe(false)
+  // Strings are set verbatim, including a falsy-but-present "" and "0".
+  v("a")
+  expect(attrs.get("data-x")).toBe("a")
+  v("")
+  expect(attrs.has("data-x")).toBe(true)
+  expect(attrs.get("data-x")).toBe("")
+  v(0)
+  expect(attrs.get("data-x")).toBe("0")
+  // true is the bare attribute: present with an empty value.
+  v(true)
+  expect(attrs.get("data-x")).toBe("")
+})
+
 test("_on binds a listener and is disposed by its owner", () => {
   const handlers = new Map()
   const node = {
@@ -280,5 +407,20 @@ test("_on binds a listener and is disposed by its owner", () => {
   handlers.get("click")(1)
   expect(seen).toEqual([1])
   stop()
+  expect(handlers.size).toBe(0)
+})
+
+test("_on's own disposer removes the listener and is idempotent", () => {
+  const handlers = new Map()
+  const node = {
+    addEventListener: (name, handler) => handlers.set(name, handler),
+    removeEventListener: (name) => handlers.delete(name),
+  }
+  const off = _on(node, "click", () => {})
+  expect(handlers.size).toBe(1)
+  off()
+  expect(handlers.size).toBe(0)
+  // Stopping twice must not throw or resurrect the listener.
+  off()
   expect(handlers.size).toBe(0)
 })

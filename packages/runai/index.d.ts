@@ -22,6 +22,10 @@ export declare function owner(fn: () => void): () => void
  */
 export declare function _setText<T>(node: Node, value: T | (() => T)): () => void
 
+/**
+ * `false`/`null`/`undefined` remove the attribute; `true` sets it bare
+ * (`name=""`); anything else is stringified, so `0` and `""` are set.
+ */
 export declare function _setAttr<T>(
   node: Element,
   name: string,
