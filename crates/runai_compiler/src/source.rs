@@ -9,7 +9,7 @@
 //! A parser rejection is reported as `RA007_AMBIGUOUS_JSX`, quoting the parser's
 //! own message so an agent sees the real syntax error rather than a generic one.
 //! A file without a mode directive is `RA012_MISSING_MODE` with a zero-width span
-//! at byte 0.
+//! at byte 0. The directive's quote style is irrelevant; its escapes are not.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Expression, Program, Statement};
@@ -27,17 +27,18 @@ pub enum Mode {
     Island,
 }
 
-/// The two directives, including their quotes, exactly as they must appear in
-/// the source text.
-const USE_STATIC: &str = "\"use static\"";
-const USE_ISLAND: &str = "\"use island\"";
+/// The two directives as they read inside the quotes. Quote style is not part of
+/// the directive: JavaScript's own directive semantics are quote-insensitive, and
+/// accepting `'use static'` infers nothing about the mode.
+const USE_STATIC: &str = "use static";
+const USE_ISLAND: &str = "use island";
 
 /// Which mode the first statement declares, or `RA012_MISSING_MODE`.
 ///
 /// Only a string literal statement in the first position counts. The comparison
-/// is against the raw source text of the literal, quotes included, so an escape
-/// sequence (`"use\x20static"`) cannot smuggle a directive past review: it is a
-/// different string, and therefore not a mode.
+/// is against the directive's raw content, quotes stripped but escapes left
+/// as-is, so an escape sequence (`"use\x20static"`) cannot smuggle a directive
+/// past review: it is a different string, and therefore not a mode.
 // The `Err` type is `Diagnostic`, not `Box<Diagnostic>`, because the interface is
 // fixed: every later consumer matches on `Result<_, Diagnostic>` directly.
 #[allow(clippy::result_large_err)]
@@ -45,9 +46,7 @@ pub fn detect_mode(source: &str) -> Result<Mode, Diagnostic> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, source, SourceType::tsx()).parse();
 
-    let directive = first_string_literal(&ret.program).and_then(|span| raw_text(source, span));
-
-    match directive {
+    match directive_content(source, &ret.program) {
         Some(USE_STATIC) => Ok(Mode::Static),
         Some(USE_ISLAND) => Ok(Mode::Island),
         _ => Err(missing_mode()),
@@ -78,8 +77,8 @@ fn missing_mode() -> Diagnostic {
 ///
 /// Returns the program only when the parser reported no diagnostics at all. Any
 /// diagnostic becomes one `RA007_AMBIGUOUS_JSX`, in source order, carrying the
-/// parser's own message and primary label span (or `(0, 0)` when the diagnostic
-/// has no label).
+/// parser's own message and its primary label span. A diagnostic with no label
+/// says so in the message instead of claiming a location it does not have.
 pub fn parse_tsx<'a>(
     alloc: &'a Allocator,
     source: &'a str,
@@ -94,26 +93,39 @@ pub fn parse_tsx<'a>(
         .diagnostics
         .iter()
         .map(|diagnostic| {
-            // Not every diagnostic carries a label, so `(0, 0)` is the fallback.
-            let span = diagnostic.labels.first().map_or((0, 0), |label| {
-                let span = label.span();
-                (span.start, span.end)
-            });
+            // Prefer the primary label: secondary labels often point at a context
+            // span that is not where the error is.
+            let label = diagnostic
+                .labels
+                .iter()
+                .find(|label| label.primary())
+                .or_else(|| diagnostic.labels.first());
+
+            let message = match label {
+                Some(_) => format!("ambiguous JSX: {message}", message = diagnostic.message),
+                // `(0, 0)` renders as `path:1:1`, which claims a real location.
+                None => format!(
+                    "ambiguous JSX (parser gave no source location): {message}",
+                    message = diagnostic.message
+                ),
+            };
 
             Diagnostic {
                 code: Code::RA007,
                 severity: Severity::Error,
-                span,
-                message: format!("ambiguous JSX: {message}", message = diagnostic.message),
+                span: label.map_or((0, 0), |label| {
+                    let span = label.span();
+                    (span.start, span.end)
+                }),
+                message,
                 explain: format!(
-                    "The TSX parser rejected this file: {message}. An unclosed tag, an \
-                     unterminated attribute, or two adjacent sibling elements with no separator \
-                     makes the markup impossible to read, so the compiler refuses to guess.",
+                    "The TSX parser rejected this file: {message}. The compiler reports the \
+                     parser's own words rather than guessing at what was meant.",
                     message = diagnostic.message
                 ),
-                fix: "Rewrite the JSX so every tag closes and every attribute terminates: look \
-                      for a missing `>` or `</tag>`, an unterminated string inside an attribute, \
-                      or two sibling elements running together."
+                fix: "Rewrite the JSX so every tag closes and every attribute terminates: add the \
+                      missing `>` or `</tag>`, close any unterminated string inside an attribute, \
+                      and wrap adjacent sibling elements in a single parent element."
                     .into(),
                 doc: Code::RA007.skill_file(),
                 patch: None,
@@ -122,20 +134,22 @@ pub fn parse_tsx<'a>(
         .collect())
 }
 
-/// The span of the string literal in the first statement position, if there is one.
+/// The directive's content, quotes stripped but escapes left as they appear, or
+/// `None` when the first statement position holds no string literal.
 ///
 /// Oxc lifts a leading string literal out of the statement list into
-/// [`Program::directives`], so the directive prologue is checked first; a string
-/// literal that was not in the prologue is still the first statement's expression
-/// and is treated the same way.
-fn first_string_literal<'a>(program: &'a Program<'a>) -> Option<Span> {
+/// [`Program::directives`], so the directive prologue is checked first and its
+/// `directive` field is already quote-stripped. The `body` fallback is defence in
+/// depth: for a well-formed prologue it is unreachable, because a leading
+/// string-literal expression statement *is* the prologue and Oxc hoists it.
+fn directive_content<'a>(source: &'a str, program: &'a Program<'a>) -> Option<&'a str> {
     if let Some(directive) = program.directives.first() {
-        return Some(directive.expression.span);
+        return Some(directive.directive.as_str());
     }
 
     match program.body.first() {
         Some(Statement::ExpressionStatement(statement)) => match &statement.expression {
-            Expression::StringLiteral(literal) => Some(literal.span),
+            Expression::StringLiteral(literal) => raw_text(source, literal.span).map(strip_quotes),
             _ => None,
         },
         _ => None,
@@ -146,6 +160,17 @@ fn first_string_literal<'a>(program: &'a Program<'a>) -> Option<Span> {
 /// outside the source or off a character boundary.
 fn raw_text(source: &str, span: Span) -> Option<&str> {
     source.get(span.start as usize..span.end as usize)
+}
+
+/// One leading and one trailing quote character removed, if present.
+///
+/// The `body` fallback reads source text rather than Oxc's hoisted `directive`
+/// field, so it has to remove the delimiters itself to be quote-insensitive.
+fn strip_quotes(raw: &str) -> &str {
+    raw.strip_prefix(['"', '\''])
+        .unwrap_or(raw)
+        .strip_suffix(['"', '\''])
+        .unwrap_or(raw)
 }
 
 #[cfg(test)]
@@ -164,6 +189,30 @@ mod tests {
         assert!(matches!(detect_mode(src), Ok(Mode::Island)));
     }
 
+    /// Quote style carries no information about the mode, so a single-quoted
+    /// directive must count. Otherwise the `RA012` fix text would tell an agent to
+    /// add a double-quoted line above the existing single-quoted one, and the file
+    /// would stay `RA012` forever.
+    #[test]
+    fn single_quotes_are_accepted() {
+        assert!(matches!(detect_mode("'use static'\n"), Ok(Mode::Static)));
+        assert!(matches!(detect_mode("'use island'\n"), Ok(Mode::Island)));
+    }
+
+    /// The directive must be the first statement; later positions are ordinary
+    /// string expressions and name no mode.
+    #[test]
+    fn directive_must_be_first() {
+        let src = "import x from 'y'\n\"use static\"\n";
+        assert_eq!(detect_mode(src).unwrap_err().code, Code::RA012);
+    }
+
+    #[test]
+    fn comment_before_the_directive_still_counts() {
+        let src = "// hi\n\"use static\"\n";
+        assert!(matches!(detect_mode(src), Ok(Mode::Static)));
+    }
+
     #[test]
     fn missing_directive_is_ra012() {
         let src = "export default function A() { return <p/> }\n";
@@ -172,8 +221,8 @@ mod tests {
         assert!(err.fix.contains("\"use static\""));
     }
 
-    /// The comparison is against the raw source text, so an escape sequence that
-    /// cooks down to the same string is not a directive.
+    /// The comparison leaves escapes as-is, so an escape sequence that cooks down
+    /// to the same string is not a directive.
     #[test]
     fn escapes_do_not_smuggle_a_directive() {
         let src = "\"use\\x20static\"\nexport default function A() { return <p/> }\n";
@@ -187,5 +236,44 @@ mod tests {
         let errs = parse_tsx(&alloc, src).unwrap_err();
         assert_eq!(errs[0].code, Code::RA007);
         assert!(errs[0].span.0 > 0, "span should point into the file");
+    }
+
+    /// `explain` must carry the parser's own message, not only prose about JSX, so
+    /// a non-JSX syntax error still tells the agent what actually broke. The
+    /// expected text is read from a separate raw parse, not from our own output.
+    #[test]
+    fn ra007_explain_carries_the_parser_message() {
+        let alloc = oxc_allocator::Allocator::default();
+        let src = "const a = <div>;\n";
+
+        let ret = Parser::new(&alloc, src, SourceType::tsx()).parse();
+        let parser_message = ret
+            .diagnostics
+            .first()
+            .expect("fixture must not parse")
+            .message
+            .to_string();
+
+        let errs = parse_tsx(&alloc, src).unwrap_err();
+        assert!(
+            errs[0].explain.contains(&parser_message),
+            "explain did not carry the parser message {parser_message:?}: {:?}",
+            errs[0].explain
+        );
+    }
+
+    /// `Directive::directive` is documented as the raw content with escapes left
+    /// as-is; both facts below are load-bearing for `detect_mode`.
+    #[test]
+    fn directive_field_is_quote_insensitive_and_escape_sensitive() {
+        let alloc = oxc_allocator::Allocator::default();
+
+        let ret = Parser::new(&alloc, "'use static'\n", SourceType::tsx()).parse();
+        let single = ret.program.directives.first().expect("directive hoisted");
+        assert_eq!(single.directive.as_str(), "use static");
+
+        let ret = Parser::new(&alloc, "\"use\\x20static\"\n", SourceType::tsx()).parse();
+        let escaped = ret.program.directives.first().expect("directive hoisted");
+        assert_eq!(escaped.directive.as_str(), "use\\x20static");
     }
 }
