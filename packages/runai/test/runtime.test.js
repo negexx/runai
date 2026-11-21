@@ -505,16 +505,106 @@ test("a throwing effect does not wedge the queue", () => {
 
 // --- codegen internals Task 11 emits ---
 
+// The brief's fixture: a `<!>` placeholder between two static text nodes.
+// Assigning `textContent` on the comment (the shipped behaviour) contributes no
+// text at all, so this stays "a  b" forever. Starting at 0 also pins the very
+// first write, which a fixture starting at 1 cannot see.
+test("_setText replaces its anchor and tracks the value", () => {
+  const n = signal(0)
+  const p = document.createElement("p")
+  p.append("a ", document.createComment(""), " b")
+  _setText(p.childNodes[1], () => n())
+  expect(p.textContent).toBe("a 0 b")
+  n(1)
+  expect(p.textContent).toBe("a 1 b")
+  n(2)
+  expect(p.textContent).toBe("a 2 b")
+})
+
 test("_setText is a reactive text binding with a disposer", () => {
   const n = signal("a")
-  const node = { textContent: "" }
-  const stop = _setText(node, () => n())
-  expect(node.textContent).toBe("a")
+  const p = document.createElement("p")
+  p.append(document.createComment(""))
+  const stop = _setText(p.firstChild, () => n())
+  expect(p.textContent).toBe("a")
   n("b")
-  expect(node.textContent).toBe("b")
+  expect(p.textContent).toBe("b")
   stop()
   n("c")
-  expect(node.textContent).toBe("b")
+  expect(p.textContent).toBe("b")
+})
+
+test("_setText renders null and undefined as the empty string", () => {
+  const v = signal(null)
+  const p = document.createElement("p")
+  p.append("x", document.createComment(""), "y")
+  _setText(p.childNodes[1], () => v())
+  // The anchor is gone and a real Text node took its place: three children, the
+  // middle one a text node carrying "".
+  expect(p.childNodes.length).toBe(3)
+  expect(p.childNodes[1].nodeType).toBe(3)
+  expect(p.textContent).toBe("xy")
+  v(undefined)
+  expect(p.textContent).toBe("xy")
+  // `0` and `""` are values, not absences: they are rendered as text.
+  v(0)
+  expect(p.textContent).toBe("x0y")
+  v("")
+  expect(p.textContent).toBe("xy")
+  v(false)
+  expect(p.textContent).toBe("xfalsey")
+})
+
+test("_setText keeps one text node at the anchor's position", () => {
+  const n = signal(1)
+  const p = document.createElement("p")
+  const anchor = document.createComment("")
+  p.append("a", anchor)
+  _setText(anchor, () => n())
+  const text = p.childNodes[1]
+  // The comment was replaced, not merely hidden: it has no parent any more.
+  expect(anchor.parentNode).toBe(null)
+  expect(text.nodeType).toBe(3)
+  expect(text.data).toBe("1")
+  n(2)
+  // The effect writes `data` on the node it created; it never needs the anchor
+  // again, and no second node appears at the position.
+  expect(p.childNodes.length).toBe(2)
+  expect(p.childNodes[1]).toBe(text)
+  expect(text.data).toBe("2")
+  expect(p.textContent).toBe("a2")
+})
+
+test("_setText is disposed with its owner", () => {
+  const n = signal(0)
+  const p = document.createElement("p")
+  p.append(document.createComment(""))
+  // Registered with the current frame, like `_setAttr`/`_on`: a root-scope
+  // effect would keep writing to a node its island already tore down.
+  const dispose = owner(() => { _setText(p.firstChild, () => n()) })
+  expect(p.textContent).toBe("0")
+  dispose()
+  n(1)
+  expect(p.textContent).toBe("0")
+})
+
+test("_setText names a detached anchor instead of throwing a bare TypeError", () => {
+  // The anchor takes its position from its parent; a parentless one has no slot
+  // to fill. The emitter never produces this, but an agent reading a
+  // `replaceChild` TypeError cannot act on it.
+  expect(() => _setText(document.createComment(""), () => 0)).toThrow(/RUNAI_DEV _setText anchor/)
+})
+
+test("_setText binds the emitted placeholder template", () => {
+  const n = signal(0)
+  // Task 11's pinned emitted shape: `template("<p class=\"a\"><!></p>")` plus
+  // `_setText(el.firstChild, () => n())`.
+  const t = template('<p class="a"><!></p>')
+  const el = t.content.firstChild.cloneNode(true)
+  _setText(el.firstChild, () => n())
+  expect(el.outerHTML).toBe('<p class="a">0</p>')
+  n(1)
+  expect(el.outerHTML).toBe('<p class="a">1</p>')
 })
 
 test("_setAttr applies reactively and removes a falsy attribute", () => {
@@ -867,6 +957,23 @@ test("resource lands a synchronous throw in the error state", () => {
   // need a try/catch around the accessor.
   expect(bad().status).toBe("error")
   expect(bad().error.message).toBe("sync")
+})
+
+test("resource always passes { signal }, zero-argument or not", async () => {
+  // The corrected plan says the context is *always* passed. A zero-argument
+  // compute simply ignores the extra argument, so there is no arity heuristic
+  // that could misread a `function f() { arguments[0] }` as needing one. This
+  // pins that the argument is always supplied, and that a fn which declares no
+  // parameter still runs.
+  const seen = []
+  const r = resource(function () {
+    seen.push(arguments[0])
+    return 1
+  })
+  expect(seen.length).toBe(1)
+  expect(seen[0].signal).toBeInstanceOf(AbortSignal)
+  await new Promise((ok) => setTimeout(ok, 0))
+  expect(r().status).toBe("success")
 })
 
 test("mount disposes the component's effects and takes its node out", () => {

@@ -579,9 +579,10 @@ function take(list) {
 
 // resource(fn) -> accessor to { status: "pending" | "error" | "success" }.
 // The compute runs inside an effect, so a signal read before its first await
-// makes it re-run; a re-run aborts the previous call through the AbortSignal
-// handed to a one-argument `fn`. A synchronous throw and a rejected promise
-// both land in the error state: `When` must never need a try/catch.
+// makes it re-run; a re-run aborts the previous call. The call always receives
+// `{ signal }` — a zero-argument `fn` simply ignores the extra argument, so
+// there is no arity heuristic to get wrong. A synchronous throw and a rejected
+// promise both land in the error state: `When` must never need a try/catch.
 export function resource(fn) {
   const out = signal({ status: "pending" })
   effect(() => {
@@ -593,7 +594,7 @@ export function resource(fn) {
     out({ status: "pending" })
     let pending
     try {
-      pending = fn.length ? fn({ signal: ctrl.signal }) : fn()
+      pending = fn({ signal: ctrl.signal })
     } catch (error) {
       out({ status: "error", error })
       return
@@ -638,11 +639,29 @@ export function mount(component, root) {
 
 // --- internals the emitter calls -------------------------------------------
 
-// _setText(node, value) — value is a raw value or a thunk, read reactively.
-export function _setText(node, value) {
+// _setText(anchor, fn) — `anchor` is the `<!>` placeholder comment the emitter
+// put where dynamic text belongs. A comment holds no text, so assigning
+// `textContent` on it renders nothing; and assigning on its parent would destroy
+// the static siblings on either side. So the anchor is consumed: a `Text` node
+// takes its *position*, and the effect keeps that node's `data` current. After
+// the replacement the anchor is no longer in the document and is never needed
+// again.
+export function _setText(anchor, fn) {
+  const text = document.createTextNode("")
+  // The parent may still be a detached clone — Task 11 calls this before `mount`
+  // appends anything — and replacing *inside* the clone is what carries the text
+  // node into the document along with it. A parentless anchor has no position to
+  // take, so dev names the misuse instead of a bare `replaceChild` TypeError.
+  if (!anchor.parentNode) {
+    if (typeof process !== "undefined" && process.env.NODE_ENV !== "production")
+      throw new Error(
+        "RUNAI_DEV _setText anchor has no parent: pass the <!> placeholder comment of the cloned template, whose position the text node takes.",
+      )
+  }
+  anchor.parentNode.replaceChild(text, anchor)
   return effect(() => {
-    const v = typeof value === "function" ? value() : value
-    node.textContent = v == null ? "" : String(v)
+    const v = fn()
+    text.data = v == null ? "" : String(v)
   })
 }
 

@@ -17,10 +17,14 @@ export declare function owner(fn: () => void): () => void
 
 /**
  * Codegen internals. Emitted by the compiler, not authored by hand.
- * A function argument is a reactive thunk, re-run on dependency change;
- * anything else is a constant. Each returns a disposer.
+ * Each tracks its value inside an effect and returns the effect's disposer.
+ *
+ * `_setText` takes the `<!>` placeholder comment the emitter put in the
+ * template: the comment is replaced by a `Text` node, so the dynamic text keeps
+ * its position between the static siblings, and the effect writes `data` on
+ * that node. `null`/`undefined` render as `""`.
  */
-export declare function _setText<T>(node: Node, value: T | (() => T)): () => void
+export declare function _setText(anchor: Comment, fn: () => unknown): () => void
 
 /**
  * `false`/`null`/`undefined` remove the attribute; `true` sets it bare
