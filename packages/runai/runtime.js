@@ -372,12 +372,20 @@ export function template(html) {
 
 // A builder may return a fragment — every `For`/`Show`/`When` does, so nesting
 // them is the normal composition. Inserting a fragment moves its children into
-// the parent and leaves the fragment itself empty and parentless, so callers
-// must capture the real nodes *before* the first insert and address the group,
-// never the fragment. (Read `childNodes` twice and the second pass is empty.)
+// the parent and leaves the fragment itself empty and parentless. So a group is
+// resolved at *use* time, never captured by the parent: a `Show`/`When`/`For`
+// exposes a live `kids()` and its visible group can change long after whoever
+// built it looked at it. An author-supplied plain fragment has no such group, so
+// its child list is captured on first read — always before its first insert,
+// since reading a group is what leads to inserting it — and then served through
+// the same accessor. (Read `childNodes` twice and the second pass is empty.)
 function nodes(node) {
   if (!node) return []
-  return node.nodeType === 11 ? [...node.childNodes] : [node]
+  if (node.kids) return node.kids()
+  if (node.nodeType !== 11) return [node]
+  const group = [...node.childNodes]
+  node.kids = () => group
+  return group
 }
 
 // For — keyed list. A row is built exactly once per key: surviving keys keep
@@ -395,14 +403,39 @@ export function For(props) {
   const anchor = range.appendChild(document.createComment(""))
   const parent = frame
   const rows = new Map()
+  // The live group, resolved on every read: each row's builder may return a
+  // nested `Show`/`When`/`For` whose own visible nodes change long after this
+  // list was built, so a group captured by the parent would be dead the moment
+  // a nested primitive changed branch.
+  let order = []
+  range.kids = () => {
+    const group = []
+    for (const key of order) {
+      const row = rows.get(key)
+      if (row) for (const n of nodes(row.node)) group.push(n)
+    }
+    group.push(anchor)
+    return group
+  }
   effect(() => {
     const host = anchor.parentNode
     if (!host) return
     const items = props.each() || []
+    // `by` is called exactly once per item: an impure `by` read twice would
+    // yield a key the reorder cannot find, and the throw would name `rows`.
+    const keys = items.map((i) => props.by(i))
     const live = new Set()
-    for (const item of items) {
-      const key = props.by(item)
+    order = []
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      const key = keys[i]
+      // A duplicate key would overwrite the first row's item signal (one item of
+      // data silently vanishing) and then reorder that row twice, which for a
+      // multi-node row reverses the row's own nodes. Unique keys are RA003's job;
+      // the runtime must not corrupt the DOM when a dev breaks that rule.
+      if (live.has(key)) continue
       live.add(key)
+      order.push(key)
       const row = rows.get(key)
       // A surviving row only gets its item signal written: its node and its
       // effects are reused, so `children` is not re-run. That is what makes a
@@ -413,31 +446,27 @@ export function For(props) {
           row.item = signal(item)
           return props.children(row.item)
         })
-        created.nodes = nodes(created.node)
         rows.set(key, created)
       }
     }
     for (const [key, row] of rows) {
       if (live.has(key)) continue
       rows.delete(key)
-      // Take the row's nodes out of the document first, then dispose its scope:
-      // its effects stop, and its signals/deriveds are released with it. A
-      // surviving row is never touched this way.
-      take(row.nodes)
+      // Take the row's *current* nodes out of the document, then dispose its
+      // scope: its effects stop, and its signals/deriveds are released with it.
+      // A surviving row is never touched this way.
+      take(nodes(row.node))
       disposeScope(row)
     }
     // Walk backwards, inserting each row before the next one: only rows whose
     // position actually changed are moved, and moving preserves identity.
     let next = anchor
-    for (let i = items.length - 1; i >= 0; i--) {
-      const row = rows.get(props.by(items[i])).nodes
+    for (let i = order.length - 1; i >= 0; i--) {
+      const row = nodes(rows.get(order[i]).node)
       // A row that rendered nothing (a component returning null) occupies no
       // position; it must not become the reference node for the row below it.
       if (!row.length) continue
       const last = row[row.length - 1]
-      // A duplicate key would ask the DOM to insert a node before itself, which
-      // throws. Stable keys are the source's job (RA003); bad input must not
-      // become a DOMException here.
       if (last !== next && last.nextSibling !== next)
         for (const n of row) if (n !== next) host.insertBefore(n, next)
       next = row[0]
@@ -453,17 +482,21 @@ export function For(props) {
 export function Show(props) {
   const range = document.createDocumentFragment()
   const anchor = range.appendChild(document.createComment(""))
-  // Captured once: the branches are constant nodes, and a fragment branch is
-  // emptied by its first insertion, so it cannot be re-read later.
-  const kids = [nodes(props.fallback), nodes(props.children)]
-  let which = -1
+  // The active group, resolved on every read: a branch may be a nested
+  // `Show`/`When`/`For` whose own visible nodes change, so holding a snapshot
+  // here would leave the parent inserting nodes that no longer exist.
   let shown = []
+  // The anchor travels with the group: it is the insertion point a later swap
+  // uses, so leaving it behind in the emptied fragment would insert the new
+  // branch into a detached node.
+  range.kids = () => [...shown, anchor]
+  let which = -1
   effect(() => {
     const next = props.when() ? 1 : 0
     if (next === which) return
     take(shown)
     which = next
-    shown = kids[which]
+    shown = nodes(which ? props.children : props.fallback)
     const host = anchor.parentNode
     if (host) for (const n of shown) host.insertBefore(n, anchor)
   })
@@ -479,12 +512,12 @@ export function When(props) {
   const range = document.createDocumentFragment()
   const anchor = range.appendChild(document.createComment(""))
   const parent = frame
-  // `pending` is a caller-built constant node, captured once and reused across
-  // reruns; re-reading it after an insert would find it empty if it is a
-  // fragment. The data branches are built per result, under their own scope.
-  const pending = nodes(props.pending)
   let scope = null
+  // The active group, resolved on every read; `pending` is a caller-built
+  // constant node and `nodes` serves its group from the same accessor.
   let shown = []
+  // Same rule as `Show`: the anchor is part of the group.
+  range.kids = () => [...shown, anchor]
   effect(() => {
     const result = props.value()
     // A later pending state must not resurrect a disposed node, so `pending` is
@@ -498,7 +531,7 @@ export function When(props) {
     take(shown)
     if (scope) disposeScope(scope)
     scope = next
-    shown = next ? nodes(next.node) : pending
+    shown = nodes(next ? next.node : props.pending)
     const host = anchor.parentNode
     if (host) for (const n of shown) host.insertBefore(n, anchor)
   })
@@ -550,19 +583,23 @@ export function resource(fn) {
 // already disposes a scope whose body throws, so a component that throws during
 // mount leaves nothing registered behind.
 export function mount(component, root) {
-  let kids = []
+  let node
   const dispose = owner(() => {
-    const node = component({})
+    node = component({})
     if (!node) return
-    // A component may return a fragment (`Show`, `When`, `For` all do).
-    // `appendChild` moves the fragment's children out and leaves the fragment
-    // itself parentless, so capture the real nodes before appending.
-    kids = nodes(node)
+    // Seed a plain fragment's group while it still holds its children: appending
+    // moves them into `root` and leaves the fragment empty. `nodes` caches that
+    // group only for an author-supplied fragment; every primitive answers with
+    // its live group, which is resolved again at dispose time below.
+    nodes(node)
     root.appendChild(node)
   })
   return () => {
     dispose()
-    take(kids)
+    // Resolved after disposal, not captured: a nested `Show`/`When`/`For` keeps
+    // swapping which nodes *are* the component's group, so a build-time snapshot
+    // would leave a live branch in the page and remove already-detached nodes.
+    take(nodes(node))
   }
 }
 

@@ -1026,3 +1026,140 @@ test("For tolerates a row that renders nothing", () => {
   items([{ id: 2, show: true }, { id: 1, show: false }])
   expect(ul.querySelectorAll("li").length).toBe(1)
 })
+
+// --- fix round 1: node groups are resolved at use time ---
+//
+// Every test below failed on c655973. The shared cause: `nodes()` was captured
+// once, at build time, while `Show`/`When`/`For` keep moving nodes in and out of
+// their own anchor afterwards. A parent holding that snapshot holds dead nodes
+// the moment a nested primitive changes branch.
+
+test("For-of-When keeps a resolved row's content and removes it on key removal", async () => {
+  const items = signal([{ id: 1 }])
+  let resolve
+  const r = resource(
+    () =>
+      new Promise((ok) => {
+        resolve = () => ok("data")
+      }),
+  )
+  const ul = document.createElement("ul")
+  mount(
+    () =>
+      For({
+        each: () => items(),
+        by: (i) => i.id,
+        children: () =>
+          When({
+            value: r,
+            pending: document.createTextNode("loading"),
+            error: () => document.createTextNode("err"),
+            children: (d) => document.createTextNode(String(d)),
+          }),
+      }),
+    ul,
+  )
+  expect(ul.textContent).toBe("loading")
+  resolve()
+  await new Promise((ok) => setTimeout(ok, 0))
+  // The row's group changed underneath the list; the list must see the swap.
+  expect(ul.textContent).toBe("data")
+  items([])
+  // The removed row must take the *current* group out, not the captured one.
+  expect(ul.textContent).toBe("")
+  expect(ul.childNodes.length).toBe(1) // the list's own anchor
+})
+
+test("mount disposes a component that returns a toggling Show", () => {
+  const on = signal(false)
+  const root = document.createElement("div")
+  const stop = mount(
+    () =>
+      Show({
+        when: () => on(),
+        fallback: document.createTextNode("off"),
+        children: document.createTextNode("on"),
+      }),
+    root,
+  )
+  expect(root.textContent).toBe("off")
+  on(true)
+  expect(root.textContent).toBe("on")
+  stop()
+  // `mount` must dispose the whole group the component produced — after a swap
+  // that group is the branch `Show` is currently holding, not the initial one.
+  expect(root.childNodes.length).toBe(0)
+  expect(root.textContent).toBe("")
+})
+
+test("a When that resolves while hidden shows its real content when re-shown", async () => {
+  const visible = signal(true)
+  const state = signal({ status: "pending" })
+  const branch = When({
+    value: state,
+    pending: document.createTextNode("loading"),
+    error: () => document.createTextNode("err"),
+    children: (d) => document.createTextNode(String(d)),
+  })
+  const node = Show({
+    when: () => visible(),
+    fallback: document.createTextNode("hidden"),
+    children: branch,
+  })
+  expect(node.textContent).toBe("loading")
+  // Hide the branch, then let the detached `When` resolve.
+  visible(false)
+  expect(node.textContent).toBe("hidden")
+  state({ status: "success", data: "data" })
+  // Still hidden: the detached branch must not insert itself anywhere.
+  expect(node.textContent).toBe("hidden")
+  visible(true)
+  // Re-showing must address the group `When` holds now, not the pending snapshot.
+  expect(node.textContent).toBe("data")
+})
+
+test("For rejects a duplicate key instead of dropping an item or reversing a row", () => {
+  // A multi-node row: the second visit of a duplicated key would run
+  // `insertBefore(b, a)` and reverse the row's own nodes.
+  const items = signal([{ id: 1, label: "first" }, { id: 1, label: "second" }])
+  const ul = document.createElement("ul")
+  ul.appendChild(
+    For({
+      each: () => items(),
+      by: (i) => i.id,
+      children: (item) => {
+        const f = document.createDocumentFragment()
+        f.appendChild(document.createTextNode(item().label + ":"))
+        const b = document.createElement("b")
+        b.textContent = "b"
+        f.appendChild(b)
+        return f
+      },
+    }),
+  )
+  // One row for one key: the duplicate must not create a second pass that
+  // reverses the first row's nodes.
+  expect(ul.textContent).toBe("first:b")
+  expect(ul.querySelectorAll("b").length).toBe(1)
+  expect(ul.firstChild.textContent).toBe("first:")
+})
+
+test("template.clone() returns a fresh fragment with the parsed content", () => {
+  const t = template("<p class='a'>x</p><p class='b'>y</p>")
+  const c = t.clone()
+  expect(c.nodeType).toBe(11)
+  expect(c.firstChild.outerHTML).toBe("<p class=\"a\">x</p>")
+  expect(c.childNodes.length).toBe(2)
+  // Independent of the template and of the next clone.
+  c.firstChild.textContent = "changed"
+  expect(t.content.firstChild.textContent).toBe("x")
+  expect(t.clone().firstChild.textContent).toBe("x")
+})
+
+test("resource lands a rejected promise in the error state", async () => {
+  const bad = resource(() => Promise.reject(new Error("net")))
+  expect(bad()).toEqual({ status: "pending" })
+  await new Promise((ok) => setTimeout(ok, 0))
+  expect(bad().status).toBe("error")
+  expect(bad().error.message).toBe("net")
+})
