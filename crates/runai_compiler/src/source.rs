@@ -33,6 +33,23 @@ pub enum Mode {
 const USE_STATIC: &str = "use static";
 const USE_ISLAND: &str = "use island";
 
+/// Which mode a parsed program declares, or `RA012_MISSING_MODE`.
+///
+/// The program-based form of [`detect_mode`]: a caller that already holds a
+/// parsed route file reads the mode from it instead of parsing the source a
+/// second time. Same rule, one implementation — `detect_mode` is this function
+/// plus a parse.
+// `Err` is `Diagnostic` rather than `Box<Diagnostic>` for the same reason
+// `detect_mode`'s is: the interface is fixed.
+#[allow(clippy::result_large_err)]
+pub fn mode_of(program: &Program) -> Result<Mode, Diagnostic> {
+    match directive_content(program.source_text, program) {
+        Some(USE_STATIC) => Ok(Mode::Static),
+        Some(USE_ISLAND) => Ok(Mode::Island),
+        _ => Err(missing_mode()),
+    }
+}
+
 /// Which mode the first statement declares, or `RA012_MISSING_MODE`.
 ///
 /// Only a string literal statement in the first position counts. The comparison
@@ -46,11 +63,7 @@ pub fn detect_mode(source: &str) -> Result<Mode, Diagnostic> {
     let alloc = Allocator::default();
     let ret = Parser::new(&alloc, source, SourceType::tsx()).parse();
 
-    match directive_content(source, &ret.program) {
-        Some(USE_STATIC) => Ok(Mode::Static),
-        Some(USE_ISLAND) => Ok(Mode::Island),
-        _ => Err(missing_mode()),
-    }
+    mode_of(&ret.program)
 }
 
 /// `RA012_MISSING_MODE`: the file never names a mode.
@@ -210,6 +223,31 @@ fn strip_quotes(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mode_of` reads the mode from a program that is already parsed, and
+    /// `detect_mode` is that plus a parse. They are two entry points over one
+    /// rule, so they must never disagree — a divergence would make `lower_route`
+    /// and `detect_mode` report different modes for the same file.
+    #[test]
+    fn mode_of_agrees_with_detect_mode() {
+        for src in [
+            "\"use static\"\n",
+            "'use island'\n",
+            "// hi\n\"use static\"\n",
+            "import x from 'y'\n\"use static\"\n",
+            "\"use\\x20static\"\n",
+            "export default function A() { return <p/> }\n",
+            "",
+        ] {
+            let alloc = Allocator::default();
+            let ret = Parser::new(&alloc, src, SourceType::tsx()).parse();
+            assert_eq!(
+                mode_of(&ret.program).map_err(|d| d.code),
+                detect_mode(src).map_err(|d| d.code),
+                "{src:?}"
+            );
+        }
+    }
 
     #[test]
     fn detects_static() {
