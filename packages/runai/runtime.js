@@ -418,8 +418,13 @@ export function For(props) {
     return group
   }
   effect(() => {
+    // Read the dependencies *before* asking whether the list is attached. The
+    // anchor is inside a `Show`/`When` branch that is taken out of the document
+    // while hidden, so a `if (!host) return` here would end the run with no
+    // dependencies: `execute` untracks first, so the effect would be permanently
+    // unsubscribed and the list dead for the island's life (and its rows never
+    // disposed). Only the DOM insertion is guarded.
     const host = anchor.parentNode
-    if (!host) return
     const items = props.each() || []
     // `by` is called exactly once per item: an impure `by` read twice would
     // yield a key the reorder cannot find, and the throw would name `rows`.
@@ -431,9 +436,18 @@ export function For(props) {
       const key = keys[i]
       // A duplicate key would overwrite the first row's item signal (one item of
       // data silently vanishing) and then reorder that row twice, which for a
-      // multi-node row reverses the row's own nodes. Unique keys are RA003's job;
-      // the runtime must not corrupt the DOM when a dev breaks that rule.
-      if (live.has(key)) continue
+      // multi-node row reverses the row's own nodes. Unique keys are RA003's job,
+      // but RA003 is not implemented yet in this milestone, so the runtime must
+      // not corrupt the DOM *and* must not drop a row without saying so. Dev
+      // warning, not a throw: production keeps rendering whatever is renderable.
+      if (live.has(key)) {
+        if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+          console.warn(
+            "RUNAI_DEV duplicate key in For ignored: this row is not rendered. Give each item a stable, unique key (RA003).",
+          )
+        }
+        continue
+      }
       live.add(key)
       order.push(key)
       const row = rows.get(key)
@@ -459,7 +473,9 @@ export function For(props) {
       disposeScope(row)
     }
     // Walk backwards, inserting each row before the next one: only rows whose
-    // position actually changed are moved, and moving preserves identity.
+    // position actually changed are moved, and moving preserves identity. `host`
+    // is null while the list is detached (hidden by a `Show`); the rows were
+    // still built and ordered above, and the live group serves them on re-show.
     let next = anchor
     for (let i = order.length - 1; i >= 0; i--) {
       const row = nodes(rows.get(order[i]).node)
@@ -467,7 +483,7 @@ export function For(props) {
       // position; it must not become the reference node for the row below it.
       if (!row.length) continue
       const last = row[row.length - 1]
-      if (last !== next && last.nextSibling !== next)
+      if (host && last !== next && last.nextSibling !== next)
         for (const n of row) if (n !== next) host.insertBefore(n, next)
       next = row[0]
     }
@@ -482,23 +498,26 @@ export function For(props) {
 export function Show(props) {
   const range = document.createDocumentFragment()
   const anchor = range.appendChild(document.createComment(""))
-  // The active group, resolved on every read: a branch may be a nested
-  // `Show`/`When`/`For` whose own visible nodes change, so holding a snapshot
-  // here would leave the parent inserting nodes that no longer exist.
-  let shown = []
+  // The active branch is resolved on *every* read, not captured when `which`
+  // changes: a branch may be a nested `Show`/`When`/`For` whose own visible
+  // nodes change long after this swap, so a cached snapshot would leave a parent
+  // inserting nodes that are no longer the branch's group.
+  let which = -1
+  const active = () => (which === 1 ? props.children : props.fallback)
   // The anchor travels with the group: it is the insertion point a later swap
   // uses, so leaving it behind in the emptied fragment would insert the new
   // branch into a detached node.
-  range.kids = () => [...shown, anchor]
-  let which = -1
+  range.kids = () => [...nodes(active()), anchor]
   effect(() => {
     const next = props.when() ? 1 : 0
     if (next === which) return
-    take(shown)
+    // Remove the outgoing branch's *current* group, then flip, then insert the
+    // incoming branch's *current* group. `host` is null while this `Show` itself
+    // is hidden; the swap still happens so `kids()` serves the right branch.
+    take(nodes(active()))
     which = next
-    shown = nodes(which ? props.children : props.fallback)
     const host = anchor.parentNode
-    if (host) for (const n of shown) host.insertBefore(n, anchor)
+    if (host) for (const n of nodes(active())) host.insertBefore(n, anchor)
   })
   return range
 }
@@ -513,11 +532,11 @@ export function When(props) {
   const anchor = range.appendChild(document.createComment(""))
   const parent = frame
   let scope = null
-  // The active group, resolved on every read; `pending` is a caller-built
+  // Resolved on every read, same rule as `Show`; `pending` is a caller-built
   // constant node and `nodes` serves its group from the same accessor.
-  let shown = []
+  const active = () => (scope ? scope.node : props.pending)
   // Same rule as `Show`: the anchor is part of the group.
-  range.kids = () => [...shown, anchor]
+  range.kids = () => [...nodes(active()), anchor]
   effect(() => {
     const result = props.value()
     // A later pending state must not resurrect a disposed node, so `pending` is
@@ -528,12 +547,11 @@ export function When(props) {
         : build(parent, () =>
             result.status === "error" ? props.error(result.error) : props.children(result.data),
           )
-    take(shown)
+    take(nodes(active()))
     if (scope) disposeScope(scope)
     scope = next
-    shown = nodes(next ? next.node : props.pending)
     const host = anchor.parentNode
-    if (host) for (const n of shown) host.insertBefore(n, anchor)
+    if (host) for (const n of nodes(active())) host.insertBefore(n, anchor)
   })
   return range
 }

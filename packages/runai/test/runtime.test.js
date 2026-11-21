@@ -1123,20 +1123,27 @@ test("For rejects a duplicate key instead of dropping an item or reversing a row
   // `insertBefore(b, a)` and reverse the row's own nodes.
   const items = signal([{ id: 1, label: "first" }, { id: 1, label: "second" }])
   const ul = document.createElement("ul")
-  ul.appendChild(
-    For({
-      each: () => items(),
-      by: (i) => i.id,
-      children: (item) => {
-        const f = document.createDocumentFragment()
-        f.appendChild(document.createTextNode(item().label + ":"))
-        const b = document.createElement("b")
-        b.textContent = "b"
-        f.appendChild(b)
-        return f
-      },
-    }),
-  )
+  // The duplicate-key dev warning has its own test; keep this run's output clean.
+  const warn = console.warn
+  console.warn = () => {}
+  try {
+    ul.appendChild(
+      For({
+        each: () => items(),
+        by: (i) => i.id,
+        children: (item) => {
+          const f = document.createDocumentFragment()
+          f.appendChild(document.createTextNode(item().label + ":"))
+          const b = document.createElement("b")
+          b.textContent = "b"
+          f.appendChild(b)
+          return f
+        },
+      }),
+    )
+  } finally {
+    console.warn = warn
+  }
   // One row for one key: the duplicate must not create a second pass that
   // reverses the first row's nodes.
   expect(ul.textContent).toBe("first:b")
@@ -1163,3 +1170,129 @@ test("resource lands a rejected promise in the error state", async () => {
   expect(bad().status).toBe("error")
   expect(bad().error.message).toBe("net")
 })
+
+// --- fix round 2 ---
+
+test("a For nested in a hidden Show stays live and renders what changed while hidden", () => {
+  const visible = signal(true)
+  const items = signal([{ id: 1 }])
+  const root = document.createElement("div")
+  mount(
+    () =>
+      Show({
+        when: () => visible(),
+        fallback: document.createTextNode("hidden"),
+        children: For({
+          each: () => items(),
+          by: (i) => i.id,
+          children: (item) => document.createTextNode(String(item().id)),
+        }),
+      }),
+    root,
+  )
+  expect(root.textContent).toBe("1")
+  // Hiding takes the list's anchor out of the document. The list must still read
+  // `items` while detached: bailing before that read leaves the effect with no
+  // dependencies, i.e. permanently unsubscribed for the island's lifetime.
+  visible(false)
+  expect(root.textContent).toBe("hidden")
+  items([{ id: 1 }, { id: 2 }])
+  visible(true)
+  expect(root.textContent).toBe("12")
+  // And the rows it built while hidden are disposed on removal, not leaked.
+  items([])
+  expect(root.textContent).toBe("")
+})
+
+test("For warns in dev about a duplicate key and still renders the first item", () => {
+  const items = signal([{ id: 1, label: "first" }, { id: 1, label: "second" }])
+  const warn = console.warn
+  const warnings = []
+  console.warn = (m) => warnings.push(m)
+  const ul = document.createElement("ul")
+  try {
+    ul.appendChild(
+      For({
+        each: () => items(),
+        by: (i) => i.id,
+        children: (item) => document.createTextNode(item().label),
+      }),
+    )
+  } finally {
+    console.warn = warn
+  }
+  expect(ul.textContent).toBe("first")
+  // Dropping a row silently is undiagnosable: dev must say what happened and
+  // name the source rule that prevents it.
+  expect(warnings.length).toBe(1)
+  expect(warnings[0]).toContain("duplicate key")
+  expect(warnings[0]).toContain("RA003")
+})
+
+test("a Show nested in a Show inserts the live group after being re-shown", () => {
+  const outer = signal(true)
+  const inner = signal(true)
+  const items = signal([{ id: 1 }])
+  const list = For({
+    each: () => items(),
+    by: (i) => i.id,
+    children: (item) => document.createTextNode(String(item().id)),
+  })
+  const innerShow = Show({
+    when: () => inner(),
+    fallback: document.createTextNode("-"),
+    children: list,
+  })
+  const root = document.createElement("div")
+  mount(
+    () =>
+      Show({
+        when: () => outer(),
+        fallback: document.createTextNode("hidden"),
+        children: innerShow,
+      }),
+    root,
+  )
+  expect(root.textContent).toBe("1")
+  outer(false)
+  expect(root.textContent).toBe("hidden")
+  // The list builds rows while detached; re-showing the outer branch must insert
+  // the group the nested Show holds *now*, not a group captured when it swapped.
+  items([{ id: 1 }, { id: 2 }, { id: 3 }])
+  outer(true)
+  expect(root.textContent).toBe("123")
+})
+
+test("a When nested in a Show inserts the live group after being re-shown", () => {
+  const visible = signal(true)
+  const items = signal([{ id: 1 }])
+  // A resolved `When` whose branch is itself a `For`: the branch's visible nodes
+  // change while the When is detached, so re-showing must resolve them live.
+  const branch = When({
+    value: signal({ status: "success", data: 0 }),
+    pending: document.createTextNode("loading"),
+    error: () => document.createTextNode("err"),
+    children: () =>
+      For({
+        each: () => items(),
+        by: (i) => i.id,
+        children: (item) => document.createTextNode(String(item().id)),
+      }),
+  })
+  const root = document.createElement("div")
+  mount(
+    () =>
+      Show({
+        when: () => visible(),
+        fallback: document.createTextNode("hidden"),
+        children: branch,
+      }),
+    root,
+  )
+  expect(root.textContent).toBe("1")
+  visible(false)
+  items([{ id: 1 }, { id: 2 }])
+  visible(true)
+  expect(root.textContent).toBe("12")
+})
+
