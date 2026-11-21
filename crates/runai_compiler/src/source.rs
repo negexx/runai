@@ -156,6 +156,27 @@ pub(crate) fn raw_text(source: &str, span: Span) -> Option<&str> {
     source.get(span.start as usize..span.end as usize)
 }
 
+/// Whether `text` contains a line break.
+///
+/// Both consumers of the JSX whitespace rule need the same answer — [`check_jsx`]
+/// to report the one ambiguous case, [`crate::ir::lower_text`] to collapse the
+/// text — and `\r` is a line break too: a classic-Mac file separates its JSX lines
+/// with it. Treating only `\n` would keep a `\r`-separated node verbatim in the IR
+/// and never report the space it deletes.
+///
+/// [`check_jsx`]: crate::analyze::jsx::check_jsx
+pub(crate) fn has_line_break(text: &str) -> bool {
+    text.contains(['\r', '\n'])
+}
+
+/// Split `text` at line breaks, accepting `\n`, `\r\n`, and `\r`.
+///
+/// The one split rule, so the analysis and the lowering cannot disagree about
+/// what a line is. Empty lines are left in; every caller trims and drops them.
+pub(crate) fn lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split(['\r', '\n'])
+}
+
 /// Strip one pair of matching quote delimiters, if the text has one.
 ///
 /// The `body` fallback reads source text rather than Oxc's hoisted `directive`

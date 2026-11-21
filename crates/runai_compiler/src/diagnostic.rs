@@ -170,8 +170,9 @@ impl Code {
             }
             Code::RA014 => {
                 "Do what the message names for this construct: write the spread out, move the JSX \
-                 into the children, give the attribute or prop a value, wrap a root fragment in \
-                 one parent element, or keep exactly one JSX return."
+                 into the children or the returned tree, give the attribute or prop a value, wrap \
+                 a root fragment in one parent element, render a runtime primitive's markup \
+                 directly, or keep exactly one JSX return."
             }
         }
     }

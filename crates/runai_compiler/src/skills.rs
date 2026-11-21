@@ -53,15 +53,17 @@ fn why(code: Code) -> &'static str {
              decision that controls the 0 KB guarantee."
         }
         Code::RA014 => {
-            "The constructs it refuses are a capitalized or member-expression tag (component \
-             inlining and `<For>`/`<Show>`/`<When>` come with a later plan), a namespaced tag, a \
-             `<this>` tag, JSX inside a `{…}` expression, a JSX-valued attribute, a spread \
-             attribute or child, a fragment as the returned root, and a second JSX return. Each \
-             would either drop part of a node or copy JSX into a JavaScript expression where it \
-             cannot parse; emitting without it is wrong in a way nothing reports. The plan's \
-             later milestones lift these one slice at a time. An attribute with an empty \
-             expression (`name={}`) is deliberately **not** on this list: that is a parse error, \
-             reported as `RA007`, not valid syntax waiting for a later milestone."
+            "The constructs it refuses are a capitalized tag or member-expression tag (component \
+             inlining comes with a later plan), the runtime's own `<For>`/`<Show>`/`<When>` \
+             primitives (their lowering comes with a later plan and is not component inlining), \
+             a namespaced tag, a `<this>` tag, JSX inside a `{…}` expression, a JSX-valued \
+             attribute, a spread attribute or child, a fragment as the returned root, a second \
+             JSX return, and JSX in any other route body statement. Each would either drop part \
+             of a node or copy JSX into a JavaScript module where it cannot parse; emitting \
+             without it is wrong in a way nothing reports. The plan's later milestones lift \
+             these one slice at a time. An attribute with an empty expression (`name={}`) is \
+             deliberately **not** on this list: that is a parse error, reported as `RA007`, not \
+             valid syntax waiting for a later milestone."
         }
     }
 }
@@ -127,7 +129,7 @@ mod tests {
         let body = skill_body(Code::RA014);
         assert!(body.contains("limitation of the compiler"), "{body}");
         for construct in [
-            "capitalized or member-expression tag",
+            "capitalized tag or member-expression tag",
             "namespaced tag",
             "`<this>` tag",
             "JSX inside a `{…}` expression",
@@ -135,9 +137,18 @@ mod tests {
             "spread attribute or child",
             "returned root",
             "second JSX return",
+            "JSX in any other route body statement",
+            "`<For>`/`<Show>`/`<When>`",
         ] {
             assert!(body.contains(construct), "missing {construct}: {body}");
         }
+        // The runtime primitives are not components: a skill that sent an agent to
+        // component inlining for them would describe a mechanism that does not
+        // apply to the tag it wrote.
+        assert!(
+            body.contains("not component inlining"),
+            "the skill must not call the runtime primitives components: {body}"
+        );
         // The carried defect: an empty attribute expression is `RA007`, so
         // listing it as "valid syntax this milestone lacks" sends an agent
         // looking for a later milestone instead of at the parse error.

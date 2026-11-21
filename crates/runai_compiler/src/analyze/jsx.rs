@@ -2,7 +2,8 @@
 //!
 //! `analyze` runs these before anything is transformed, so every span points at
 //! what the agent actually wrote: the file the diagnostic quotes is the file the
-//! fix edits. Two rules live here.
+//! fix edits. Three rules live here: the whitespace ambiguity, the refusals, and
+//! "does a route body statement carry JSX".
 //!
 //! # `RA007`: a line break between inline siblings
 //!
@@ -34,8 +35,9 @@
 //!
 //! The full list, which is exactly the list lowering refuses:
 //!
-//! - a capitalized tag (`<Greeting/>`) or the runtime's `<For>`/`<Show>`/`<When>`
-//!   — component inlining comes with a later plan;
+//! - a capitalized tag (`<Greeting/>`) — component inlining comes with a later
+//!   plan, and the runtime's `<For>`/`<Show>`/`<When>` are refused as primitives
+//!   this milestone does not lower, not as components;
 //! - a member-expression tag (`<Shared.Header/>`);
 //! - a namespaced tag (`<svg:rect/>`) — this milestone emits unprefixed HTML;
 //! - a `<this>` tag;
@@ -45,7 +47,12 @@
 //! - a spread attribute (`{...rest}`) or a spread child (`{...items}`);
 //! - a JSX fragment as the route's returned markup — the IR's root is one node;
 //! - a second JSX `return` in the route body — lowering emits one root, and
-//!   dropping the other would render markup without part of a node.
+//!   dropping the other would render markup without part of a node;
+//! - JSX anywhere else in a route body statement (`const header = <h1/>`, a
+//!   nested renderer's `return`) — [`RouteIr::statements`] is copied into the
+//!   emitted `.mjs` verbatim, where JSX is a syntax error.
+//!
+//! [`RouteIr::statements`]: crate::ir::RouteIr::statements
 //!
 //! `RA014_NOT_SUPPORTED_YET` is the right code, not `RA007`: the parser accepted
 //! the file, and `RA007` means "the parser rejected this file" everywhere else.
@@ -67,14 +74,25 @@
 //! both functions.
 
 use oxc_ast::ast::{
-    ArrowFunctionBody, ExportDefaultDeclaration, ExportDefaultDeclarationKind, Expression,
-    Function, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement, JSXElementName,
-    JSXExpression, JSXExpressionContainer, JSXFragment, Program, ReturnStatement, Statement,
+    ArrowFunctionBody, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    Expression, Function, FunctionBody, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement,
+    JSXElementName, JSXExpression, JSXExpressionContainer, JSXFragment, Program, ReturnStatement,
+    Statement,
 };
 use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
 use crate::diagnostic::{Code, Diagnostic};
+use crate::source::{has_line_break, raw_text};
+
+/// The tags the runtime itself provides, in their capitalized declaration form.
+///
+/// They look like components to [`dom_tag`]'s capitalization rule, but they are
+/// not: they are this framework's list, conditional, and async primitives, and no
+/// later task in this milestone's plan gives the agent a way to write them. A
+/// diagnostic that called them "a component" would point at an inlining
+/// mechanism that does not exist for them.
+const RUNTIME_TAGS: &[&str] = &["For", "Show", "When"];
 
 /// Elements that flow inline with their neighbours, so a dropped space is
 /// visible. Everything else is block-level: a newline around it is layout, not
@@ -109,8 +127,9 @@ pub fn check_jsx(program: &Program, source: &str) -> Vec<Diagnostic> {
         diagnostics: Vec::new(),
     };
 
-    // The route's render is a separate question from "which elements exist", and
-    // both rules below are about the *returned root*.
+    // The route's render is a separate question from "which elements exist".
+    // Everything here is about the *returned root* or the statements the
+    // returned root replaces, so they are answered from one walk.
     if let Some(render) = route_render(program) {
         checker.root(render);
     }
@@ -134,11 +153,10 @@ impl JsxChecker<'_> {
     /// Spans here come from the program parsed from this very source, so the
     /// `None` arm is a constructed-AST case only. It is deliberately silent
     /// rather than panicking: this walk's job is to report, and a panic in a
-    /// diagnostic pass would hide every diagnostic after it.
+    /// diagnostic pass would hide every diagnostic after it. The rule itself is
+    /// [`crate::source::raw_text`], shared with lowering so the two cannot drift.
     fn slice(&self, span: Span) -> &str {
-        self.source
-            .get(span.start as usize..span.end as usize)
-            .unwrap_or("")
+        raw_text(self.source, span).unwrap_or("")
     }
 
     /// The two rules about the route's returned markup.
@@ -161,22 +179,30 @@ impl JsxChecker<'_> {
             )),
         }
 
+        let (Some(body), Some(return_span)) = (render.body, render.return_span) else {
+            return;
+        };
+        let returned = jsx_returns(body);
+        let root_span = render.root.span();
+
         // One root is emitted, so a second JSX return would lose the other branch
         // with no report. Only the route body is walked, and nested functions are
         // skipped: their `return`s belong to another component's render.
-        if let Some(body) = render.body {
-            let root_span = render.root.span();
-            if let Some(dropped) = jsx_returns(body)
-                .into_iter()
-                .find(|span| *span != root_span)
-            {
-                self.diagnostics.push(unsupported(
-                    dropped,
-                    "a second JSX return that lowering does not reach",
-                    "Return one element from the component body. Move the other markup into \
-                     that element, or split the branch into a component of its own.",
-                ));
-            }
+        if let Some(dropped) = returned.iter().copied().find(|span| *span != root_span) {
+            self.diagnostics.push(unsupported(
+                dropped,
+                "a second JSX return that lowering does not reach",
+                "Return one element from the component body. Move the other markup into \
+                 that element, or split the branch into a component of its own.",
+            ));
+        }
+
+        // Everything else in the body before the `return` is copied into the
+        // emitted module as JavaScript, so JSX there is a parse failure with no
+        // other report. The root return's own JSX is lowered, not copied, and a
+        // second return already has the more specific diagnostic above.
+        if let Some(span) = jsx_in_body_statements(body, return_span, &returned) {
+            self.diagnostics.push(body_jsx(span));
         }
     }
 }
@@ -278,7 +304,7 @@ impl JsxChecker<'_> {
                 continue;
             };
             let raw = self.slice(text.span);
-            if !raw.trim().is_empty() || !raw.contains('\n') {
+            if !raw.trim().is_empty() || !has_line_break(raw) {
                 continue;
             }
 
@@ -308,15 +334,19 @@ pub(crate) fn dom_tag<'a>(name: &'a JSXElementName<'a>) -> Result<&'a str, Refus
             let tag = identifier.name.as_str();
             // The parser lowercases nothing: a JSX *identifier* starting with a
             // capital is React's component convention, whatever Oxc's node kind
-            // is called.
+            // is called. The runtime's own `<For>`/`<Show>`/`<When>` share that
+            // spelling but are not components, so they get their own refusal.
             if tag.starts_with(|c: char| c.is_ascii_uppercase()) {
-                Err(Refusal::component(tag))
+                Err(Refusal::capitalized(tag))
             } else {
                 Ok(tag)
             }
         }
+        // A tag with an attribute (or any dotted reference) parses as
+        // `IdentifierReference`; the same capitalization rule applies, so both
+        // arms must share it or `<For/>` and `<For each={x}/>` would disagree.
         JSXElementName::IdentifierReference(identifier) => {
-            Err(Refusal::component(identifier.name.as_str()))
+            Err(Refusal::capitalized(identifier.name.as_str()))
         }
         JSXElementName::MemberExpression(_) => Err(Refusal {
             construct: "a member-expression tag (`<Namespace.Component>`)",
@@ -344,6 +374,19 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
+    /// A capitalized tag: a component, or one of the runtime's primitives.
+    ///
+    /// One entry point for both `JSXElementName` arms that can carry a capital, so
+    /// `<For/>` (an `Identifier`) and `<For each={x}/>` (an
+    /// `IdentifierReference`) cannot disagree about what they name.
+    fn capitalized(tag: &str) -> Self {
+        if RUNTIME_TAGS.contains(&tag) {
+            Self::runtime(tag)
+        } else {
+            Self::component(tag)
+        }
+    }
+
     /// A capitalized tag: a component this milestone cannot inline.
     fn component(tag: &str) -> Self {
         Self {
@@ -351,6 +394,33 @@ impl Refusal {
             repair: format!(
                 "`<{tag}>` names a component. Inline its markup here, or ask for component \
                  inlining in a later plan; this milestone renders DOM elements only."
+            ),
+        }
+    }
+
+    /// A runtime primitive: `<For>`, `<Show>`, or `<When>`.
+    ///
+    /// The honest repair is neither "inline it" (there is no markup to inline) nor
+    /// "wait for component inlining" (this is not a component). The primitive
+    /// lowers in a later plan, so the agent is told what to write until then and
+    /// which plan brings it.
+    fn runtime(tag: &str) -> Self {
+        let repair = match tag {
+            "For" => "Render the list one element at a time (spread the items into static \
+                      markup), or wait for `<For>` support in a later plan."
+                .to_string(),
+            "Show" => "Return one of the two elements conditionally from the component, or wait \
+                       for `<Show>` support in a later plan."
+                .to_string(),
+            "When" => "Render the `success` branch directly, or wait for `<When>` support in a \
+                       later plan."
+                .to_string(),
+            _ => unreachable!("RUNTIME_TAGS and this match must list the same tags"),
+        };
+        Self {
+            construct: "a runtime primitive (`<For>`, `<Show>`, `<When>`)",
+            repair: format!(
+                "`<{tag}>` is a runtime primitive this milestone does not lower. {repair}"
             ),
         }
     }
@@ -377,7 +447,8 @@ pub(crate) struct RouteRender<'a> {
 ///
 /// Every accepted export shape is mirrored from `analyze::component`'s resolver:
 /// an inline function declaration, function expression, or arrow function, any of
-/// them parenthesized, or a name declared in this file and exported as default.
+/// them parenthesized, or a name declared in this file — plainly or under
+/// `export` — and exported as default.
 pub(crate) fn route_render<'a>(program: &'a Program<'a>) -> Option<RouteRender<'a>> {
     for statement in &program.body {
         match statement {
@@ -465,18 +536,45 @@ fn render_of_name<'a>(
             .filter(|identifier| identifier.name == name)
             .and_then(|_| render_of_function(function)),
         Statement::VariableDeclaration(declaration) => {
-            declaration.declarations.iter().find_map(|declarator| {
-                if !declarator
-                    .id
-                    .get_identifier_name()
-                    .is_some_and(|identifier| identifier.as_str() == name)
-                {
-                    return None;
-                }
-                render_of_expression(program, declarator.init.as_ref()?, seen)
-            })
+            render_of_declaration(program, declaration, name, seen)
         }
+        // `export function Page() {…}` and `export const Page = …` are declared in
+        // this file just as plainly as the unexported forms above, and
+        // `analyze::component` resolves them. Without this arm a route exported
+        // under `export` and then named in `export default Page` resolves in the
+        // analyzer but not here, and lowering reports a compiler defect for a
+        // legal route.
+        Statement::ExportDeclaration(declaration) => match &declaration.declaration {
+            Declaration::FunctionDeclaration(function) => function
+                .id
+                .as_ref()
+                .filter(|identifier| identifier.name == name)
+                .and_then(|_| render_of_function(function)),
+            Declaration::VariableDeclaration(declaration) => {
+                render_of_declaration(program, declaration, name, seen)
+            }
+            _ => None,
+        },
         _ => None,
+    })
+}
+
+/// [`render_of_name`] for the declarators of one `const`/`let`/`var`.
+fn render_of_declaration<'a>(
+    program: &'a Program<'a>,
+    declaration: &'a oxc_ast::ast::VariableDeclaration<'a>,
+    name: &'a str,
+    seen: &mut Vec<&'a str>,
+) -> Option<RouteRender<'a>> {
+    declaration.declarations.iter().find_map(|declarator| {
+        if !declarator
+            .id
+            .get_identifier_name()
+            .is_some_and(|identifier| identifier.as_str() == name)
+        {
+            return None;
+        }
+        render_of_expression(program, declarator.init.as_ref()?, seen)
     })
 }
 
@@ -554,6 +652,33 @@ pub(crate) fn jsx_returns<'a>(body: &'a oxc_ast::ast::FunctionBody<'a>) -> Vec<S
     found.returns
 }
 
+/// The span of the first JSX node in a body statement *before* `return_span` that
+/// is not one of `excluded`, or `None`.
+///
+/// These statements are copied verbatim into [`crate::ir::RouteIr::statements`],
+/// which the emitters write to a `.mjs`, where `<li>` is a syntax error. The check
+/// is an AST walk over exactly the statements `ir::statements` slices, so the two
+/// cannot disagree about which range was emitted. The route's own `return` is
+/// excluded by span, and `excluded` carries the JSX of any second return: those
+/// have their own, more specific diagnostic, and lowering never copies them.
+pub(crate) fn jsx_in_body_statements<'a>(
+    body: &'a FunctionBody<'a>,
+    return_span: Span,
+    excluded: &[Span],
+) -> Option<Span> {
+    jsx_spans(|finder| {
+        for statement in body
+            .statements
+            .iter()
+            .filter(|statement| statement.span().end <= return_span.start)
+        {
+            finder.visit_statement(statement);
+        }
+    })
+    .into_iter()
+    .find(|span| !excluded.contains(span))
+}
+
 /// Collects the JSX each `return` statement returns, skipping nested functions.
 #[derive(Default)]
 struct JsxReturns {
@@ -620,25 +745,41 @@ fn is_inline(element: &JSXElement<'_>) -> bool {
 /// template literal are ordinary expressions whose text happens to contain `<`,
 /// and refusing them would reject valid routes.
 fn first_jsx(expression: &JSXExpression<'_>) -> Option<Span> {
-    let mut finder = JsxFinder::default();
-    finder.visit_jsx_expression(expression);
-    finder.found
+    jsx_spans(|finder| finder.visit_jsx_expression(expression))
+        .into_iter()
+        .next()
 }
 
-/// Records the first JSX node it meets while walking an expression.
+/// Every JSX node the walk meets, in walk order.
+///
+/// One collector for every "where is the first JSX?" question in the crate: the
+/// expression refusal here, the body-statement refusal, and lowering's invariant.
+/// Callers take `.first()` when they only need one, so "first" has one meaning
+/// rather than one implementation per caller.
 #[derive(Default)]
-struct JsxFinder {
-    found: Option<Span>,
+pub(crate) struct JsxSpans {
+    spans: Vec<Span>,
 }
 
-impl<'a> Visit<'a> for JsxFinder {
+impl<'a> Visit<'a> for JsxSpans {
     fn visit_jsx_element(&mut self, element: &JSXElement<'a>) {
-        self.found.get_or_insert(element.span);
+        self.spans.push(element.span);
     }
 
     fn visit_jsx_fragment(&mut self, fragment: &JSXFragment<'a>) {
-        self.found.get_or_insert(fragment.span);
+        self.spans.push(fragment.span);
     }
+}
+
+/// The JSX spans `walk` reaches, in walk order.
+///
+/// The spans are a list rather than just the first because a second `return`'s JSX
+/// is already reported by its own diagnostic: if it came first in a body it would
+/// otherwise hide an ordinary JSX-valued statement after it.
+pub(crate) fn jsx_spans(walk: impl FnOnce(&mut JsxSpans)) -> Vec<Span> {
+    let mut finder = JsxSpans::default();
+    walk(&mut finder);
+    finder.spans
 }
 
 /// The `RA007` for a line break that deletes a space.
@@ -669,6 +810,19 @@ fn unsupported(span: Span, construct: &str, repair: &str) -> Diagnostic {
         (span.start, span.end),
         format!("cannot lower {construct} yet: {repair}"),
     )
+}
+
+/// The `RA014` for JSX in a body statement that lowering copies verbatim.
+///
+/// The construct and repair are shared with [`crate::ir::lower_route`], so the
+/// analysis list and the lowering list cannot describe the same refusal two ways.
+pub(crate) const BODY_JSX_CONSTRUCT: &str = "JSX in a route body statement";
+pub(crate) const BODY_JSX_REPAIR: &str = "the component body is copied into the module above \
+                                          the template, where JSX is a syntax error. Write the \
+                                          markup inline in the returned tree instead.";
+
+fn body_jsx(span: Span) -> Diagnostic {
+    unsupported(span, BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR)
 }
 
 #[cfg(test)]
@@ -791,20 +945,32 @@ mod tests {
 
     /// Every tag refusal, one fixture each. These are the RA014 arms of the
     /// contract, and `ir.rs`'s `the_two_lists_are_equal` refuses the same shapes.
+    ///
+    /// `<For>`/`<Show>`/`<When>` get one assertion per tag: they are the runtime's
+    /// own primitives, not components, so their message must not send an agent to
+    /// component inlining that does not exist for them.
     #[test]
     fn every_unsupported_tag_is_ra014() {
         for (src, construct) in [
             ("const a = <div><Greeting /></div>\n", "a capitalized tag"),
-            (
-                "const a = <div><For each={x} /></div>\n",
-                "a capitalized tag",
-            ),
             (
                 "const a = <div><Shared.Header /></div>\n",
                 "member-expression",
             ),
             ("const a = <div><svg:rect /></div>\n", "namespaced tag"),
             ("const a = <div><this /></div>\n", "`<this>` tag"),
+            (
+                "const a = <div><For each={x} /></div>\n",
+                "runtime primitive",
+            ),
+            (
+                "const a = <div><Show when={x} /></div>\n",
+                "runtime primitive",
+            ),
+            (
+                "const a = <div><When value={x} /></div>\n",
+                "runtime primitive",
+            ),
         ] {
             let diagnostics = check(src);
             assert_eq!(diagnostics.len(), 1, "{src}: {diagnostics:?}");
@@ -812,6 +978,32 @@ mod tests {
             assert!(
                 diagnostics[0].message.contains(construct),
                 "{src}: the message must name the construct, got {:?}",
+                diagnostics[0].message
+            );
+        }
+    }
+
+    /// The runtime primitives say what the agent can actually do, and name the tag
+    /// it wrote. "Inline it" is not a repair for a primitive, and "later plan"
+    /// alone gives the agent nothing legal to try now.
+    #[test]
+    fn a_runtime_primitive_repair_is_actionable() {
+        for (tag, repair) in [
+            ("For", "one element at a time"),
+            ("Show", "conditionally"),
+            ("When", "success"),
+        ] {
+            let src = format!("const a = <div><{tag} /></div>\n");
+            let diagnostics = check(&src);
+            assert_eq!(diagnostics.len(), 1, "{src}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].message.contains(&format!("`<{tag}>`")),
+                "{src}: the message must name the tag, got {:?}",
+                diagnostics[0].message
+            );
+            assert!(
+                diagnostics[0].message.contains(repair),
+                "{src}: the message must carry the repair, got {:?}",
                 diagnostics[0].message
             );
         }
@@ -847,15 +1039,71 @@ mod tests {
         }
     }
 
-    /// A nested renderer is not a dropped return: its `return` belongs to another
-    /// component. The block-bodied shapes are the ones that would fail if the
-    /// walk descended into nested functions.
+    /// JSX in a body statement is copied into the emitted module as JavaScript,
+    /// where it is a syntax error. Both shapes are refused, and the diagnostic
+    /// names the construct.
     #[test]
-    fn a_nested_renderer_is_not_a_second_return() {
+    fn jsx_in_a_body_statement_is_ra014() {
         for src in [
-            "export default function P() { function Item() { return <li/> } return <ul><li>hi</li></ul> }\n",
-            "export default function P() { const Item = () => { return <li/> }; return <ul><li>hi</li></ul> }\n",
-            // A concise arrow body is the JSX; there is no return statement.
+            // An ordinary JSX-valued local.
+            "export default function P() { const header = <h1>x</h1>; return <p>{header}</p> }\n",
+            // A nested renderer's `return`, whose JSX never reaches the module.
+            "export default function P() { function Item() { return <li/> } return <ul/> }\n",
+            "export default function P() { const Item = () => { return <li/> }; return <ul/> }\n",
+            // A component declared above the route's return.
+            "export default function P() { const Item = () => <li/>; return <ul/> }\n",
+        ] {
+            let diagnostics = check(src);
+            assert_eq!(diagnostics.len(), 1, "{src}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, Code::RA014, "{src}");
+            assert!(
+                diagnostics[0]
+                    .message
+                    .contains("JSX in a route body statement"),
+                "{src}: the message must name the construct, got {:?}",
+                diagnostics[0].message
+            );
+        }
+    }
+
+    /// A second return's JSX has its own diagnostic. If it comes first in the body
+    /// it must not hide an ordinary JSX-valued statement after it: both are
+    /// reported, each under its own construct and at its own span.
+    #[test]
+    fn a_second_return_does_not_hide_a_later_body_statement() {
+        let src = "export default function P() { if (a) return <b/>; const header = <h1/>; return <i/> }\n";
+        let diagnostics = check(src);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics.iter().all(|d| d.code == Code::RA014));
+
+        let body = diagnostics
+            .iter()
+            .find(|d| d.message.contains("JSX in a route body statement"))
+            .expect("the body statement must be reported");
+        let (start, end) = body.span;
+        assert_eq!(
+            &src[start as usize..end as usize],
+            "<h1/>",
+            "the body-statement span must be that statement's JSX, not the second return's: {body:?}"
+        );
+
+        let dropped = diagnostics
+            .iter()
+            .find(|d| d.message.contains("second JSX return"))
+            .expect("the second return must be reported");
+        let (start, end) = dropped.span;
+        assert_eq!(&src[start as usize..end as usize], "<b/>", "{dropped:?}");
+    }
+
+    /// A nested renderer that is *not* JSX-valued is an ordinary function: a
+    /// handler, a helper returning a number, a component defined in another
+    /// declaration position. None of them carries JSX into `statements`.
+    #[test]
+    fn a_nested_renderer_without_jsx_is_clean() {
+        for src in [
+            "export default function P() { function twice(x) { return x * 2 } return <p>{twice(1)}</p> }\n",
+            // A concise arrow body is the JSX; there is no return statement, and
+            // nothing else in the body.
             "export default (props: Record<never, never>) => <p/>\n",
             "export default (props: Record<never, never>) => { return <p/> }\n",
             // A plain handler is not a renderer at all.
@@ -866,12 +1114,54 @@ mod tests {
     }
 
     /// A component tag nested inside another component is reported once per tag,
-    /// not once per ancestor.
+    /// not once per ancestor. Asserting only the *count* would pass if one tag
+    /// were reported twice and the other never, so each tag's message is counted.
     #[test]
     fn each_unsupported_tag_is_reported_once() {
         let diagnostics = check("const a = <div><Greeting><Other /></Greeting></div>\n");
         assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
         assert!(diagnostics.iter().all(|d| d.code == Code::RA014));
+        for tag in ["`<Greeting>`", "`<Other>`"] {
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|d| d.message.contains(tag))
+                    .count(),
+                1,
+                "{tag} must be reported exactly once: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// The spans are the agent's own: they index the *original* source, so the
+    /// slice a span names is the text the agent wrote. An implementation that
+    /// shifted every span would pass a code-only assertion, so one is checked
+    /// against the fixture by hand.
+    #[test]
+    fn a_span_slices_the_text_the_agent_wrote() {
+        let src = "const a = <p><b>a</b>\n<i>b</i></p>\n";
+        let diagnostics = check(src);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let (start, end) = diagnostics[0].span;
+        assert_eq!(
+            &src[start as usize..end as usize],
+            "\n",
+            "the span must be exactly the line break: {:?}",
+            diagnostics[0]
+        );
+    }
+
+    /// `\r` is a line break too. A classic-Mac file separates its JSX lines with
+    /// it, and the whitespace rule deletes the space there exactly as it does for
+    /// `\n`. Reporting only `\n` would keep the node verbatim and stay silent.
+    #[test]
+    fn a_carriage_return_is_a_line_break() {
+        let src = "const a = <p><b>a</b>\r<i>b</i></p>\n";
+        let diagnostics = check(src);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, Code::RA007);
+        let (start, end) = diagnostics[0].span;
+        assert_eq!(&src[start as usize..end as usize], "\r");
     }
 
     /// `{a < b}` is a comparison, not JSX. A string heuristic would refuse it.
