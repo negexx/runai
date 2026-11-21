@@ -49,9 +49,9 @@ if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
   globalThis.__runaiDevDeps = (stop) => (stop.node && stop.node.deps) || []
 }
 
-function openScope() {
-  const scope = { stops: new Set(), children: [], parent: frame }
-  frame.children.push(scope)
+function openScope(parent = frame) {
+  const scope = { stops: new Set(), children: [], parent }
+  parent.children.push(scope)
   return scope
 }
 
@@ -327,6 +327,243 @@ export function owner(fn) {
   if (typeof process !== "undefined" && process.env.NODE_ENV !== "production")
     dispose.scope = scope
   return dispose
+}
+
+// --- components ------------------------------------------------------------
+
+// A component body is not a tracking scope, so a builder function's reads must
+// not be attributed to the effect that happened to call it. Otherwise `<For>`
+// would read its own row signal during a rebuild, subscribe to it, and the next
+// reorder would write that signal from the effect that reads it, i.e. an
+// effect cycle. `build` opens a scope under `parent` (the frame at the call
+// site, not the transient effect run), clears the tracker for the duration of
+// `fn`, and hangs `fn`'s result on the scope as `scope.node` so the caller can
+// dispose the row/branch and still address its DOM node.
+function build(parent, fn) {
+  const scope = openScope(parent)
+  const prevTracker = tracker
+  const prevFrame = frame
+  tracker = null
+  frame = scope
+  try {
+    scope.node = fn(scope)
+  } catch (err) {
+    disposeScope(scope)
+    throw err
+  } finally {
+    tracker = prevTracker
+    frame = prevFrame
+  }
+  return scope
+}
+
+// template(html) -> <template> whose `.content` is the parsed fragment.
+// cloneNode the fragment's first child, never assign innerHTML on a live node:
+// the pinned emitter shape is `t.content.firstChild.cloneNode(true)`.
+export function template(html) {
+  const t = document.createElement("template")
+  t.innerHTML = html
+  // A fresh fragment every call: two mounts of one template must not share
+  // nodes. Cloning the whole fragment (not just its first child) keeps a
+  // multi-root template intact.
+  t.clone = () => t.content.cloneNode(true)
+  return t
+}
+
+// A builder may return a fragment — every `For`/`Show`/`When` does, so nesting
+// them is the normal composition. Inserting a fragment moves its children into
+// the parent and leaves the fragment itself empty and parentless, so callers
+// must capture the real nodes *before* the first insert and address the group,
+// never the fragment. (Read `childNodes` twice and the second pass is empty.)
+function nodes(node) {
+  if (!node) return []
+  return node.nodeType === 11 ? [...node.childNodes] : [node]
+}
+
+// For — keyed list. A row is built exactly once per key: surviving keys keep
+// their node *and* their row scope, so effects created by `children` keep
+// running; only the node's position changes. Keys that disappear have their row
+// scope disposed, which stops the effects and releases the row's signals.
+//
+// Rows live in the returned fragment, before a comment anchor maintained as its
+// last child. `anchor.parentNode` is therefore the fragment while the list is
+// detached and the real parent after the fragment is appended (appending a
+// fragment moves its children out), so one code path handles both, and no
+// wrapper element is introduced.
+export function For(props) {
+  const range = document.createDocumentFragment()
+  const anchor = range.appendChild(document.createComment(""))
+  const parent = frame
+  const rows = new Map()
+  effect(() => {
+    const host = anchor.parentNode
+    if (!host) return
+    const items = props.each() || []
+    const live = new Set()
+    for (const item of items) {
+      const key = props.by(item)
+      live.add(key)
+      const row = rows.get(key)
+      // A surviving row only gets its item signal written: its node and its
+      // effects are reused, so `children` is not re-run. That is what makes a
+      // row's local state survive a reorder.
+      if (row) row.item(item)
+      else {
+        const created = build(parent, (row) => {
+          row.item = signal(item)
+          return props.children(row.item)
+        })
+        created.nodes = nodes(created.node)
+        rows.set(key, created)
+      }
+    }
+    for (const [key, row] of rows) {
+      if (live.has(key)) continue
+      rows.delete(key)
+      // Take the row's nodes out of the document first, then dispose its scope:
+      // its effects stop, and its signals/deriveds are released with it. A
+      // surviving row is never touched this way.
+      take(row.nodes)
+      disposeScope(row)
+    }
+    // Walk backwards, inserting each row before the next one: only rows whose
+    // position actually changed are moved, and moving preserves identity.
+    let next = anchor
+    for (let i = items.length - 1; i >= 0; i--) {
+      const row = rows.get(props.by(items[i])).nodes
+      // A row that rendered nothing (a component returning null) occupies no
+      // position; it must not become the reference node for the row below it.
+      if (!row.length) continue
+      const last = row[row.length - 1]
+      // A duplicate key would ask the DOM to insert a node before itself, which
+      // throws. Stable keys are the source's job (RA003); bad input must not
+      // become a DOMException here.
+      if (last !== next && last.nextSibling !== next)
+        for (const n of row) if (n !== next) host.insertBefore(n, next)
+      next = row[0]
+    }
+  })
+  return range
+}
+
+// Show — conditional branch. The branches are caller-built nodes, so Show has
+// nothing of its own to dispose. It must NOT dispose the hidden branch either:
+// Task 5 disposal is terminal, so a hidden-then-shown branch would come back
+// dead. It only moves the active node(s) in and out of the document.
+export function Show(props) {
+  const range = document.createDocumentFragment()
+  const anchor = range.appendChild(document.createComment(""))
+  // Captured once: the branches are constant nodes, and a fragment branch is
+  // emptied by its first insertion, so it cannot be re-read later.
+  const kids = [nodes(props.fallback), nodes(props.children)]
+  let which = -1
+  let shown = []
+  effect(() => {
+    const next = props.when() ? 1 : 0
+    if (next === which) return
+    take(shown)
+    which = next
+    shown = kids[which]
+    const host = anchor.parentNode
+    if (host) for (const n of shown) host.insertBefore(n, anchor)
+  })
+  return range
+}
+
+// When — the only way to render an async value. Takes the accessor uncalled and
+// reads it inside an effect, so the pending branch is on screen synchronously
+// (before any promise can settle) and each status change swaps the branch.
+// A branch built from data gets its own scope, disposed when that branch
+// leaves, so its effects do not outlive the data they were built from.
+export function When(props) {
+  const range = document.createDocumentFragment()
+  const anchor = range.appendChild(document.createComment(""))
+  const parent = frame
+  // `pending` is a caller-built constant node, captured once and reused across
+  // reruns; re-reading it after an insert would find it empty if it is a
+  // fragment. The data branches are built per result, under their own scope.
+  const pending = nodes(props.pending)
+  let scope = null
+  let shown = []
+  effect(() => {
+    const result = props.value()
+    // A later pending state must not resurrect a disposed node, so `pending` is
+    // never disposed here; only a built branch carries a scope to dispose.
+    const next =
+      result.status === "pending"
+        ? null
+        : build(parent, () =>
+            result.status === "error" ? props.error(result.error) : props.children(result.data),
+          )
+    take(shown)
+    if (scope) disposeScope(scope)
+    scope = next
+    shown = next ? nodes(next.node) : pending
+    const host = anchor.parentNode
+    if (host) for (const n of shown) host.insertBefore(n, anchor)
+  })
+  return range
+}
+
+// Remove a group of nodes from wherever they are. A node already detached is
+// skipped: detaching is idempotent, so disposal order cannot double-remove.
+function take(list) {
+  for (const n of list) if (n.parentNode) n.parentNode.removeChild(n)
+}
+
+// resource(fn) -> accessor to { status: "pending" | "error" | "success" }.
+// The compute runs inside an effect, so a signal read before its first await
+// makes it re-run; a re-run aborts the previous call through the AbortSignal
+// handed to a one-argument `fn`. A synchronous throw and a rejected promise
+// both land in the error state: `When` must never need a try/catch.
+export function resource(fn) {
+  const out = signal({ status: "pending" })
+  effect(() => {
+    const ctrl = new AbortController()
+    // Registered in the effect's own scope: a re-run (or disposal of the
+    // caller's owner) aborts the in-flight call, and the check below keeps a
+    // late resolution from writing to a torn-down scope.
+    onDispose(() => ctrl.abort())
+    out({ status: "pending" })
+    let pending
+    try {
+      pending = fn.length ? fn({ signal: ctrl.signal }) : fn()
+    } catch (error) {
+      out({ status: "error", error })
+      return
+    }
+    Promise.resolve(pending).then(
+      (data) => {
+        if (!ctrl.signal.aborted) out({ status: "success", data })
+      },
+      (error) => {
+        if (!ctrl.signal.aborted) out({ status: "error", error })
+      },
+    )
+  })
+  return out
+}
+
+// mount(component, root) — an island's entry point. Everything the component
+// creates is owned by one scope, so the returned disposer tears down its
+// effects, signals, and listeners and takes its DOM out of the page. `owner`
+// already disposes a scope whose body throws, so a component that throws during
+// mount leaves nothing registered behind.
+export function mount(component, root) {
+  let kids = []
+  const dispose = owner(() => {
+    const node = component({})
+    if (!node) return
+    // A component may return a fragment (`Show`, `When`, `For` all do).
+    // `appendChild` moves the fragment's children out and leaves the fragment
+    // itself parentless, so capture the real nodes before appending.
+    kids = nodes(node)
+    root.appendChild(node)
+  })
+  return () => {
+    dispose()
+    take(kids)
+  }
 }
 
 // --- internals the emitter calls -------------------------------------------

@@ -1,5 +1,19 @@
 import { test, expect } from "bun:test"
-import { signal, derived, effect, owner, _setText, _setAttr, _on } from "../runtime.js"
+import {
+  signal,
+  derived,
+  effect,
+  owner,
+  _setText,
+  _setAttr,
+  _on,
+  For,
+  Show,
+  When,
+  resource,
+  mount,
+  template,
+} from "../runtime.js"
 
 test("signal reads and writes", () => {
   const count = signal(0)
@@ -602,4 +616,413 @@ test("_on's own disposer removes the listener and is idempotent", () => {
   off()
   expect(handlers.size).toBe(0)
   expect(removed).toBe(1)
+})
+
+// --- Task 6: templates, keyed For, Show, When, resource, mount ---
+
+test("For keyed updates reuse the same DOM node for the same key", () => {
+  const items = signal([{ id: 1, label: "a" }, { id: 2, label: "b" }])
+  const rendered = new Map()
+  const list = For({
+    each: () => items(),
+    by: (i) => i.id,
+    children: (item) => {
+      const el = document.createElement("li")
+      el.textContent = item().label
+      rendered.set(item().id, el)
+      return el
+    },
+  })
+  const nodeFor1 = rendered.get(1)
+  const nodeFor2 = rendered.get(2)
+  items([{ id: 2, label: "b" }, { id: 1, label: "a" }])
+  expect(list.childNodes[0]).toBe(nodeFor2)
+  expect(list.childNodes[1]).toBe(nodeFor1)
+  expect(rendered.size).toBe(2)
+})
+
+test("When requires pending and renders error branch", async () => {
+  const failing = resource(async () => { throw new Error("boom") })
+  const node = When({
+    value: failing,
+    pending: document.createTextNode("loading"),
+    error: (e) => document.createTextNode(`failed: ${e.message}`),
+    children: (d) => document.createTextNode(String(d)),
+  })
+  expect(node.textContent).toBe("loading")
+  await new Promise((r) => setTimeout(r, 0))
+  expect(node.textContent).toBe("failed: boom")
+})
+
+test("Show toggles on signal change", () => {
+  const on = signal(false)
+  const node = Show({ when: () => on(), fallback: document.createTextNode("off"), children: document.createTextNode("on") })
+  expect(node.textContent).toBe("off")
+  on(true)
+  expect(node.textContent).toBe("on")
+})
+
+test("mount runs a component into a root and disposes", () => {
+  const root = document.createElement("div")
+  const stop = mount(() => { const el = document.createElement("p"); el.textContent = "hi"; return el }, root)
+  expect(root.textContent).toBe("hi")
+  stop()
+})
+
+test("template clones markup", () => {
+  const t = template("<button class='x'>go</button>")
+  const a = t.content.firstChild.cloneNode(true)
+  expect(a.outerHTML).toBe("<button class=\"x\">go</button>")
+})
+
+// --- tests added beyond the brief: one per real hazard ---
+
+test("For disposes a removed row's effects and keeps the survivors'", () => {
+  const items = signal([{ id: 1 }, { id: 2 }])
+  const tick = signal(0)
+  const runs = { 1: 0, 2: 0 }
+  For({
+    each: () => items(),
+    by: (i) => i.id,
+    children: (item) => {
+      // Read the id once at build time, so the effect below does not read the
+      // row signal and cannot be woken by the reorder's item write.
+      const id = item().id
+      effect(() => {
+        tick()
+        runs[id]++
+      })
+      return document.createElement("li")
+    },
+  })
+  expect(runs).toEqual({ 1: 1, 2: 1 })
+  items([{ id: 2 }])
+  // Removing a key must run its effects' teardown, not merely drop the node:
+  // a leak here is the exact row leak Task 5 was fixed for.
+  tick(1)
+  expect(runs).toEqual({ 1: 1, 2: 2 })
+})
+
+test("For writes a changed item into the surviving row's signal", () => {
+  const items = signal([{ id: 1, label: "a" }])
+  let builds = 0
+  let list
+  list = For({
+    each: () => items(),
+    by: (i) => i.id,
+    children: (item) => {
+      builds++
+      const el = document.createElement("li")
+      effect(() => {
+        el.textContent = item().label
+      })
+      return el
+    },
+  })
+  items([{ id: 1, label: "b" }])
+  // The row's label must update without building a second row.
+  expect(list.textContent).toBe("b")
+  expect(builds).toBe(1)
+})
+
+test("For reorders live nodes in the document without recreating them", () => {
+  const items = signal([{ id: 1 }, { id: 2 }, { id: 3 }])
+  const nodes = new Map()
+  const ul = document.createElement("ul")
+  const list = For({
+    each: () => items(),
+    by: (i) => i.id,
+    children: (item) => {
+      const el = document.createElement("li")
+      el.textContent = String(item().id)
+      nodes.set(item().id, el)
+      return el
+    },
+  })
+  ul.appendChild(list)
+  expect(ul.querySelectorAll("li").length).toBe(3)
+  items([{ id: 3 }, { id: 1 }, { id: 2 }])
+  // Attaching a fragment moves its children out, so the anchor is now in `ul`
+  // and the same insertBefore path must still reorder the live nodes.
+  const lis = [...ul.querySelectorAll("li")]
+  expect(lis.map((n) => n.textContent)).toEqual(["3", "1", "2"])
+  expect(lis[0]).toBe(nodes.get(3))
+  expect(lis[1]).toBe(nodes.get(1))
+  expect(lis[2]).toBe(nodes.get(2))
+})
+
+test("For rows are owned by the scope that created the list", () => {
+  const root = document.createElement("div")
+  const tick = signal(0)
+  let runs = 0
+  const stop = mount(
+    () =>
+      For({
+        each: () => [{ id: 1 }],
+        by: (i) => i.id,
+        children: () => {
+          effect(() => {
+            tick()
+            runs++
+          })
+          return document.createElement("li")
+        },
+      }),
+    root,
+  )
+  expect(runs).toBe(1)
+  expect(root.querySelectorAll("li").length).toBe(1)
+  stop()
+  // A row built under `root` instead of the caller's frame would survive here.
+  tick(1)
+  expect(runs).toBe(1)
+})
+
+test("Show can show a branch again after hiding it", () => {
+  const on = signal(true)
+  const n = signal(0)
+  // The branch carries a live effect. An implementation that disposes the
+  // hidden branch — a tempting reading of "unmount it" — kills that effect for
+  // good (disposal is terminal in this runtime), so a later show renders a dead
+  // subtree that never updates again.
+  const branch = document.createElement("b")
+  effect(() => {
+    branch.textContent = String(n())
+  })
+  const node = Show({ when: () => on(), fallback: document.createTextNode("off"), children: branch })
+  expect(node.textContent).toBe("0")
+  on(false)
+  expect(node.textContent).toBe("off")
+  on(true)
+  expect(node.textContent).toBe("0")
+  n(1)
+  expect(node.textContent).toBe("1")
+})
+
+test("When renders the success branch once the promise resolves", async () => {
+  const ok = resource(async () => 42)
+  const node = When({
+    value: ok,
+    pending: document.createTextNode("loading"),
+    error: () => document.createTextNode("failed"),
+    children: (d) => document.createTextNode(`v${d}`),
+  })
+  expect(node.textContent).toBe("loading")
+  await new Promise((r) => setTimeout(r, 0))
+  expect(node.textContent).toBe("v42")
+})
+
+test("When disposes the branch it replaces", () => {
+  const state = signal({ status: "success", data: 1 })
+  const tick = signal(0)
+  let runs = 0
+  const node = When({
+    value: state,
+    pending: document.createTextNode("loading"),
+    error: () => document.createTextNode("err"),
+    children: () => {
+      effect(() => {
+        tick()
+        runs++
+      })
+      return document.createTextNode("ok")
+    },
+  })
+  expect(runs).toBe(1)
+  state({ status: "error", error: new Error("x") })
+  expect(node.textContent).toBe("err")
+  // The replaced branch's effect must have been disposed with it.
+  tick(1)
+  expect(runs).toBe(1)
+})
+
+test("resource re-runs on a dependency change and aborts the prior call", async () => {
+  const id = signal(1)
+  const signals = []
+  const r = resource(({ signal }) => {
+    signals.push(signal)
+    const current = id() // a tracked read: writing `id` re-runs the compute
+    return new Promise((resolve) => {
+      const t = setTimeout(() => resolve(current), 5)
+      signal.addEventListener("abort", () => {
+        clearTimeout(t)
+        resolve("stale")
+      })
+    })
+  })
+  id(2)
+  expect(signals.length).toBe(2)
+  expect(signals[0].aborted).toBe(true)
+  expect(signals[1].aborted).toBe(false)
+  await new Promise((res) => setTimeout(res, 20))
+  // The aborted call's late resolution must not overwrite the live one.
+  expect(r()).toEqual({ status: "success", data: 2 })
+})
+
+test("resource lands a synchronous throw in the error state", () => {
+  const bad = resource(() => {
+    throw new Error("sync")
+  })
+  // Not rejected, not pending, not thrown out of `resource`: `When` must never
+  // need a try/catch around the accessor.
+  expect(bad().status).toBe("error")
+  expect(bad().error.message).toBe("sync")
+})
+
+test("mount disposes the component's effects and takes its node out", () => {
+  const root = document.createElement("div")
+  const n = signal(0)
+  let runs = 0
+  const stop = mount(() => {
+    effect(() => {
+      n()
+      runs++
+    })
+    const el = document.createElement("p")
+    el.textContent = "hi"
+    return el
+  }, root)
+  expect(root.textContent).toBe("hi")
+  expect(runs).toBe(1)
+  stop()
+  expect(root.childNodes.length).toBe(0)
+  n(1)
+  expect(runs).toBe(1)
+})
+
+test("a component that throws during mount leaves no effects behind", () => {
+  const root = document.createElement("div")
+  const n = signal(0)
+  let runs = 0
+  const count = globalThis.__runaiDevStops
+  const base = count()
+  expect(() =>
+    mount(() => {
+      effect(() => {
+        n()
+        runs++
+      })
+      throw new Error("boom")
+    }, root),
+  ).toThrow("boom")
+  // `owner` disposes a throwing scope, so nothing may remain registered.
+  expect(count()).toBe(base)
+  n(1)
+  expect(runs).toBe(1)
+  expect(root.childNodes.length).toBe(0)
+})
+
+test("template clones an independent node each time", () => {
+  const t = template("<b>x</b>")
+  const a = t.content.firstChild.cloneNode(true)
+  const b = t.content.firstChild.cloneNode(true)
+  a.textContent = "changed"
+  expect(b.textContent).toBe("x")
+  expect(t.content.firstChild.textContent).toBe("x")
+})
+
+test("For rows that are themselves fragments keep order and identity", () => {
+  const items = signal([{ id: 1 }, { id: 2 }, { id: 3 }])
+  const ul = document.createElement("ul")
+  const list = For({
+    each: () => items(),
+    by: (i) => i.id,
+    children: (item) => {
+      const id = item().id
+      // A row is allowed to be a fragment: `<Show>`/`<When>`/a nested `<For>`
+      // all return one, so composition is the normal case.
+      const f = document.createDocumentFragment()
+      f.appendChild(document.createTextNode("a" + id))
+      const b = document.createElement("b")
+      b.textContent = "b" + id
+      f.appendChild(b)
+      return f
+    },
+  })
+  ul.appendChild(list)
+  expect(ul.textContent).toBe("a1b1a2b2a3b3")
+  const a2 = ul.childNodes[2]
+  items([{ id: 3 }, { id: 2 }, { id: 1 }])
+  expect(ul.textContent).toBe("a3b3a2b2a1b1")
+  expect(ul.childNodes[2]).toBe(a2) // same node, moved, not rebuilt
+  items([{ id: 3 }, { id: 1 }])
+  expect(ul.textContent).toBe("a3b3a1b1")
+})
+
+test("Show swaps a multi-node branch as a group", () => {
+  const on = signal(false)
+  const frag = document.createDocumentFragment()
+  const a = document.createElement("i")
+  const b = document.createElement("u")
+  frag.appendChild(a)
+  frag.appendChild(b)
+  const node = Show({ when: () => on(), fallback: document.createTextNode("off"), children: frag })
+  expect(node.textContent).toBe("off")
+  on(true)
+  // Inserting a fragment moves its children out and leaves it empty, so the
+  // second swap must address the captured nodes, not the fragment.
+  expect([...node.childNodes].filter((n) => n.nodeType !== 8)).toEqual([a, b])
+  on(false)
+  expect(node.textContent).toBe("off")
+  on(true)
+  expect([...node.childNodes].filter((n) => n.nodeType !== 8)).toEqual([a, b])
+})
+
+test("a resource disposed mid-flight aborts and never writes again", async () => {
+  let seen
+  let sig
+  const warn = console.warn
+  const warnings = []
+  console.warn = (m) => warnings.push(m)
+  try {
+    const stop = owner(() => {
+      seen = resource(({ signal }) => {
+        sig = signal
+        return new Promise((resolve) => setTimeout(() => resolve(1), 5))
+      })
+    })
+    expect(seen()).toEqual({ status: "pending" })
+    stop()
+    expect(sig.aborted).toBe(true)
+    await new Promise((r) => setTimeout(r, 20))
+  } finally {
+    console.warn = warn
+  }
+  // The late resolution must not write to the disposed state signal: that write
+  // is a no-op with a dev warning today, and it must not happen at all.
+  expect(warnings.length).toBe(0)
+})
+
+test("When goes back to pending when a new value is requested", () => {
+  const state = signal({ status: "success", data: "a" })
+  const pending = document.createTextNode("loading")
+  const node = When({
+    value: state,
+    pending,
+    error: () => document.createTextNode("err"),
+    children: (d) => document.createTextNode(String(d)),
+  })
+  expect(node.textContent).toBe("a")
+  state({ status: "pending" })
+  // `pending` is a caller-built constant node reused across reruns; the
+  // previously built success branch must have been disposed and removed.
+  expect(node.textContent).toBe("loading")
+  expect([...node.childNodes].includes(pending)).toBe(true)
+})
+
+test("For tolerates a row that renders nothing", () => {
+  const items = signal([{ id: 1, show: false }, { id: 2, show: true }])
+  const ul = document.createElement("ul")
+  ul.appendChild(
+    For({
+      each: () => items(),
+      by: (i) => i.id,
+      children: (item) =>
+        item().show ? document.createElement("li") : document.createDocumentFragment(),
+    }),
+  )
+  // An empty row occupies no position; the next row must still be inserted.
+  expect(ul.querySelectorAll("li").length).toBe(1)
+  items([{ id: 2, show: true }, { id: 1, show: false }])
+  expect(ul.querySelectorAll("li").length).toBe(1)
 })
