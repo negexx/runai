@@ -85,10 +85,13 @@ impl Code {
                  from?\", and a propless component has to write that answer down too."
             }
             Code::RA007 => {
-                "The parser rejected this file before it could be compiled. Nothing downstream — \
-                 lowering, analysis, codegen — can run without the tree the parser failed to \
-                 produce, so the parser's own message and location are reported instead of a \
-                 guess at what was meant."
+                "Either the parser rejected this file before it could be compiled, or a line \
+                 break sits between two inline elements. Nothing downstream — lowering, analysis, \
+                 codegen — can run on a tree the parser failed to produce, so the parser's own \
+                 message and location are reported instead of a guess at what was meant. A line \
+                 break between two inline elements is the other case: JSX deletes whitespace-only \
+                 text that contains a newline, so the space the author saw in the editor is not \
+                 the space the page shows."
             }
             Code::RA009 => {
                 "A signal is written during render: in the component body or in a JSX expression \
@@ -146,7 +149,9 @@ impl Code {
                 "Fix the syntax error the parser reported in `message`. In route files the usual \
                  causes are an unclosed element, an unterminated string inside an attribute, or \
                  adjacent sibling elements — add the missing `>` or closing element, close the \
-                 attribute string, or wrap the siblings in one parent element."
+                 attribute string, or wrap the siblings in one parent element. When `message` \
+                 names a line break between inline elements instead, the repair is the one it \
+                 carries. Put both on one line, or write {\" \"} where you want the space."
             }
             Code::RA009 => {
                 "Move the write into an `effect(...)` or the event handler that causes the change, \

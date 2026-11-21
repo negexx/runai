@@ -75,10 +75,24 @@ pub fn parse_tsx<'a>(
     alloc: &'a Allocator,
     source: &'a str,
 ) -> Result<&'a Program<'a>, Vec<Diagnostic>> {
+    parse_program(alloc, source).map(|parsed| &*alloc.alloc(parsed.program))
+}
+
+/// The parser's own return value, with every parser diagnostic mapped to
+/// `RA007_AMBIGUOUS_JSX`.
+///
+/// This is the one parse path: [`parse_tsx`] allocates the program from it, and
+/// [`crate::strip::strip_types`] needs the *owned* program because the
+/// transformer mutates it. Both therefore report a rejection identically, and a
+/// second `RA007` mapping cannot drift from this one.
+pub(crate) fn parse_program<'a>(
+    alloc: &'a Allocator,
+    source: &'a str,
+) -> Result<oxc_parser::ParserReturn<'a>, Vec<Diagnostic>> {
     let ret = Parser::new(alloc, source, SourceType::tsx()).parse();
 
     if ret.diagnostics.is_empty() {
-        return Ok(alloc.alloc(ret.program));
+        return Ok(ret);
     }
 
     Err(ret

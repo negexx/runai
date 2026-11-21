@@ -31,7 +31,9 @@ fn why(code: Code) -> &'static str {
         Code::RA007 => {
             "Nothing downstream — lowering, analysis, codegen — can run on a file with a syntax \
              error. The diagnostic carries the parser's own message and location so the repair \
-             lands where the error actually is."
+             lands where the error actually is. The same code covers a line break between two \
+             inline elements, because that is the other way the file's visible text and its \
+             rendered text disagree: JSX deletes whitespace-only text containing a newline."
         }
         Code::RA009 => {
             "Rendering must not have side effects. A write during render either runs once and \
@@ -51,12 +53,15 @@ fn why(code: Code) -> &'static str {
              decision that controls the 0 KB guarantee."
         }
         Code::RA014 => {
-            "The constructs it refuses are a spread (`{...rest}`), JSX inside a `{…}` \
-             expression, a JSX-valued attribute, an empty attribute expression, a fragment as \
-             the returned root, and a second JSX return. Each would either drop part of a node \
-             or copy JSX into a JavaScript expression where it cannot parse; emitting without it \
-             is wrong in a way nothing reports. The plan's later milestones lift these one slice \
-             at a time."
+            "The constructs it refuses are a capitalized or member-expression tag (component \
+             inlining and `<For>`/`<Show>`/`<When>` come with a later plan), a namespaced tag, a \
+             `<this>` tag, JSX inside a `{…}` expression, a JSX-valued attribute, a spread \
+             attribute or child, a fragment as the returned root, and a second JSX return. Each \
+             would either drop part of a node or copy JSX into a JavaScript expression where it \
+             cannot parse; emitting without it is wrong in a way nothing reports. The plan's \
+             later milestones lift these one slice at a time. An attribute with an empty \
+             expression (`name={}`) is deliberately **not** on this list: that is a parse error, \
+             reported as `RA007`, not valid syntax waiting for a later milestone."
         }
     }
 }
@@ -114,20 +119,31 @@ mod tests {
 
     /// Task 15 ships this body to users, and the RA014 skill must say which
     /// constructs the milestone refuses rather than leaving an agent to discover
-    /// them one cold run at a time.
+    /// them one cold run at a time. Every construct `analyze::jsx::check_jsx`
+    /// emits must appear here, and the empty-attribute case must be described as
+    /// a parse error rather than listed as valid syntax.
     #[test]
     fn ra014_explains_that_the_syntax_is_valid() {
         let body = skill_body(Code::RA014);
         assert!(body.contains("limitation of the compiler"), "{body}");
         for construct in [
-            "spread",
+            "capitalized or member-expression tag",
+            "namespaced tag",
+            "`<this>` tag",
             "JSX inside a `{…}` expression",
             "JSX-valued attribute",
-            "empty attribute expression",
+            "spread attribute or child",
             "returned root",
             "second JSX return",
         ] {
             assert!(body.contains(construct), "missing {construct}: {body}");
         }
+        // The carried defect: an empty attribute expression is `RA007`, so
+        // listing it as "valid syntax this milestone lacks" sends an agent
+        // looking for a later milestone instead of at the parse error.
+        assert!(
+            body.contains("that is a parse error, reported as `RA007`"),
+            "the empty-attribute case must be described as a parse error: {body}"
+        );
     }
 }

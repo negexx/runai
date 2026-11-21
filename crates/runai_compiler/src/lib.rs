@@ -5,6 +5,7 @@ pub mod diagnostic;
 pub mod ir;
 pub mod skills;
 pub mod source;
+pub mod strip;
 
 #[cfg(test)]
 mod tests {
