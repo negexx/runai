@@ -440,10 +440,12 @@ export function For(props) {
       // but RA003 is not implemented yet in this milestone, so the runtime must
       // not corrupt the DOM *and* must not drop a row without saying so. Dev
       // warning, not a throw: production keeps rendering whatever is renderable.
+      // The message says "not yet implemented" because this is all an agent ever
+      // sees: naming a diagnostic that does not exist sends it looking for one.
       if (live.has(key)) {
         if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
           console.warn(
-            "RUNAI_DEV duplicate key in For ignored: this row is not rendered. Give each item a stable, unique key (RA003).",
+            `RUNAI_DEV duplicate key in For ignored: the row with key ${String(key)} is not rendered. Give each item a stable, unique key (RA003, not yet implemented).`,
           )
         }
         continue

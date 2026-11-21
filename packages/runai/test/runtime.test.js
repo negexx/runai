@@ -1176,6 +1176,11 @@ test("resource lands a rejected promise in the error state", async () => {
 test("a For nested in a hidden Show stays live and renders what changed while hidden", () => {
   const visible = signal(true)
   const items = signal([{ id: 1 }])
+  // A shared read every row effect depends on. A removed row's own `item` is
+  // never written again, so an effect reading only that cannot show a leak; this
+  // one wakes every row effect that is still alive, which is exactly the leak.
+  const tick = signal(0)
+  let rowRuns = 0
   const root = document.createElement("div")
   mount(
     () =>
@@ -1185,7 +1190,14 @@ test("a For nested in a hidden Show stays live and renders what changed while hi
         children: For({
           each: () => items(),
           by: (i) => i.id,
-          children: (item) => document.createTextNode(String(item().id)),
+          children: (item) => {
+            const el = document.createTextNode(String(item().id))
+            effect(() => {
+              tick()
+              rowRuns++
+            })
+            return el
+          },
         }),
       }),
     root,
@@ -1199,7 +1211,22 @@ test("a For nested in a hidden Show stays live and renders what changed while hi
   items([{ id: 1 }, { id: 2 }])
   visible(true)
   expect(root.textContent).toBe("12")
-  // And the rows it built while hidden are disposed on removal, not leaked.
+  // Removal while the list is *detached* — the case the N1 fix created and the
+  // one a stale-snapshot or a bail-before-read would leak. The removal happens
+  // before `visible(true)`, so no row ever re-enters the document on this path.
+  visible(false)
+  expect(root.textContent).toBe("hidden")
+  items([])
+  // Shown again: the removed rows must not come back, and their effects must be
+  // gone, not merely detached. One wake of `tick` would rerun a leaked effect.
+  visible(true)
+  expect(root.textContent).toBe("")
+  const runsAfterRemoval = rowRuns
+  tick(1)
+  expect(rowRuns).toBe(runsAfterRemoval)
+  // Removal while shown still works after that round trip.
+  items([{ id: 3 }])
+  expect(root.textContent).toBe("3")
   items([])
   expect(root.textContent).toBe("")
 })
@@ -1226,7 +1253,10 @@ test("For warns in dev about a duplicate key and still renders the first item", 
   // name the source rule that prevents it.
   expect(warnings.length).toBe(1)
   expect(warnings[0]).toContain("duplicate key")
-  expect(warnings[0]).toContain("RA003")
+  // The message is all an agent ever sees, so it must name the offending key and
+  // must not send it looking for a check this milestone does not ship.
+  expect(warnings[0]).toContain("key 1")
+  expect(warnings[0]).toContain("RA003, not yet implemented")
 })
 
 test("a Show nested in a Show inserts the live group after being re-shown", () => {
