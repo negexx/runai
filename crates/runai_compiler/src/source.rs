@@ -35,22 +35,10 @@ const USE_ISLAND: &str = "use island";
 
 /// Which mode a parsed program declares, or `RA012_MISSING_MODE`.
 ///
-/// The program-based form of [`detect_mode`]: a caller that already holds a
-/// parsed route file reads the mode from it instead of parsing the source a
-/// second time. Same rule, one implementation — `detect_mode` is this function
-/// plus a parse.
-// `Err` is `Diagnostic` rather than `Box<Diagnostic>` for the same reason
-// `detect_mode`'s is: the interface is fixed.
-#[allow(clippy::result_large_err)]
-pub fn mode_of(program: &Program) -> Result<Mode, Diagnostic> {
-    match directive_content(program.source_text, program) {
-        Some(USE_STATIC) => Ok(Mode::Static),
-        Some(USE_ISLAND) => Ok(Mode::Island),
-        _ => Err(missing_mode()),
-    }
-}
-
-/// Which mode the first statement declares, or `RA012_MISSING_MODE`.
+/// One entry point, and the caller parses: [`parse_tsx`] returns the program,
+/// which is passed here with the `source` it was parsed from. The program
+/// supplies the directive prologue; the source supplies the text for the
+/// `body` fallback in [`directive_content`].
 ///
 /// Only a string literal statement in the first position counts. The comparison
 /// is against the directive's raw content, quotes stripped but escapes left
@@ -59,11 +47,12 @@ pub fn mode_of(program: &Program) -> Result<Mode, Diagnostic> {
 // The `Err` type is `Diagnostic`, not `Box<Diagnostic>`, because the interface is
 // fixed: every later consumer matches on `Result<_, Diagnostic>` directly.
 #[allow(clippy::result_large_err)]
-pub fn detect_mode(source: &str) -> Result<Mode, Diagnostic> {
-    let alloc = Allocator::default();
-    let ret = Parser::new(&alloc, source, SourceType::tsx()).parse();
-
-    mode_of(&ret.program)
+pub fn detect_mode<'a>(program: &'a Program<'a>, source: &'a str) -> Result<Mode, Diagnostic> {
+    match directive_content(source, program) {
+        Some(USE_STATIC) => Ok(Mode::Static),
+        Some(USE_ISLAND) => Ok(Mode::Island),
+        _ => Err(missing_mode()),
+    }
 }
 
 /// `RA012_MISSING_MODE`: the file never names a mode.
@@ -194,41 +183,26 @@ fn strip_quotes(raw: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// `mode_of` reads the mode from a program that is already parsed, and
-    /// `detect_mode` is that plus a parse. They are two entry points over one
-    /// rule, so they must never disagree — a divergence would make `lower_route`
-    /// and `detect_mode` report different modes for the same file.
-    #[test]
-    fn mode_of_agrees_with_detect_mode() {
-        for src in [
-            "\"use static\"\n",
-            "'use island'\n",
-            "// hi\n\"use static\"\n",
-            "import x from 'y'\n\"use static\"\n",
-            "\"use\\x20static\"\n",
-            "export default function A() { return <p/> }\n",
-            "",
-        ] {
-            let alloc = Allocator::default();
-            let ret = Parser::new(&alloc, src, SourceType::tsx()).parse();
-            assert_eq!(
-                mode_of(&ret.program).map_err(|d| d.code),
-                detect_mode(src).map_err(|d| d.code),
-                "{src:?}"
-            );
-        }
+    /// Parse, then read the mode: the one path every caller takes.
+    // The `Err` type is the fixed interface `Diagnostic`, not a boxing wrapper,
+    // so the lint fires on the test helper exactly as it does on `detect_mode`.
+    #[allow(clippy::result_large_err)]
+    fn mode(src: &str) -> Result<Mode, Diagnostic> {
+        let alloc = Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        detect_mode(program, src)
     }
 
     #[test]
     fn detects_static() {
         let src = "\"use static\"\nimport x from 'y'\n";
-        assert!(matches!(detect_mode(src), Ok(Mode::Static)));
+        assert!(matches!(mode(src), Ok(Mode::Static)));
     }
 
     #[test]
     fn detects_island() {
         let src = "\"use island\"\nexport default function A() { return <p/> }\n";
-        assert!(matches!(detect_mode(src), Ok(Mode::Island)));
+        assert!(matches!(mode(src), Ok(Mode::Island)));
     }
 
     /// Quote style carries no information about the mode, so a single-quoted
@@ -237,28 +211,29 @@ mod tests {
     /// would stay `RA012` forever.
     #[test]
     fn single_quotes_are_accepted() {
-        assert!(matches!(detect_mode("'use static'\n"), Ok(Mode::Static)));
-        assert!(matches!(detect_mode("'use island'\n"), Ok(Mode::Island)));
+        assert!(matches!(mode("'use static'\n"), Ok(Mode::Static)));
+        assert!(matches!(mode("'use island'\n"), Ok(Mode::Island)));
     }
 
     /// The directive must be the first statement; later positions are ordinary
-    /// string expressions and name no mode.
+    /// string expressions and name no mode. A directive placed after an import is
+    /// exactly that case, so it is `RA012` rather than an accepted mode.
     #[test]
-    fn directive_must_be_first() {
+    fn directive_after_an_import_is_ra012() {
         let src = "import x from 'y'\n\"use static\"\n";
-        assert_eq!(detect_mode(src).unwrap_err().code, Code::RA012);
+        assert_eq!(mode(src).unwrap_err().code, Code::RA012);
     }
 
     #[test]
     fn comment_before_the_directive_still_counts() {
         let src = "// hi\n\"use static\"\n";
-        assert!(matches!(detect_mode(src), Ok(Mode::Static)));
+        assert!(matches!(mode(src), Ok(Mode::Static)));
     }
 
     #[test]
     fn missing_directive_is_ra012() {
         let src = "export default function A() { return <p/> }\n";
-        let err = detect_mode(src).unwrap_err();
+        let err = mode(src).unwrap_err();
         assert_eq!(err.code, Code::RA012);
         assert!(err.fix.contains("\"use static\""));
     }
@@ -268,7 +243,7 @@ mod tests {
     #[test]
     fn escapes_do_not_smuggle_a_directive() {
         let src = "\"use\\x20static\"\nexport default function A() { return <p/> }\n";
-        assert_eq!(detect_mode(src).unwrap_err().code, Code::RA012);
+        assert_eq!(mode(src).unwrap_err().code, Code::RA012);
     }
 
     #[test]

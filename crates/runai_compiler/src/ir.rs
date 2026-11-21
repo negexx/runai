@@ -65,7 +65,7 @@ use oxc_span::{GetSpan, Span};
 
 use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
 use crate::diagnostic::{Code, Diagnostic};
-use crate::source::{Mode, mode_of, parse_tsx, raw_text};
+use crate::source::{Mode, detect_mode, parse_tsx, raw_text};
 
 /// One dynamic slot in an element.
 ///
@@ -169,7 +169,7 @@ pub struct RouteIr {
 pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
     let alloc = Allocator::default();
     let program = parse_tsx(&alloc, source)?;
-    let mode = mode_of(program).map_err(|diagnostic| vec![diagnostic])?;
+    let mode = detect_mode(program, source).map_err(|diagnostic| vec![diagnostic])?;
 
     // One summary, computed once and used three ways: the lowering walk
     // validates the component with it, and `RouteIr` takes its name and body
