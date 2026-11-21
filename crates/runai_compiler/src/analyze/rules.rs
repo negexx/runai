@@ -9,7 +9,12 @@
 //!   an `effect`. The effect re-runs when the signals it reads change and it reads
 //!   the signal it writes, so the write feeds its own run.
 //! - `RA009_IMPLICIT_EFFECT`: a write whose nearest function is a component body.
-//!   The component body runs once, so the write cannot re-run the component.
+//!
+#![doc = crate::diagnostic::ra009_consequence!()]
+//!
+//! That sentence is shared with `render_write`'s message, `Code::explain`,
+//! `Code::fix_template`, and the `RA009` skill body through `ra009_consequence!` in
+//! [`crate::diagnostic`], so no site can reword it alone.
 //!
 //! # The two exemptions a naive ancestor check gets wrong
 //!
@@ -36,10 +41,38 @@
 //! self-dependency shape `RA002` describes. It is **deliberately unpinned by a code**
 //! here: inventing one would claim a rule the plan does not have.
 //!
-//! The runtime catches only the self-dependent case. `resource`'s compute runs inside
-//! an effect, so a write to a signal it reads throws `effect cycle`; a `derived` that
-//! does the same throws the same error once a live effect reads that derived. A write
-//! to a signal the compute never reads is accepted silently in both cases.
+//! Of the runtime's two cycle guards, only one covers this shape: `execute`'s
+//! `e.running` check (`runtime.js:167`), which throws `effect cycle` when it is asked
+//! to run an effect that is already running. (`recompute`'s `d.busy` guard,
+//! `runtime.js:127-131`, is `derived cycle` and fires only for a derived that reads
+//! itself.) Both `execute` (`runtime.js:173`) and `recompute` (`runtime.js:133`)
+//! untrack at entry, so a running compute is a subscriber of a signal only if it has
+//! read that signal in the same run.
+//!
+//! - `resource`: the compute is the body of an effect. Writing a signal it has read
+//!   queues that same effect, and `flush` then executes it again while it is still
+//!   running, so the guard fires inside the compute's run. `flush` rethrows the error
+//!   from the setter (`runtime.js:217`), and `resource`'s own `try`/`catch` around
+//!   `fn(...)` turns it into `out({ status: "error", error })` (`runtime.js:596-599`).
+//!   Creating such a resource therefore does not throw: it answers `status: "error"`
+//!   carrying the `effect cycle` message. A later write from outside re-runs the
+//!   compute; when the compute writes that signal on every run, each run queues the
+//!   next, and `flush` throws `effects keep invalidating each other` when it exceeds
+//!   its wave limit to the external caller (`runtime.js:194-200`).
+//! - `derived`: `recompute` has no check for this shape — its `derived cycle` guard is
+//!   only for a derived that reads itself (`runtime.js:127-131`). The write marks the
+//!   derived dirty and, through it, queues the readers that had read it, so they run
+//!   again: measured, a derived precomputed and then subscribed computes twice and
+//!   throws nothing. The `effect cycle: an effect wrote a signal it reads` message
+//!   reaches the author only through `execute`'s guard, i.e. when the subscriber the
+//!   write queues is itself still running — which is what happens when the derived's
+//!   first compute runs inside the `effect(...)` that reads it (measured).
+//!
+//! A write to a signal the compute has **not** read in that run is accepted silently.
+//! The compute is not a subscriber of that signal (`untrack` cleared its deps at
+//! entry), so `propagate` walks other subscribers and never queues it — the compute is
+//! neither re-run nor told. Measured with a second effect watching the written signal:
+//! it sees the new value, and the resource neither errors nor re-runs.
 //!
 //! `a_write_inside_a_derived_is_not_ra002` and
 //! `a_write_inside_a_resource_is_not_flagged` pin the hole so a future reader sees a
@@ -152,10 +185,10 @@ fn render_write(call: &AccessorCall, component: &ComponentInfo<'_>) -> Diagnosti
         Code::RA009,
         call.span,
         format!(
-            "`{name}` is written while component `{component}` renders; the component body runs \
-             once, so this write cannot re-run the component",
+            "`{name}` is written while component `{component}` renders; {consequence}",
             name = call.name,
             component = component.display_name(),
+            consequence = crate::diagnostic::RA009_CONSEQUENCE,
         ),
     )
 }
@@ -358,8 +391,10 @@ mod tests {
     }
 
     /// A write inside a `derived` is not one of these three codes: the plan assigns
-    /// `RA002` to an effect only. The runtime rejects it, and this rule must not
-    /// claim a code the plan gave to another rule.
+    /// `RA002` to an effect only, and this rule must not claim a code the plan gave to
+    /// another rule. The runtime does not reject this shape either — the compute writes
+    /// `n` without having read it, so nothing joins it to this run (see the module docs)
+    /// — it is simply undiagnosed here.
     #[test]
     fn a_write_inside_a_derived_is_not_ra002() {
         let src = "export default function P() { const n = signal(0); const d = derived(() => { n(1); return 1 }); return <p>{d()}</p> }\n";
@@ -484,22 +519,54 @@ mod tests {
         let diagnostics = check_signal_rules(program, &b);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         let message = &diagnostics[0].message;
-        // `updates no reader` and `already rendered` are the exact false claim this
-        // message carried before: `flush` is synchronous, so a live effect or `_setText`
-        // node already subscribed to `n` *does* re-run with the new value.
-        for false_claim in [
-            "stale",
-            "re-trigger",
-            "re-run the render",
-            "updates no reader",
-            "already rendered",
-        ] {
+        // The exact claim this message carried before: `flush` is synchronous, so a live
+        // effect or `_setText` node already subscribed to `n` *does* re-run with the new
+        // value.
+        for false_claim in crate::diagnostic::RA009_FALSE_CLAIMS {
             assert!(
                 !message.to_ascii_lowercase().contains(false_claim),
                 "false claim `{false_claim}` in the message: {message}"
             );
         }
-        assert!(message.contains("runs once"), "{message}");
+        // The exact shared sentence, not a fragment of it. `runs once` alone is passed by
+        // "…runs once, so the write is never seen by a live reader", which is the false
+        // claim this whole round is about.
+        assert!(
+            message.contains(crate::diagnostic::RA009_CONSEQUENCE),
+            "the shared consequence is missing: {message}"
+        );
+    }
+
+    /// The module docs are the one `RA009` site no other test reaches — re-inserting a
+    /// denied claim there fails no other assertion. Three halves, because one alone is not
+    /// enough:
+    ///
+    /// 1. the docs take the shared macro. `include_str!` sees source, not expansion, so
+    ///    the assertion is on the attribute that pulls it. The needle is assembled with
+    ///    `concat!` so this test's own source does not satisfy it;
+    /// 2. the sentence is not written out literally in the file, which is what a hand-copy
+    ///    of the shared sentence would do;
+    /// 3. no entry of [`crate::diagnostic::RA009_FALSE_CLAIMS`] appears anywhere in the
+    ///    file (including this comment), which is the half that fails when the round-1
+    ///    reader claim is pasted back into the module docs.
+    #[test]
+    fn the_module_docs_state_only_the_true_consequence() {
+        const SRC: &str = include_str!("rules.rs");
+        let attribute = concat!("#![doc = crate::diagnostic::", "ra009_consequence!()]");
+        assert!(
+            SRC.contains(attribute),
+            "the module docs must take the shared sentence, not a literal copy of it"
+        );
+        assert!(
+            !SRC.contains(crate::diagnostic::RA009_CONSEQUENCE),
+            "the module docs contain a hand-written copy of the shared sentence"
+        );
+        for false_claim in crate::diagnostic::RA009_FALSE_CLAIMS {
+            assert!(
+                !SRC.to_ascii_lowercase().contains(false_claim),
+                "false claim `{false_claim}` in the module docs"
+            );
+        }
     }
 
     /// The message names the accessor and the component so the diagnostic is

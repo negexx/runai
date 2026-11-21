@@ -13,6 +13,55 @@
 
 use serde::Serialize;
 
+/// The one claim every `RA009` text site makes, and the only thing the runtime
+/// licenses: [`crate::analyze::rules`]'s `render_write` message, `Code::explain`,
+/// `Code::fix_template`, the `RA009` skill's `## Why it is an error`, and the module
+/// docs of [`crate::analyze::rules`] all take this sentence and no other.
+///
+/// A macro rather than a plain constant because the sites cannot all interpolate:
+/// `explain` and `fix_template` are `&'static str` built by `concat!` (which takes
+/// literals, not a `const`), and the module docs are `#![doc = …]`, whose value must
+/// be a literal too. This expansion is the single literal they share.
+macro_rules! ra009_consequence {
+    () => {
+        "The component body runs once, so this write cannot re-run the component."
+    };
+}
+pub(crate) use ra009_consequence;
+
+/// The claim every `RA009` text site must make and no other: the one sentence
+/// [`crate::analyze::rules`]'s `render_write`, `Code::explain`, `Code::fix_template`,
+/// the `RA009` skill's `## Why it is an error`, and the module docs of
+/// [`crate::analyze::rules`] all carry verbatim.
+pub(crate) const RA009_CONSEQUENCE: &str = ra009_consequence!();
+
+/// Every claim about a render-time write that `packages/runai/runtime.js` disproves,
+/// matched as a case-insensitive substring. Kept here, once, because two test modules
+/// assert it — [`crate::skills`] against the `RA009` skill body and
+/// [`crate::analyze::rules`] against the rendered message — and two copies would let
+/// one be reworded while the other kept agreeing with itself.
+///
+/// Each entry was a sentence this task's text actually carried:
+///
+/// - `stale`: "every such reader stays stale" — the runtime flushes writes
+///   synchronously, so a live subscriber *does* see the new value.
+/// - `re-trigger`, `re-run the render`: a component body is never invoked again
+///   (`mount` calls `component({})` once), so no write can re-run it.
+/// - `updates no reader`: the `stale` claim from the other direction.
+/// - `already rendered`: the premise of the stale claim; a reader that already
+///   rendered is exactly the one that updates.
+///
+/// `cfg(test)`: every user is a test module (this file's, [`crate::skills`]'s, and
+/// [`crate::analyze::rules`]'s), so a non-test build would have no referent for it.
+#[cfg(test)]
+pub(crate) const RA009_FALSE_CLAIMS: [&str; 5] = [
+    "stale",
+    "re-trigger",
+    "re-run the render",
+    "updates no reader",
+    "already rendered",
+];
+
 /// A stable diagnostic code. Codes are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
@@ -97,9 +146,12 @@ impl Code {
                  the space the page shows."
             }
             Code::RA009 => {
-                "A signal is written during render: in the component body or in a JSX expression \
-                 container. The component body runs once, so this write cannot re-run the \
-                 component. Rendering must not have side effects."
+                concat!(
+                    "A signal is written during render: in the component body or in a JSX \
+                     expression container. ",
+                    ra009_consequence!(),
+                    " Rendering must not have side effects."
+                )
             }
             Code::RA010 => {
                 "A `\"use static\"` route uses a signal, a derived value, an effect, a resource, \
@@ -160,9 +212,11 @@ impl Code {
             // nearest function is the function passed to `effect(...)`, so that repair would
             // land the agent straight in `RA002` at the same span.
             Code::RA009 => {
-                "Derive the value instead of writing it, or move the write into the event handler \
-                 that causes the change. The component body runs once, so this write cannot \
-                 re-run the component."
+                concat!(
+                    "Derive the value instead of writing it, or move the write into the event \
+                     handler that causes the change. ",
+                    ra009_consequence!()
+                )
             }
             Code::RA010 => "Change line 1 to \"use island\" to ship JavaScript for this route.",
             Code::RA011 => {
@@ -555,6 +609,20 @@ mod tests {
         for code in Code::all() {
             assert!(!code.explain().is_empty(), "{}", code.as_str());
             assert!(code.fix_template().len() > 20, "{}", code.as_str());
+        }
+    }
+
+    /// The shared sentence and the denied list are complements: the sentence must not
+    /// itself contain a denied claim, or every site that uses it would fail the very
+    /// assertion meant to catch a reword. This is the one test that reads both, and it
+    /// is why the sentence cannot be swapped for the round-1 wording unnoticed.
+    #[test]
+    fn the_shared_consequence_is_not_itself_a_denied_claim() {
+        for false_claim in RA009_FALSE_CLAIMS {
+            assert!(
+                !RA009_CONSEQUENCE.to_ascii_lowercase().contains(false_claim),
+                "the shared sentence carries the denied claim `{false_claim}`: {RA009_CONSEQUENCE}"
+            );
         }
     }
 }

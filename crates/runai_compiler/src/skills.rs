@@ -42,8 +42,10 @@ fn why(code: Code) -> &'static str {
              rendered text disagree: JSX deletes whitespace-only text containing a newline."
         }
         Code::RA009 => {
-            "Rendering must not have side effects. The component body runs once, so this write \
-             cannot re-run the component."
+            concat!(
+                "Rendering must not have side effects. ",
+                crate::diagnostic::ra009_consequence!()
+            )
         }
         Code::RA010 => {
             "Static routes ship zero bytes of JavaScript. There is no runtime on the page to run a \
@@ -91,6 +93,7 @@ pub fn skill_body(code: Code) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::{RA009_CONSEQUENCE, RA009_FALSE_CLAIMS};
 
     /// The drift test Task 15 depends on: a code with no body is a skill file
     /// that tells an agent nothing, which is worse than no file at all.
@@ -160,16 +163,8 @@ mod tests {
     /// banned here and in `render_write`'s message (pinned in `analyze::rules`).
     #[test]
     fn ra009_offers_a_legal_repair_and_states_only_the_true_consequence() {
-        // The claims the runtime disproves, in every casing.
-        const FALSE_CLAIMS: [&str; 5] = [
-            "stale",
-            "re-trigger",
-            "re-run the render",
-            "updates no reader",
-            "already rendered",
-        ];
         let assert_clean = |what: &str, text: &str| {
-            for false_claim in FALSE_CLAIMS {
+            for false_claim in RA009_FALSE_CLAIMS {
                 assert!(
                     !text.to_ascii_lowercase().contains(false_claim),
                     "false claim `{false_claim}` in the {what}: {text}"
@@ -188,19 +183,23 @@ mod tests {
         assert!(fix.contains("Derive the value"), "{fix}");
         assert!(fix.contains("event handler"), "{fix}");
         assert_clean("fix", fix);
+        assert!(
+            fix.contains(RA009_CONSEQUENCE),
+            "the shared sentence is missing: {fix}"
+        );
 
         let explain = Code::RA009.explain();
         assert_clean("explain", explain);
         assert!(
-            explain.contains("runs once") || explain.contains("cannot re-run the component"),
-            "the true half is missing: {explain}"
+            explain.contains(RA009_CONSEQUENCE),
+            "the shared sentence is missing: {explain}"
         );
 
         let why = skill_body(Code::RA009);
         assert_clean("skill body", &why);
         assert!(
-            why.contains("runs once") || why.contains("cannot re-run the component"),
-            "the true half is missing from the skill: {why}"
+            why.contains(RA009_CONSEQUENCE),
+            "the shared sentence is missing from the skill: {why}"
         );
     }
 
