@@ -14,7 +14,7 @@
 //! snippet matches how the component is actually exported.
 
 use crate::analyze::component::{ComponentInfo, ComponentKind};
-use crate::diagnostic::{Code, Diagnostic, Severity};
+use crate::diagnostic::{Code, Diagnostic};
 
 /// Check that `info`'s component declares its props type.
 ///
@@ -50,50 +50,38 @@ fn unannotated_props(info: &ComponentInfo) -> Diagnostic {
     // parse error, so the text an agent copies must use a legal identifier.
     let name = info.display_name();
 
-    // Where the fix names a signature, it must name the one that exists. When the
-    // component is exported through a name (`export default Page`, `export { Page
-    // as default }`), writing `export default function …` again is a duplicate
-    // default export — a parse error for an agent following the fix verbatim.
+    // Where the message names a signature, it must name the one that exists. When
+    // the component is exported through a name (`export default Page`, `export {
+    // Page as default }`), writing `export default function …` again is a duplicate
+    // default export — a parse error for an agent following the text verbatim.
     // There the repair is to annotate the existing declaration.
-    let signature = if info.inline_default {
-        format!("export default function {name}(props: Props)")
+    let declaration = if info.inline_default {
+        format!("export default function {name}")
     } else {
-        format!("function {name}(props: Props)")
+        format!("function {name}")
     };
 
-    let fix = if info.params == 0 {
+    // The canonical fix (one typed parameter) is the same for every component.
+    // The per-site part is the message: it names this declaration and the exact
+    // signature line to write.
+    let message = if info.params == 0 {
         // Propless. The type still has to be written down, so name the exact
         // type to declare — `Record<never, never>` is the "no props" object,
         // and an empty object type (`{}`) would accept anything.
         format!(
-            "Declare `type Props = Record<never, never>` and take it as a parameter: \
-             `{signature} {{ ... }}`."
+            "component `{name}` takes no props, but does not declare that in a type; write: \
+             {declaration}(props: Record<never, never>) {{"
         )
     } else {
-        // Props exist but their shape is unstated.
+        // Props exist but their shape is unstated. The alias name is derived from
+        // the component, so the text names a type the agent can add here.
         format!(
-            "Add a type for `{name}`'s props — e.g. `type {name}Props = {{ id: string }}` — and \
-             annotate the parameter: `function {name}(props: {name}Props)`."
+            "component `{name}` has untyped props; write: {declaration}(props: {name}Props) {{ \
+             with a type for `{name}`'s props, e.g. `type {name}Props = {{ id: string }}`"
         )
     };
 
-    Diagnostic {
-        code: Code::RA006,
-        severity: Severity::Error,
-        span: info.body_span,
-        message: if info.params == 0 {
-            format!("component `{name}` takes no props, but does not declare that in a type")
-        } else {
-            format!("component `{name}` has untyped props")
-        },
-        explain: "Props are the only way data enters a component, so their type is the written \
-                  answer to \"where does this value come from?\". An unannotated parameter leaves \
-                  that answer unstated, and a propless component leaves it to prose."
-            .into(),
-        fix,
-        doc: Code::RA006.skill_file(),
-        patch: None,
-    }
+    Diagnostic::new(Code::RA006, info.body_span, message)
 }
 
 #[cfg(test)]
@@ -137,14 +125,24 @@ mod tests {
     }
 
     /// The message is what an agent triages on; it must name the same mistake the
-    /// fix repairs. It used to be asserted only through the fix.
+    /// fix repairs — and, since the canonical fix is per code, it must carry the
+    /// exact signature line to write.
     #[test]
     fn a_propless_message_says_the_props_are_undeclared() {
         let src = "export default function Page() { return <p/> }\n";
         let d = check(src);
-        assert_eq!(
-            d[0].message,
-            "component `Page` takes no props, but does not declare that in a type"
+        assert!(
+            d[0].message.starts_with(
+                "component `Page` takes no props, but does not declare that in a type"
+            ),
+            "{:?}",
+            d[0].message
+        );
+        assert!(
+            d[0].message
+                .contains("export default function Page(props: Record<never, never>) {"),
+            "the message must carry the exact line to write: {:?}",
+            d[0].message
         );
         assert!(d[0].explain.contains("type"), "{}", d[0].explain);
     }
@@ -181,17 +179,17 @@ mod tests {
     }
 
     /// A rest parameter is a parameter: `function Page(...props)` is not
-    /// propless, so it must not get the "declare `Record<never, never>`" fix.
-    /// It is one untyped parameter, which is an untyped-props `RA006`.
+    /// propless, so its message must not offer the "declare `Record<never, never>`"
+    /// repair. It is one untyped parameter, which is an untyped-props `RA006`.
     #[test]
     fn rest_parameter_is_not_propless() {
         let src = "export default function Page(...props) { return <p/> }\n";
         let d = check(src);
         assert_eq!(d[0].code, crate::diagnostic::Code::RA006);
         assert!(
-            !d[0].fix.contains("Record<never, never>"),
-            "rest-only props got the propless fix: {:?}",
-            d[0].fix
+            !d[0].message.contains("Record<never, never>"),
+            "rest-only props got the propless repair: {:?}",
+            d[0].message
         );
 
         let typed = "export default function Page(...props: Props[]) { return <p/> }\n";
@@ -211,7 +209,7 @@ mod tests {
 
     /// An anonymous component is named `"default"`, which is the export's name,
     /// not a binding. Emitting it verbatim gives `function default(props)` — a
-    /// parse error that sends an agent following the fix into a loop it cannot
+    /// parse error that sends an agent following the message into a loop it cannot
     /// diagnose. Both branches must use a legal identifier.
     #[test]
     fn an_anonymous_component_gets_a_legal_identifier_in_the_fix() {
@@ -224,14 +222,15 @@ mod tests {
             let d = check(src);
             assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
             assert!(
-                !d[0].fix.contains("function default"),
+                !d[0].message.contains("function default"),
                 "{src} emitted an illegal identifier: {:?}",
-                d[0].fix
+                d[0].message
             );
             assert!(
-                d[0].fix.contains("function Page(props: Props)"),
+                d[0].message
+                    .contains("export default function Page(props: Record<never, never>)"),
                 "{src}: {:?}",
-                d[0].fix
+                d[0].message
             );
             assert!(
                 !d[0].message.contains("`default`"),
@@ -252,12 +251,20 @@ mod tests {
             let d = check(src);
             assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
             assert!(
-                !d[0].fix.contains("function default"),
+                !d[0].message.contains("function default"),
                 "{src} emitted an illegal identifier: {:?}",
-                d[0].fix
+                d[0].message
             );
-            assert!(!d[0].fix.contains("defaultProps"), "{src}: {:?}", d[0].fix);
-            assert!(d[0].fix.contains("type PageProps"), "{src}: {:?}", d[0].fix);
+            assert!(
+                !d[0].message.contains("defaultProps"),
+                "{src}: {:?}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains("type PageProps"),
+                "{src}: {:?}",
+                d[0].message
+            );
         }
     }
 
@@ -274,9 +281,9 @@ mod tests {
         }
     }
 
-    /// When the component reaches its default export through a name, the fix must
-    /// not tell the agent to write `export default function Page(…)`: that is a
-    /// second default export, i.e. a parse error for anyone who follows the text
+    /// When the component reaches its default export through a name, the message
+    /// must not tell the agent to write `export default function Page(…)`: that is
+    /// a second default export, i.e. a parse error for anyone who follows the text
     /// verbatim. The repair names the existing declaration instead.
     #[test]
     fn a_named_default_export_fix_does_not_add_a_second_export() {
@@ -286,39 +293,40 @@ mod tests {
         ] {
             let d = check(src);
             assert!(
-                !d[0].fix.contains("export default function"),
+                !d[0].message.contains("export default function"),
                 "{src}: {:?}",
-                d[0].fix
+                d[0].message
             );
             assert!(
-                d[0].fix.contains("`function Page(props: Props)"),
+                d[0].message
+                    .contains("function Page(props: Record<never, never>)"),
                 "{src}: {:?}",
-                d[0].fix
+                d[0].message
             );
         }
 
         // An inline default export is the thing to edit, and says so.
         let d = check("export default function Page() { return <p/> }\n");
         assert!(
-            d[0].fix
-                .contains("`export default function Page(props: Props)"),
+            d[0].message
+                .contains("export default function Page(props: Record<never, never>)"),
             "{:?}",
-            d[0].fix
+            d[0].message
         );
     }
 
-    /// The fix names the **binding**, not a conventional `Page`.
+    /// The message names the **binding**, not a conventional `Page`.
     ///
     /// `component_from_arrow` hardcoded `name: "default"`, and every earlier test
     /// happened to call its binding `Page`, which hid the difference. For a real
     /// file — `const AboutPage = (props) => <p/>; export default AboutPage` — the
-    /// fix said `function Page(props: Props)`: applying that verbatim declares a
+    /// text said `function Page(props: Props)`: applying that verbatim declares a
     /// new, unused `Page` and leaves `AboutPage` exactly as untyped as before, so
     /// the next run reports `RA006` again. The name in the text must be one the
     /// agent can find in this file.
     #[test]
     fn a_resolved_default_export_is_named_by_its_binding_not_page() {
-        for (src, expected_fix) in [
+        for (src, expected_text) in [
             (
                 "const AboutPage = (props) => <p/>\nexport default AboutPage\n",
                 "function AboutPage(props: AboutPageProps)",
@@ -329,46 +337,46 @@ mod tests {
             ),
             (
                 "const AboutPage = () => <p/>\nexport default AboutPage\n",
-                "`function AboutPage(props: Props)",
+                "function AboutPage(props: Record<never, never>",
             ),
             (
                 "const AboutPage = () => <p/>\nexport { AboutPage as default }\n",
-                "`function AboutPage(props: Props)",
+                "function AboutPage(props: Record<never, never>",
             ),
             (
                 // The name may also reach the export through parentheses.
                 "const AboutPage = () => <p/>\nexport default (AboutPage)\n",
-                "`function AboutPage(props: Props)",
+                "function AboutPage(props: Record<never, never>",
             ),
             (
                 // A named function expression is scoped to its own body: the
                 // module binding the agent can edit is the declarator's.
                 "const AboutPage = function Actual() { return <p/> }\nexport default AboutPage\n",
-                "`function AboutPage(props: Props)",
+                "function AboutPage(props: Record<never, never>",
             ),
             (
                 // Following an alias lands on the declaration that has the
                 // parameter, which is named `AboutPage`, not the alias.
                 "const Alias = (AboutPage)\nconst AboutPage = () => <p/>\nexport default Alias\n",
-                "`function AboutPage(props: Props)",
+                "function AboutPage(props: Record<never, never>",
             ),
         ] {
             let d = check(src);
             assert_eq!(d[0].code, crate::diagnostic::Code::RA006, "{src}");
             assert!(
-                d[0].fix.contains(expected_fix),
-                "{src}: expected the binding's name in the fix: {:?}",
-                d[0].fix
+                d[0].message.contains(expected_text),
+                "{src}: expected the binding's name in the message: {:?}",
+                d[0].message
             );
             assert!(
-                !d[0].fix.contains("function default"),
+                !d[0].message.contains("function default"),
                 "{src}: illegal identifier: {:?}",
-                d[0].fix
+                d[0].message
             );
             assert!(
-                !d[0].fix.contains("function Page("),
-                "{src}: the fix names a binding this file does not declare: {:?}",
-                d[0].fix
+                !d[0].message.contains("function Page("),
+                "{src}: the message names a binding this file does not declare: {:?}",
+                d[0].message
             );
             assert!(
                 d[0].message.contains("`AboutPage`"),
@@ -410,8 +418,8 @@ mod tests {
         }
     }
 
-    /// Every `RA006` points at its own skill file, so Task 15's generated docs
-    /// and these paths cannot drift apart.
+    /// Every `RA006` points at its own skill file in the installed location, so
+    /// Task 15's generated docs and these paths cannot drift apart.
     #[test]
     fn every_ra006_points_at_the_skill_file() {
         let alloc = oxc_allocator::Allocator::default();
@@ -419,16 +427,32 @@ mod tests {
         let program = parse_tsx(&alloc, src).unwrap();
         let info = find_route_component(program).unwrap();
         for diagnostic in check_props(&info) {
-            assert_eq!(diagnostic.doc, crate::diagnostic::Code::RA006.skill_file());
+            assert_eq!(diagnostic.doc, crate::diagnostic::Code::RA006.doc_path());
         }
     }
 
-    /// The propless fix names an exact type and signature. Applying it must be
+    /// The propless repair names an exact type and signature. Applying it must be
     /// clean on the next run, or the agent is in a repair loop.
     #[test]
     fn following_the_propless_fix_is_clean() {
+        // `Record<never, never>` as the annotation is what the message names, and
+        // the type alias is the one it tells the agent to declare.
         let src = "type Props = Record<never, never>\nexport default function Page(props: Props) { return <p/> }\n";
         assert!(check(src).is_empty());
+
+        let hint = "export default function Page() { return <p/> }\n";
+        let d = check(hint);
+        let line = d[0]
+            .message
+            .split(';')
+            .find(|part| part.contains("write:"))
+            .expect("the message names the line to write")
+            .replace("write:", "")
+            .replace('`', "")
+            .trim()
+            .to_string();
+        let applied = format!("type Props = Record<never, never>\n{line} return <p/> }}\n");
+        assert!(check(&applied).is_empty(), "{applied}");
     }
 
     /// Destructuring the props object (`function Page({ id }: Props)`) is an

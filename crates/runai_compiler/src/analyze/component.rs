@@ -18,7 +18,7 @@ use oxc_ast::ast::{
 };
 use oxc_span::GetSpan;
 
-use crate::diagnostic::{Code, Diagnostic, Severity};
+use crate::diagnostic::{Code, Diagnostic};
 
 /// Whether the default export is a function this milestone can analyze.
 ///
@@ -558,78 +558,41 @@ pub fn validate_route_component(info: Option<&ComponentInfo>) -> Vec<Diagnostic>
 
 /// `RA011_BAD_ROUTE_EXPORT`: the file has no default export.
 fn missing_component() -> Diagnostic {
-    Diagnostic {
-        code: Code::RA011,
-        severity: Severity::Error,
-        // There is no node to point at: the absence is the problem.
-        span: (0, 0),
-        message: "route file has no default-exported component".into(),
-        explain: "A page file's default export is its route component. Without one the router \
-                  has nothing to render, and a named export such as `export function Page` is \
-                  not picked up as the route."
-            .into(),
-        fix: "Add `export default function Page(props: Record<never, never>) { ... }` returning \
-              JSX, and remove or keep the named export as an ordinary module export."
-            .into(),
-        doc: Code::RA011.skill_file(),
-        patch: None,
-    }
+    // There is no node to point at: the absence is the problem.
+    Diagnostic::new(
+        Code::RA011,
+        (0, 0),
+        "route file has no default-exported component",
+    )
 }
 
 /// `RA011_BAD_ROUTE_EXPORT`: the route component expects props it cannot get.
 fn too_many_params(info: &ComponentInfo) -> Diagnostic {
-    Diagnostic {
-        code: Code::RA011,
-        severity: Severity::Error,
-        span: info.body_span,
-        message: format!(
+    Diagnostic::new(
+        Code::RA011,
+        info.body_span,
+        format!(
             "route component `{name}` takes {params} parameters, but a route takes at most one \
              annotated `props` parameter",
             name = info.display_name(),
             params = info.params,
         ),
-        explain: "A route is rendered by the router, not by a parent component, so the only value \
-                  that can reach it is its props object. A second parameter can never be filled, \
-                  and data the route needs must be read inside the route."
-            .into(),
-        fix: format!(
-            "Drop the extra parameters so `{name}` takes at most one annotated \
-             `props: Record<never, never>` parameter.",
-            name = info.display_name(),
-        ),
-        doc: Code::RA011.skill_file(),
-        patch: None,
-    }
+    )
 }
 
 /// `RA011_BAD_ROUTE_EXPORT`: the default export is not a component.
 fn does_not_return_jsx(info: &ComponentInfo) -> Diagnostic {
-    Diagnostic {
-        code: Code::RA011,
-        severity: Severity::Error,
-        span: info.body_span,
-        // "directly" is load-bearing: the component may well return JSX through
-        // a variable or a conditional. Only a direct `return <…/>` is recognized
-        // in this milestone, and the message must not assert what it cannot see.
-        message: format!(
+    // "directly" is load-bearing: the component may well return JSX through
+    // a variable or a conditional. Only a direct `return <…/>` is recognized
+    // in this milestone, and the message must not assert what it cannot see.
+    Diagnostic::new(
+        Code::RA011,
+        info.body_span,
+        format!(
             "route component `{name}` does not return JSX directly",
             name = info.display_name()
         ),
-        explain: "A component is a function that returns JSX. Only a direct `return <…/>` is \
-                  recognized in this milestone: a returned identifier, conditional, call, array, \
-                  or a `return` nested inside an `if` is not followed, because resolving what a \
-                  value renders requires type information this compiler does not have yet. The \
-                  repair is to return JSX from the component body itself, not to hunt for a bug \
-                  in the returned value."
-            .into(),
-        fix: format!(
-            "Return JSX directly from `{name}`, e.g. `return <main>...</main>`, so the router \
-             has markup to render.",
-            name = info.display_name(),
-        ),
-        doc: Code::RA011.skill_file(),
-        patch: None,
-    }
+    )
 }
 
 /// `RA011_BAD_ROUTE_EXPORT`: a default export exists, but it is not a component.
@@ -651,23 +614,7 @@ fn existing_export_is_not_a_component(info: &ComponentInfo) -> Diagnostic {
         )
     };
 
-    Diagnostic {
-        code: Code::RA011,
-        severity: Severity::Error,
-        span: info.body_span,
-        message,
-        explain: "A page file's default export must be the route component — a function that \
-                  returns JSX. A class, a literal, a call, or a component imported from another \
-                  module is not analyzed as a component in this milestone, and the compiler does \
-                  not guess what a value declared elsewhere renders."
-            .into(),
-        fix: "Replace the existing default export with a component instead of declaring a second \
-              default export: `export default function Page(props: Record<never, never>) { ... }` \
-              returning JSX."
-            .into(),
-        doc: Code::RA011.skill_file(),
-        patch: None,
-    }
+    Diagnostic::new(Code::RA011, info.body_span, message)
 }
 
 #[cfg(test)]
@@ -805,20 +752,25 @@ mod tests {
     }
 
     /// The two `RA011` repairs are different, and the difference is the whole
-    /// point: absent says "add", present-but-wrong must not.
+    /// point: absent says "add", present-but-wrong must not. The canonical fix
+    /// covers both branches, so the distinction has to be in the message.
     #[test]
     fn an_existing_export_is_never_told_to_add_one() {
         let alloc = Allocator::default();
         let program = parse_tsx(&alloc, "export default 42\n").unwrap();
         let info = find_route_component(program);
         let diagnostic = &validate_route_component(info.as_ref())[0];
-        assert!(!diagnostic.fix.contains("Add "), "{:?}", diagnostic.fix);
+        assert!(
+            !diagnostic.message.contains("Add "),
+            "{:?}",
+            diagnostic.message
+        );
         assert!(
             diagnostic
-                .fix
-                .contains("Replace the existing default export"),
+                .message
+                .contains("not a component the compiler can analyze"),
             "{:?}",
-            diagnostic.fix
+            diagnostic.message
         );
         assert!(
             !diagnostic
@@ -833,7 +785,13 @@ mod tests {
         let info = find_route_component(program);
         let diagnostic = &validate_route_component(info.as_ref())[0];
         assert!(info.is_none());
-        assert!(diagnostic.fix.contains("Add "), "{:?}", diagnostic.fix);
+        assert!(
+            diagnostic
+                .message
+                .contains("has no default-exported component"),
+            "{:?}",
+            diagnostic.message
+        );
     }
 
     /// A named export is not a route: picking it would validate the wrong node.
@@ -1134,10 +1092,9 @@ mod tests {
             );
             assert!(
                 !diagnostic.message.contains("`default`")
-                    && !diagnostic.fix.contains("function default"),
-                "{src}: illegal identifier in the text: {:?} / {:?}",
+                    && !diagnostic.message.contains("function default"),
+                "{src}: illegal identifier in the text: {:?}",
                 diagnostic.message,
-                diagnostic.fix
             );
         }
     }
@@ -1171,9 +1128,9 @@ mod tests {
                 diagnostic.message
             );
             assert!(
-                !diagnostic.fix.contains("`Page`"),
+                !diagnostic.message.contains("`Page`"),
                 "{src}: {:?}",
-                diagnostic.fix
+                diagnostic.message
             );
         }
     }
@@ -1183,7 +1140,7 @@ mod tests {
     #[test]
     fn every_diagnostic_points_at_the_skill_file() {
         for diagnostic in validate_route_component(None) {
-            assert_eq!(diagnostic.doc, Code::RA011.skill_file());
+            assert_eq!(diagnostic.doc, Code::RA011.doc_path());
         }
     }
 

@@ -16,7 +16,7 @@ use oxc_ast::ast::{Expression, Program, Statement};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 
-use crate::diagnostic::{Code, Diagnostic, Severity};
+use crate::diagnostic::{Code, Diagnostic};
 
 /// How a route file renders: prerendered with no JavaScript, or hydrated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,22 +68,12 @@ pub fn detect_mode(source: &str) -> Result<Mode, Diagnostic> {
 
 /// `RA012_MISSING_MODE`: the file never names a mode.
 fn missing_mode() -> Diagnostic {
-    Diagnostic {
-        code: Code::RA012,
-        severity: Severity::Error,
-        // The directive belongs at the very top of the file; point there.
-        span: (0, 0),
-        message: "route file has no `\"use static\"` or `\"use island\"` directive".into(),
-        explain: "Every route file must open with a string literal statement that names its \
-                  rendering mode. The compiler never infers the mode, so an agent adding a route \
-                  always gets one answer instead of a guess."
-            .into(),
-        fix: "Add `\"use static\"` (prerendered to HTML, no JavaScript) or `\"use island\"` \
-              (hydrated on boot) as the first statement of the file."
-            .into(),
-        doc: Code::RA012.skill_file(),
-        patch: None,
-    }
+    // The directive belongs at the very top of the file; point there.
+    Diagnostic::new(
+        Code::RA012,
+        (0, 0),
+        "route file has no `\"use static\"` or `\"use island\"` directive",
+    )
 }
 
 /// Parse a route file as TSX.
@@ -123,34 +113,14 @@ pub fn parse_tsx<'a>(
                 ),
             };
 
-            Diagnostic {
-                code: Code::RA007,
-                severity: Severity::Error,
-                span: label.map_or((0, 0), |label| {
+            Diagnostic::new(
+                Code::RA007,
+                label.map_or((0, 0), |label| {
                     let span = label.span();
                     (span.start, span.end)
                 }),
                 message,
-                // No parser text here: `message` already carries it, and repeating it
-                // in the structured output would just say the same thing twice.
-                explain: "The parser rejected this file before it could be compiled. The compiler \
-                          reports the parser's own words in `message` instead of guessing at what \
-                          was meant, because a wrong guess sends the repair into the wrong part of \
-                          the file."
-                    .into(),
-                // The cause is not known: `parse_tsx` maps *every* parser diagnostic
-                // here, including non-JSX ones (`Cannot assign to this expression`).
-                // So the markup mistakes are offered as the usual causes in route
-                // files, not as the diagnosis.
-                fix: "Fix the syntax error the parser reported in `message`. In route files the \
-                      usual causes are an unclosed element, an unterminated string inside an \
-                      attribute, or adjacent sibling elements — add the missing `>` or closing \
-                      element, close the attribute string, or wrap the siblings in one parent \
-                      element."
-                    .into(),
-                doc: Code::RA007.skill_file(),
-                patch: None,
-            }
+            )
         })
         .collect())
 }

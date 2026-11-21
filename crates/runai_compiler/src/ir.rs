@@ -48,10 +48,10 @@
 //!   (`if (a) return <b/>; return <i/>`). Lowering emits only the first, and
 //!   dropping the other would render markup without part of a node.
 //!
-//! All of them report `RA014_UNSUPPORTED_CONSTRUCT`, whose identity says what
-//! they are: valid syntax this milestone does not support. `RA007` stays what it
-//! is everywhere else — "the parser rejected this file" — because a skill file
-//! that sends an agent hunting for an unclosed tag in a file that parses repairs
+//! All of them report `RA014_NOT_SUPPORTED_YET`, whose identity says what they
+//! are: valid syntax this milestone does not support. `RA007` stays what it is
+//! everywhere else — "the parser rejected this file" — because a skill file that
+//! sends an agent hunting for an unclosed tag in a file that parses repairs
 //! nothing.
 
 use oxc_allocator::Allocator;
@@ -64,7 +64,7 @@ use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
 use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
-use crate::diagnostic::{Code, Diagnostic, Severity};
+use crate::diagnostic::{Code, Diagnostic};
 use crate::source::{Mode, mode_of, parse_tsx, raw_text};
 
 /// One dynamic slot in an element.
@@ -792,41 +792,30 @@ fn event_name(name: &str) -> Option<String> {
 
 /// A construct this milestone cannot lower.
 ///
-/// The code is `RA014_UNSUPPORTED_CONSTRUCT`, whose whole identity is "valid
-/// syntax this milestone does not support". `RA007` means "the parser rejected
-/// this file" everywhere else, and reusing it here would send an agent hunting
-/// for an unclosed tag in a file that parses.
-fn unsupported(span: Span, construct: &str, fix: &str) -> Diagnostic {
-    Diagnostic {
-        code: Code::RA014,
-        severity: Severity::Error,
-        span: (span.start, span.end),
-        message: format!("cannot lower {construct} yet"),
-        explain: "The parser accepted this file: this is a limitation of the compiler, not a \
-                  syntax error. Lowering reports the construct instead of dropping it, because \
-                  markup emitted without part of a node is wrong in a way nothing reports."
-            .into(),
-        fix: fix.into(),
-        doc: Code::RA014.skill_file(),
-        patch: None,
-    }
+/// The code is `RA014_NOT_SUPPORTED_YET`, whose whole identity is "valid syntax
+/// this milestone does not support". `RA007` means "the parser rejected this
+/// file" everywhere else, and reusing it here would send an agent hunting for an
+/// unclosed tag in a file that parses.
+///
+/// The repair is per construct, so it goes in the message: `RA014`'s canonical
+/// `fix_template` tells the agent to do what the message names.
+fn unsupported(span: Span, construct: &str, repair: &str) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        (span.start, span.end),
+        format!("cannot lower {construct} yet: {repair}"),
+    )
 }
 
 /// `{…}` with nothing in it, where a value is required.
 fn empty_expression(span: Span, kind: &str, fix_example: &str) -> Diagnostic {
-    Diagnostic {
-        code: Code::RA014,
-        severity: Severity::Error,
-        span: (span.start, span.end),
-        message: format!("cannot lower an {kind} with an empty expression"),
-        explain: "`{}` carries no value, so there is nothing for codegen to emit. The parser \
-                  accepts it in a child position (where it simply renders nothing) but an \
-                  attribute or prop needs something to set."
-            .into(),
-        fix: format!("Give the {kind} a value, e.g. {fix_example}."),
-        doc: Code::RA014.skill_file(),
-        patch: None,
-    }
+    Diagnostic::new(
+        Code::RA014,
+        (span.start, span.end),
+        format!(
+            "cannot lower an {kind} with an empty expression: give the {kind} a value, e.g. {fix_example}"
+        ),
+    )
 }
 
 /// The route analyzer found a component, but this module could not locate the JSX
@@ -835,20 +824,13 @@ fn empty_expression(span: Span, kind: &str, fix_example: &str) -> Diagnostic {
 /// Unreachable while the two walkers agree; it exists so a divergence is a
 /// diagnostic an agent can read instead of a panic or empty output.
 fn unlowerable_export() -> Diagnostic {
-    Diagnostic {
-        code: Code::RA011,
-        severity: Severity::Error,
-        span: (0, 0),
-        message: "route component's returned JSX could not be located".into(),
-        explain: "The route analyzer accepted the default export, but lowering could not find the \
-                  JSX it returns. That is a compiler defect, not a problem with the route."
-            .into(),
-        fix: "Return JSX directly from the default export, e.g. `return <main>...</main>`, and \
-              report the route if this diagnostic persists."
-            .into(),
-        doc: Code::RA011.skill_file(),
-        patch: None,
-    }
+    // `span: (0, 0)` renders as `file:1:1`, which claims a real location.
+    Diagnostic::new(
+        Code::RA011,
+        (0, 0),
+        "route component's returned JSX could not be located: return JSX directly from the \
+         default export, and report the route if this diagnostic persists",
+    )
 }
 
 #[cfg(test)]
@@ -1166,7 +1148,10 @@ mod tests {
         // The identity must not blame the syntax. `RA007` means "the parser could
         // not read this" and would send an agent hunting for an unclosed tag in a
         // file that parses; `RA014` names what this is.
-        assert_eq!(errs[0].doc, "skills/RA014_UNSUPPORTED_CONSTRUCT.md");
+        assert_eq!(
+            errs[0].doc,
+            "node_modules/runai/skills/RA014_NOT_SUPPORTED_YET.md"
+        );
         assert!(
             errs[0].explain.contains("parser accepted"),
             "the explain must not blame the syntax: {:?}",
