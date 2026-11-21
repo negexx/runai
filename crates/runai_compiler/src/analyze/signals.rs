@@ -42,7 +42,7 @@ use oxc_span::GetSpan;
 use oxc_syntax::scope::ScopeFlags;
 
 /// The module every reactive primitive must be imported from.
-const PRIMITIVE_SOURCE: &str = "runai";
+pub(crate) const PRIMITIVE_SOURCE: &str = "runai";
 
 /// A reactive primitive `"runai"` exports.
 ///

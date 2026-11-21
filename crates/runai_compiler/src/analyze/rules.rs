@@ -1,6 +1,7 @@
-//! `RA001`, `RA002`, and `RA009`: where a signal is read or written.
+//! `RA001`, `RA002`, `RA009`, and `RA010`: where a signal is read or written.
 //!
-//! All three answer one question about one call: *what owns this read or write?*
+//! The first three answer one question about one call: *what owns this read or
+//! write?*
 //!
 //! - `RA001_UNTRACKED_READ`: a read whose nearest function is a component body and
 //!   which is not inside a tracking scope. Nothing re-runs it, so the value on
@@ -9,6 +10,8 @@
 //!   an `effect`. The effect re-runs when the signals it reads change and it reads
 //!   the signal it writes, so the write feeds its own run.
 //! - `RA009_IMPLICIT_EFFECT`: a write whose nearest function is a component body.
+//! - `RA010_STATIC_VIOLATION`: any of the above in a `"use static"` route, where
+//!   there is no runtime at all — see [`check_static_mode`].
 //!
 #![doc = crate::diagnostic::ra009_consequence!()]
 //!
@@ -93,6 +96,8 @@
 use crate::analyze::component::{ComponentInfo, find_components};
 use crate::analyze::signals::{AccessorCall, SignalBindings};
 use crate::diagnostic::{Code, Diagnostic};
+use crate::source::Mode;
+use oxc_ast_visit::Visit;
 
 /// Emit `RA001`, `RA002`, and `RA009` for `program`.
 ///
@@ -118,6 +123,126 @@ pub fn check_signal_rules(
         (left.span.0, left.code.as_str()).cmp(&(right.span.0, right.code.as_str()))
     });
     diagnostics
+}
+
+/// Emit `RA010` for every construct a `"use static"` route cannot run.
+///
+/// A static route is prerendered to HTML at build time and ships **zero bytes** of
+/// JavaScript, so there is no runtime on the page: a signal, a derived value, an
+/// effect, a resource, a write, or a JSX event handler would silently do nothing.
+/// This is the compiler-enforced form of that guarantee, not an observation about
+/// build output.
+///
+/// Three sources, all resolved, never matched by name:
+///
+/// - [`SignalBindings::primitive_calls`] — `signal(…)`, `derived(…)`, `effect(…)`,
+///   `resource(…)` through the `"runai"` import. A local function that happens to
+///   be called `signal` is an ordinary function and is not here, which is why this
+///   reads the bindings rather than the text;
+/// - [`AccessorCall::write`] — `count(next)`. The declaration it writes was already
+///   reported as its own primitive call, at its own span;
+/// - a JSX attribute named `on` followed by an uppercase letter — `onClick`,
+///   `onMount`. A lowercase `on…` name (`onclick`, or an ordinary `once`) is not
+///   the handler naming convention and is not flagged.
+///
+/// **Plain expressions are allowed.** `{title}` where `title` is a local constant
+/// needs no runtime: it is evaluated once, at build time, and becomes text in the
+/// prerendered HTML. Only constructs that require code to run are refused.
+///
+/// [`SignalBindings::primitive_calls`]: crate::analyze::signals::SignalBindings::primitive_calls
+pub fn check_static_mode(
+    mode: Mode,
+    program: &oxc_ast::ast::Program<'_>,
+    bindings: &SignalBindings,
+) -> Vec<Diagnostic> {
+    if mode != Mode::Static {
+        return Vec::new();
+    }
+
+    let mut diagnostics: Vec<Diagnostic> = bindings
+        .primitive_calls
+        .iter()
+        .map(|&span| static_primitive(span))
+        .collect();
+
+    diagnostics.extend(
+        bindings
+            .accessor_calls
+            .iter()
+            .filter(|call| call.write)
+            .map(static_write),
+    );
+
+    let mut handlers = HandlerCollector::default();
+    handlers.visit_program(program);
+    diagnostics.extend(handlers.spans.iter().map(|&span| static_handler(span)));
+
+    diagnostics.sort_by(|left, right| {
+        (left.span.0, left.code.as_str()).cmp(&(right.span.0, right.code.as_str()))
+    });
+    diagnostics
+}
+
+/// `RA010_STATIC_VIOLATION`: a runtime primitive in a static route.
+fn static_primitive(span: (u32, u32)) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA010,
+        span,
+        "a \"use static\" route calls a runtime primitive; it ships no JavaScript, so \
+         this would run nothing",
+    )
+}
+
+/// `RA010_STATIC_VIOLATION`: a write to an accessor in a static route.
+fn static_write(call: &AccessorCall) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA010,
+        call.span,
+        format!(
+            "`{name}` is written in a \"use static\" route; it ships no JavaScript, so the \
+             write would never happen",
+            name = call.name,
+        ),
+    )
+}
+
+/// `RA010_STATIC_VIOLATION`: an event handler in a static route.
+fn static_handler(span: (u32, u32)) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA010,
+        span,
+        "a \"use static\" route has no runtime, so this event handler would never be \
+         attached or fire",
+    )
+}
+
+/// Every `on` + uppercase JSX attribute in the file.
+///
+/// A walk rather than a name list: the convention is "`on` followed by an
+/// uppercase letter", so `onClick`, `onMount`, and `onKeyDown` are all handlers
+/// without this rule having to enumerate DOM events, and `once` or `onclick` are
+/// not. A namespaced attribute (`foo:onClick`) is not this shape either.
+#[derive(Default)]
+struct HandlerCollector {
+    spans: Vec<(u32, u32)>,
+}
+
+impl<'a> Visit<'a> for HandlerCollector {
+    fn visit_jsx_attribute(&mut self, attribute: &oxc_ast::ast::JSXAttribute<'a>) {
+        if let oxc_ast::ast::JSXAttributeName::Identifier(name) = &attribute.name
+            && is_handler_name(name.name.as_str())
+        {
+            self.spans.push((name.span.start, name.span.end));
+        }
+        oxc_ast_visit::walk::walk_jsx_attribute(self, attribute);
+    }
+}
+
+/// Whether `name` is `on` followed by an uppercase letter.
+fn is_handler_name(name: &str) -> bool {
+    name.strip_prefix("on")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(char::is_uppercase)
 }
 
 /// The diagnostic, if any, for one accessor call.
