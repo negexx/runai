@@ -179,7 +179,7 @@ fn directive_content<'a>(source: &'a str, program: &'a Program<'a>) -> Option<&'
 
 /// The raw source text a span names, quotes included, or `None` if the span falls
 /// outside the source or off a character boundary.
-fn raw_text(source: &str, span: Span) -> Option<&str> {
+pub(crate) fn raw_text(source: &str, span: Span) -> Option<&str> {
     source.get(span.start as usize..span.end as usize)
 }
 

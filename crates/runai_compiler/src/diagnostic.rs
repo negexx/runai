@@ -18,6 +18,7 @@ pub enum Code {
     RA010,
     RA011,
     RA012,
+    RA014,
 }
 
 impl Code {
@@ -37,6 +38,7 @@ impl Code {
             Code::RA010 => "RA010_STATIC_VIOLATION",
             Code::RA011 => "RA011_BAD_ROUTE_EXPORT",
             Code::RA012 => "RA012_MISSING_MODE",
+            Code::RA014 => "RA014_UNSUPPORTED_CONSTRUCT",
         }
     }
 
@@ -46,7 +48,7 @@ impl Code {
     }
 }
 
-static ALL: [Code; 8] = [
+static ALL: [Code; 9] = [
     Code::RA001,
     Code::RA002,
     Code::RA006,
@@ -55,6 +57,7 @@ static ALL: [Code; 8] = [
     Code::RA010,
     Code::RA011,
     Code::RA012,
+    Code::RA014,
 ];
 
 impl Serialize for Code {
@@ -174,6 +177,7 @@ mod tests {
     fn code_strings_are_stable() {
         assert_eq!(Code::RA001.as_str(), "RA001_UNTRACKED_READ");
         assert_eq!(Code::RA010.as_str(), "RA010_STATIC_VIOLATION");
+        assert_eq!(Code::RA014.as_str(), "RA014_UNSUPPORTED_CONSTRUCT");
     }
 
     #[test]
@@ -294,6 +298,7 @@ mod tests {
                 "RA010_STATIC_VIOLATION",
                 "RA011_BAD_ROUTE_EXPORT",
                 "RA012_MISSING_MODE",
+                "RA014_UNSUPPORTED_CONSTRUCT",
             ]
         );
     }

@@ -34,23 +34,38 @@
 //!
 //! # What is rejected instead of dropped
 //!
-//! A spread (`{...rest}` as an attribute or a child), an attribute whose value
-//! is itself JSX (`foo=<Bar />`), an attribute with an empty expression
-//! (`foo={}`), and a fragment as the *returned* root all report `RA007`.
-//! Dropping a prop or a node would emit markup that is wrong in a way nothing
-//! reports, and an agent cannot repair output it never sees.
+//! These constructs are valid JSX that this milestone does not lower:
+//!
+//! - a spread (`{...rest}`) as an attribute or a child;
+//! - an attribute whose value is itself JSX (`foo=<Bar />`);
+//! - an attribute with an empty expression (`foo={}`);
+//! - a fragment as the *returned* root;
+//! - **JSX anywhere inside a `{…}` expression** — `{ready ? <b/> : <i/>}`,
+//!   `{items.map(i => <li/>)}`, `bar={<p/>}`. The expression is copied into
+//!   the emitted module as JavaScript, where `<b/>` is a syntax error, so the
+//!   island would fail to parse at build time;
+//! - **a second JSX return** the lowering does not reach
+//!   (`if (a) return <b/>; return <i/>`). Lowering emits only the first, and
+//!   dropping the other would render markup without part of a node.
+//!
+//! All of them report `RA014_UNSUPPORTED_CONSTRUCT`, whose identity says what
+//! they are: valid syntax this milestone does not support. `RA007` stays what it
+//! is everywhere else — "the parser rejected this file" — because a skill file
+//! that sends an agent hunting for an unclosed tag in a file that parses repairs
+//! nothing.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionBody, ExportDefaultDeclaration, ExportDefaultDeclarationKind, Expression,
     Function, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
-    JSXExpression, Program, Statement,
+    JSXExpression, JSXFragment, Program, ReturnStatement, Statement,
 };
+use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
-use crate::analyze::{find_route_component, validate_route_component};
+use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
 use crate::diagnostic::{Code, Diagnostic, Severity};
-use crate::source::{Mode, mode_of, parse_tsx};
+use crate::source::{Mode, mode_of, parse_tsx, raw_text};
 
 /// One dynamic slot in an element.
 ///
@@ -109,6 +124,14 @@ pub enum IrNode {
     /// (`<Foo flag />`) is [`IrNode::Expr`] `"true"`, which is what JSX means by
     /// it. There is no `bindings` list on a component — there is no DOM node to
     /// address, so a dynamic child is carried by its [`IrNode::Expr`] alone.
+    ///
+    /// `children` is `<Child><p/></Child>`'s markup: per design §7.2 it reaches
+    /// the callee as `props.children`, so Task 11 emits it as that prop rather
+    /// than as an unnamed child. A component's children are nodes like any
+    /// element's, and an expression child (`<Child>{x}</Child>`) is an
+    /// [`IrNode::Expr`] here just as it is on an element — there is simply no
+    /// parent `bindings` list to pair it with, because the pairing belongs to
+    /// whichever component inlines it.
     Component {
         name: String,
         props: Vec<(String, IrNode)>,
@@ -116,7 +139,8 @@ pub enum IrNode {
     },
 }
 
-/// A lowered route file: its rendering mode, its component name, and its markup.
+/// A lowered route file: its rendering mode, its component name, its markup, and
+/// the source range of the component body it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteIr {
     pub mode: Mode,
@@ -126,6 +150,14 @@ pub struct RouteIr {
     /// text and codegen both need the readable name.
     pub name: String,
     pub tree: IrNode,
+    /// The route component's body span, for the island emitter.
+    ///
+    /// Task 11 emits the body's statements (`const n = signal(0)`) above the
+    /// template construction, and taking the range from here means it slices the
+    /// source instead of re-parsing the file. The span is the `FunctionBody` for
+    /// a block body and the expression for a concise arrow body
+    /// (`() => <p/>`), which has no statements to emit.
+    pub body_span: (u32, u32),
 }
 
 /// The one entry point: parse the file, read its mode, lower its JSX.
@@ -138,15 +170,25 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
     let alloc = Allocator::default();
     let program = parse_tsx(&alloc, source)?;
     let mode = mode_of(program).map_err(|diagnostic| vec![diagnostic])?;
-    let tree = lower_jsx(program)?;
 
-    // `lower_jsx` succeeds only for a default export it could locate, and both
-    // walkers accept the same shapes, so the summary exists here.
-    let name = find_route_component(program)
-        .map(|info| info.display_name().to_string())
-        .unwrap_or_else(|| "Page".to_string());
+    // One summary, computed once and used three ways: the lowering walk
+    // validates the component with it, and `RouteIr` takes its name and body
+    // span. The first version walked the program a third time here and had a
+    // `Page` fallback that no successful lowering could reach.
+    let info = find_route_component(program);
+    let tree = lower_component(program, info.as_ref())?;
+    // `lower_component` refuses a missing or unusable component, so a success
+    // here means `info` is `Some`, and its fields are exactly the ones lowered.
+    let Some(info) = info else {
+        return Err(vec![unlowerable_export()]);
+    };
 
-    Ok(RouteIr { mode, name, tree })
+    Ok(RouteIr {
+        mode,
+        name: info.display_name().to_string(),
+        tree,
+        body_span: info.body_span,
+    })
 }
 
 /// Lower the first JSX node the default export returns.
@@ -159,22 +201,55 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
 /// diagnostics rather than inventing a second opinion; `lowering_agrees_with_the_route_analyzer`
 /// is what keeps the two answers glued together.
 pub fn lower_jsx(program: &Program) -> Result<IrNode, Vec<Diagnostic>> {
-    let Some(root) = route_jsx(program) else {
-        let info = find_route_component(program);
-        let mut diagnostics = validate_route_component(info.as_ref());
-        // Unreachable while `route_jsx` mirrors `find_route_component`. Kept as a
-        // diagnostic rather than a panic or an empty success, so a future
-        // divergence is reported instead of silently emitting nothing.
-        if diagnostics.is_empty() {
-            diagnostics.push(unlowerable_export());
-        }
+    let info = find_route_component(program);
+    lower_component(program, info.as_ref())
+}
+
+/// [`lower_jsx`] for a summary that has already been computed.
+///
+/// Splitting this out is what lets [`lower_route`] reuse one
+/// `find_route_component` result for the lowering, the name, and the body span.
+fn lower_component<'a>(
+    program: &'a Program<'a>,
+    info: Option<&ComponentInfo<'a>>,
+) -> Result<IrNode, Vec<Diagnostic>> {
+    let diagnostics = validate_route_component(info);
+    if !diagnostics.is_empty() {
         return Err(diagnostics);
-    };
+    }
+
+    let root = route_jsx(program).ok_or_else(|| vec![unlowerable_export()])?;
+
+    // One root is emitted, so a body with a second JSX return would lose the
+    // other branch with no report. The analyzer accepts such a body (it asks
+    // only whether *some* return is JSX), which is why the check lives here —
+    // and why it descends into nested blocks rather than trusting the top-level
+    // scan that found `root`.
+    if let Some(dropped) = dropped_jsx_return(program, root.span()) {
+        return Err(vec![unsupported(
+            dropped,
+            "a second JSX return that lowering does not reach",
+            "Return one element from the component body. Move the other markup into that \
+             element, or split the branch into a component of its own.",
+        )]);
+    }
 
     Lowerer {
         source: program.source_text,
     }
     .root(root)
+}
+
+/// The span of a JSX return in the route body that lowering will not emit.
+///
+/// The root is the one `route_jsx` found; every other JSX return in the body
+/// would be dropped, so the first of them is what the diagnostic points at. It
+/// is the *nested* one that matters: `route_jsx` scans only the top level, so
+/// `if (a) return <b/>; return <i/>` lowers `<i/>` and drops `<b/>`.
+fn dropped_jsx_return(program: &Program, root: Span) -> Option<Span> {
+    route_body(program)
+        .map(|body| body.jsx_returns())
+        .and_then(|returns| returns.into_iter().find(|span| *span != root))
 }
 
 /// The JSX node the default export returns, with parentheses removed.
@@ -184,10 +259,19 @@ pub fn lower_jsx(program: &Program) -> Result<IrNode, Vec<Diagnostic>> {
 /// node* it returns. Every accepted shape is mirrored exactly; when they agree,
 /// the answer here exists.
 fn route_jsx<'a>(program: &'a Program<'a>) -> Option<&'a Expression<'a>> {
+    route_body(program).and_then(|body| body.jsx())
+}
+
+/// The component body the route's JSX comes from.
+///
+/// This is [`route_jsx`]'s walk, one level up: it returns the body node so the
+/// dropped-return check can inspect the same body the lowering does, without a
+/// second opinion about which function is the route component.
+fn route_body<'a>(program: &'a Program<'a>) -> Option<ResolvedBody<'a>> {
     for statement in &program.body {
         match statement {
             Statement::ExportDefaultDeclaration(declaration) => {
-                return jsx_of_default(program, declaration);
+                return body_of_default(program, declaration);
             }
             Statement::ExportNamedDeclaration(declaration) => {
                 // `?` here would abandon the whole walk when the first named
@@ -201,7 +285,7 @@ fn route_jsx<'a>(program: &'a Program<'a>) -> Option<&'a Expression<'a>> {
                 else {
                     continue;
                 };
-                return jsx_of_name(program, specifier.local.name().as_str(), &mut Vec::new());
+                return body_of_name(program, specifier.local.name().as_str(), &mut Vec::new());
             }
             _ => {}
         }
@@ -209,51 +293,117 @@ fn route_jsx<'a>(program: &'a Program<'a>) -> Option<&'a Expression<'a>> {
     None
 }
 
-/// [`route_jsx`] for `export default …`.
-fn jsx_of_default<'a>(
+/// The body a route's JSX is rendered from.
+enum ResolvedBody<'a> {
+    /// `function Page() { … }`: statements, one of which returns JSX.
+    Block(&'a oxc_ast::ast::FunctionBody<'a>),
+    /// `(props) => <p/>`: the JSX is the body, so there is no return to find.
+    Concise(&'a Expression<'a>),
+}
+
+impl<'a> ResolvedBody<'a> {
+    /// The JSX this body renders, exactly as [`jsx_of_function`] and
+    /// [`jsx_of_arrow`] used to return it.
+    fn jsx(&self) -> Option<&'a Expression<'a>> {
+        match self {
+            Self::Block(body) => jsx_return(body.statements.iter()),
+            Self::Concise(expression) => jsx_expression(expression),
+        }
+    }
+
+    /// Every JSX node this body returns, nested blocks included.
+    ///
+    /// Descending into nested blocks is the point: `if (a) return <b/>` is a
+    /// legal body whose JSX return happens to be inside the `if`, and checking
+    /// only the top level would miss both it and a second one after it. Nested
+    /// *functions* are not descended into — their returns belong to another
+    /// component's render, not this one's.
+    fn jsx_returns(&self) -> Vec<Span> {
+        let mut found = JsxReturns::default();
+        match self {
+            Self::Concise(expression) => {
+                if let Some(jsx) = jsx_expression(expression) {
+                    found.returns.push(jsx.span());
+                }
+            }
+            Self::Block(body) => oxc_ast_visit::walk::walk_function_body(&mut found, body),
+        }
+        found.returns
+    }
+}
+
+/// Collects the JSX each `return` statement returns, skipping nested functions.
+#[derive(Default)]
+struct JsxReturns {
+    returns: Vec<Span>,
+}
+
+impl<'a> Visit<'a> for JsxReturns {
+    fn visit_return_statement(&mut self, returned: &ReturnStatement<'a>) {
+        if let Some(jsx) = returned.argument.as_ref().and_then(jsx_expression) {
+            // The JSX expression's own span, not the statement's: it is what the
+            // lowering emits, so "is this the root?" is a span comparison.
+            self.returns.push(jsx.span());
+        }
+        oxc_ast_visit::walk::walk_return_statement(self, returned);
+    }
+
+    // A nested function has its own render, so its `return`s are not this
+    // body's. Not calling `walk_function`/`walk_arrow_function_expression` is
+    // what skips them.
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _arrow: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+/// [`route_body`] for `export default …`.
+fn body_of_default<'a>(
     program: &'a Program<'a>,
     declaration: &'a ExportDefaultDeclaration<'a>,
-) -> Option<&'a Expression<'a>> {
+) -> Option<ResolvedBody<'a>> {
     match &declaration.declaration {
         ExportDefaultDeclarationKind::FunctionDeclaration(function)
-        | ExportDefaultDeclarationKind::FunctionExpression(function) => jsx_of_function(function),
-        ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => jsx_of_arrow(arrow),
+        | ExportDefaultDeclarationKind::FunctionExpression(function) => body_of_function(function),
+        ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => body_of_arrow(arrow),
         ExportDefaultDeclarationKind::ParenthesizedExpression(parenthesized) => {
-            jsx_of_expression(program, &parenthesized.expression, &mut Vec::new())
+            body_of_expression(program, &parenthesized.expression, &mut Vec::new())
         }
         ExportDefaultDeclarationKind::Identifier(identifier) => {
-            jsx_of_name(program, identifier.name.as_str(), &mut Vec::new())
+            body_of_name(program, identifier.name.as_str(), &mut Vec::new())
         }
         _ => None,
     }
 }
 
-/// [`route_jsx`] for an expression that may itself be a function or a name.
-fn jsx_of_expression<'a>(
+/// [`route_body`] for an expression that may itself be a function or a name.
+fn body_of_expression<'a>(
     program: &'a Program<'a>,
     expression: &'a Expression<'a>,
     seen: &mut Vec<&'a str>,
-) -> Option<&'a Expression<'a>> {
+) -> Option<ResolvedBody<'a>> {
     match expression {
-        Expression::ArrowFunctionExpression(arrow) => jsx_of_arrow(arrow),
-        Expression::FunctionExpression(function) => jsx_of_function(function),
+        Expression::ArrowFunctionExpression(arrow) => body_of_arrow(arrow),
+        Expression::FunctionExpression(function) => body_of_function(function),
         Expression::ParenthesizedExpression(parenthesized) => {
-            jsx_of_expression(program, &parenthesized.expression, seen)
+            body_of_expression(program, &parenthesized.expression, seen)
         }
-        Expression::Identifier(identifier) => jsx_of_name(program, identifier.name.as_str(), seen),
+        Expression::Identifier(identifier) => body_of_name(program, identifier.name.as_str(), seen),
         _ => None,
     }
 }
 
-/// [`route_jsx`] for a name declared in this file.
+/// [`route_body`] for a name declared in this file.
 ///
 /// `seen` stops `const Page = Page` from recursing forever: a self-reference
 /// resolves to no JSX, which is what it is.
-fn jsx_of_name<'a>(
+fn body_of_name<'a>(
     program: &'a Program<'a>,
     name: &'a str,
     seen: &mut Vec<&'a str>,
-) -> Option<&'a Expression<'a>> {
+) -> Option<ResolvedBody<'a>> {
     if seen.contains(&name) {
         return None;
     }
@@ -264,7 +414,7 @@ fn jsx_of_name<'a>(
             .id
             .as_ref()
             .filter(|identifier| identifier.name == name)
-            .and_then(|_| jsx_of_function(function)),
+            .and_then(|_| body_of_function(function)),
         Statement::VariableDeclaration(declaration) => {
             declaration.declarations.iter().find_map(|declarator| {
                 if !declarator
@@ -274,26 +424,25 @@ fn jsx_of_name<'a>(
                 {
                     return None;
                 }
-                jsx_of_expression(program, declarator.init.as_ref()?, seen)
+                body_of_expression(program, declarator.init.as_ref()?, seen)
             })
         }
         _ => None,
     })
 }
 
-/// The first top-level `return` in `function` whose argument is JSX.
-fn jsx_of_function<'a>(function: &'a Function<'a>) -> Option<&'a Expression<'a>> {
-    let body = function.body.as_deref()?;
-    jsx_return(body.statements.iter())
+/// [`route_body`] for a function declaration or expression.
+fn body_of_function<'a>(function: &'a Function<'a>) -> Option<ResolvedBody<'a>> {
+    function.body.as_deref().map(ResolvedBody::Block)
 }
 
-/// The body of `arrow` if it is JSX itself, or its first `return` if that is.
-fn jsx_of_arrow<'a>(
+/// [`route_body`] for an arrow function, whose body may be a block or the JSX.
+fn body_of_arrow<'a>(
     arrow: &'a oxc_ast::ast::ArrowFunctionExpression<'a>,
-) -> Option<&'a Expression<'a>> {
+) -> Option<ResolvedBody<'a>> {
     match &arrow.body {
-        ArrowFunctionBody::FunctionBody(body) => jsx_return(body.statements.iter()),
-        concise => concise.as_expression().and_then(jsx_expression),
+        ArrowFunctionBody::FunctionBody(body) => Some(ResolvedBody::Block(body)),
+        concise => concise.as_expression().map(ResolvedBody::Concise),
     }
 }
 
@@ -331,11 +480,12 @@ struct Lowerer<'s> {
 impl<'s> Lowerer<'s> {
     /// The source text a span names.
     ///
-    /// The span comes from the AST of this same source, so the range is valid by
-    /// construction. Slicing rather than reading a decoded `value` is what keeps
-    /// entities and formatting verbatim.
+    /// The same rule as [`crate::source::raw_text`] — a span from this source's
+    /// own AST is always in bounds, and sharing the helper keeps the two from
+    /// drifting into different failure modes. Slicing rather than reading a
+    /// decoded `value` is what keeps entities and formatting verbatim.
     fn slice(&self, span: Span) -> &'s str {
-        &self.source[span.start as usize..span.end as usize]
+        raw_text(self.source, span).unwrap_or("")
     }
 
     /// The route's root node.
@@ -403,7 +553,7 @@ impl<'s> Lowerer<'s> {
                 }
                 Some(JSXAttributeValue::ExpressionContainer(container)) => {
                     let expr = self
-                        .expression_source(&container.expression)
+                        .expression_source(&container.expression, "attribute")?
                         .ok_or_else(|| {
                             vec![empty_expression(
                                 container.span,
@@ -464,7 +614,7 @@ impl<'s> Lowerer<'s> {
             }
             Some(JSXAttributeValue::ExpressionContainer(container)) => {
                 let expr = self
-                    .expression_source(&container.expression)
+                    .expression_source(&container.expression, "prop")?
                     .ok_or_else(|| {
                         vec![empty_expression(container.span, "prop", "`name={value}`")]
                     })?;
@@ -503,7 +653,8 @@ impl<'s> Lowerer<'s> {
                     // expression. There is nothing to render and no slot to
                     // address, so they contribute neither a node nor a binding —
                     // and the comment's text must not become an expression.
-                    let Some(expr) = self.expression_source(&container.expression) else {
+                    let Some(expr) = self.expression_source(&container.expression, "child slot")?
+                    else {
                         continue;
                     };
                     nodes.push(IrNode::Expr(expr.to_string()));
@@ -528,11 +679,61 @@ impl<'s> Lowerer<'s> {
     ///
     /// The *inner* expression span is used, not the container's, so the braces
     /// are not part of the text codegen receives.
-    fn expression_source(&self, expression: &'s JSXExpression<'s>) -> Option<&'s str> {
+    ///
+    /// This is also where C1 is refused: the text becomes JavaScript in the
+    /// emitted module, and JSX inside it (`{ready ? <b/> : <i/>}`,
+    /// `{items.map(i => <li/>)}`) is a syntax error there. A string heuristic
+    /// such as `contains("</")` would misfire on `a < b`, so the check walks the
+    /// expression's AST. `position` names the slot for the message.
+    fn expression_source(
+        &self,
+        expression: &'s JSXExpression<'s>,
+        position: &str,
+    ) -> Result<Option<&'s str>, Vec<Diagnostic>> {
         match expression {
-            JSXExpression::EmptyExpression(_) => None,
-            other => Some(self.slice(other.span())),
+            JSXExpression::EmptyExpression(_) => Ok(None),
+            other => {
+                if let Some(span) = contains_jsx(other.to_expression()) {
+                    return Err(vec![unsupported(
+                        span,
+                        &format!("JSX inside a `{{…}}` expression ({position})"),
+                        "Move the JSX out of `{…}`: it belongs in the children, e.g. \
+                         `<Parent><b/></Parent>`, or in its own `return`. Expressions become \
+                         JavaScript in the emitted module, where a JSX tag is a syntax error.",
+                    )]);
+                }
+                Ok(Some(self.slice(other.span())))
+            }
         }
+    }
+}
+
+/// The span of the first `JSXElement`/`JSXFragment` anywhere inside `expression`,
+/// or `None`.
+///
+/// A walk, not a substring search: `a < b` and `x => y < z` are ordinary
+/// expressions whose text happens to contain `<`, and refusing them would reject
+/// valid routes. Nested positions count, including inside a call, a conditional,
+/// or a parenthesized group.
+fn contains_jsx(expression: &Expression) -> Option<Span> {
+    let mut finder = JsxFinder::default();
+    finder.visit_expression(expression);
+    finder.found
+}
+
+/// Records the first JSX node it meets while walking an expression.
+#[derive(Default)]
+struct JsxFinder {
+    found: Option<Span>,
+}
+
+impl<'a> Visit<'a> for JsxFinder {
+    fn visit_jsx_element(&mut self, element: &JSXElement<'a>) {
+        self.found.get_or_insert(element.span);
+    }
+
+    fn visit_jsx_fragment(&mut self, fragment: &JSXFragment<'a>) {
+        self.found.get_or_insert(fragment.span);
     }
 }
 
@@ -574,6 +775,13 @@ fn attribute_name(name: &JSXAttributeName) -> String {
 /// name is the rest lowercased — `"click"`, `"keydown"`. Requiring the capital
 /// is what keeps `once={x}` an *attribute* rather than a listener for a `"ce"`
 /// event that does not exist.
+///
+/// There is deliberately **no whitelist** of real DOM events: the rule is this
+/// milestone's specification, and a typo or an invented name (`onDoubleClick` →
+/// `"doubleclick"`) becomes a listener that never fires. `_on` attaches it
+/// without complaint, because the browser does. A whitelist would turn a legal
+/// custom event (`onCustomThing`) into a compiler error, and validating event
+/// names is not this milestone's question.
 fn event_name(name: &str) -> Option<String> {
     let rest = name.strip_prefix("on")?;
     if !rest.starts_with(|c: char| c.is_ascii_uppercase()) {
@@ -584,12 +792,13 @@ fn event_name(name: &str) -> Option<String> {
 
 /// A construct this milestone cannot lower.
 ///
-/// `RA007` is the code for JSX the compiler cannot use. The text says plainly
-/// that the file is *syntactically* fine, because an agent that reads "ambiguous
-/// JSX" and hunts for an unclosed tag would repair nothing.
+/// The code is `RA014_UNSUPPORTED_CONSTRUCT`, whose whole identity is "valid
+/// syntax this milestone does not support". `RA007` means "the parser rejected
+/// this file" everywhere else, and reusing it here would send an agent hunting
+/// for an unclosed tag in a file that parses.
 fn unsupported(span: Span, construct: &str, fix: &str) -> Diagnostic {
     Diagnostic {
-        code: Code::RA007,
+        code: Code::RA014,
         severity: Severity::Error,
         span: (span.start, span.end),
         message: format!("cannot lower {construct} yet"),
@@ -598,7 +807,7 @@ fn unsupported(span: Span, construct: &str, fix: &str) -> Diagnostic {
                   markup emitted without part of a node is wrong in a way nothing reports."
             .into(),
         fix: fix.into(),
-        doc: Code::RA007.skill_file(),
+        doc: Code::RA014.skill_file(),
         patch: None,
     }
 }
@@ -606,7 +815,7 @@ fn unsupported(span: Span, construct: &str, fix: &str) -> Diagnostic {
 /// `{…}` with nothing in it, where a value is required.
 fn empty_expression(span: Span, kind: &str, fix_example: &str) -> Diagnostic {
     Diagnostic {
-        code: Code::RA007,
+        code: Code::RA014,
         severity: Severity::Error,
         span: (span.start, span.end),
         message: format!("cannot lower an {kind} with an empty expression"),
@@ -615,7 +824,7 @@ fn empty_expression(span: Span, kind: &str, fix_example: &str) -> Diagnostic {
                   attribute or prop needs something to set."
             .into(),
         fix: format!("Give the {kind} a value, e.g. {fix_example}."),
-        doc: Code::RA007.skill_file(),
+        doc: Code::RA014.skill_file(),
         patch: None,
     }
 }
@@ -655,13 +864,16 @@ mod tests {
         match r.tree {
             IrNode::Element {
                 tag,
+                static_attrs,
                 bindings,
                 children,
-                ..
             } => {
                 assert_eq!(tag, "div");
+                // The static half is what the template carries: a lowering that
+                // dropped it would still pass a bindings-only assertion.
+                assert_eq!(static_attrs, vec![("class".to_string(), "a".to_string())]);
                 assert!(bindings.is_empty());
-                assert!(matches!(children[0], IrNode::Text(ref t) if t == "hi"));
+                assert!(matches!(children.as_slice(), [IrNode::Text(t)] if t == "hi"));
             }
             other => panic!("expected element, got {other:?}"),
         }
@@ -672,9 +884,16 @@ mod tests {
         let src = "\"use island\"\nexport default function P() { const n = signal(0); return <p>{n()}</p> }\n";
         let r = crate::ir::lower_route(src).unwrap();
         match r.tree {
-            IrNode::Element { bindings, .. } => {
-                assert_eq!(bindings.len(), 1);
-                assert!(matches!(bindings[0], Binding::Text(_)));
+            IrNode::Element {
+                bindings, children, ..
+            } => {
+                // Both halves of the slot are the contract: the binding Task 11
+                // wires, and the placeholder that keeps document order.
+                assert_eq!(bindings, vec![Binding::Text("n()".to_string())]);
+                assert!(
+                    matches!(children.as_slice(), [IrNode::Expr(e)] if e == "n()"),
+                    "got {children:?}"
+                );
             }
             other => panic!("expected element, got {other:?}"),
         }
@@ -938,18 +1157,220 @@ mod tests {
         let src = "\"use island\"\nexport default function P() { return <><b/><i/></> }\n";
         let errs = crate::ir::lower_route(src).unwrap_err();
         assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].code, Code::RA007);
+        assert_eq!(errs[0].code, Code::RA014);
         assert!(
             errs[0].message.contains("fragment"),
             "the message must name the construct: {:?}",
             errs[0].message
         );
-        // `RA007` normally means "the parser could not read this". Saying so here
-        // would send an agent hunting for an unclosed tag in a file that parses.
+        // The identity must not blame the syntax. `RA007` means "the parser could
+        // not read this" and would send an agent hunting for an unclosed tag in a
+        // file that parses; `RA014` names what this is.
+        assert_eq!(errs[0].doc, "skills/RA014_UNSUPPORTED_CONSTRUCT.md");
         assert!(
             errs[0].explain.contains("parser accepted"),
             "the explain must not blame the syntax: {:?}",
             errs[0].explain
+        );
+    }
+
+    /// C1: JSX inside a `{…}` expression is copied into the emitted module as
+    /// JavaScript, where a tag is a syntax error — the island would fail to
+    /// parse at build time. Every nesting the AST can hold is refused: a
+    /// conditional, a call argument, an array item, a nested parenthesized
+    /// group, and a JSX-valued attribute.
+    #[test]
+    fn jsx_inside_an_expression_is_refused() {
+        for (src, expected) in [
+            (
+                "\"use island\"\nexport default function P() { return <div>{ready ? <b/> : <i/>}</div> }\n",
+                "child slot",
+            ),
+            (
+                "\"use island\"\nexport default function P() { const items = []; return <ul>{items.map(i => <li>{i}</li>)}</ul> }\n",
+                "child slot",
+            ),
+            (
+                "\"use island\"\nexport default function P() { return <div>{f(<b/>)}</div> }\n",
+                "child slot",
+            ),
+            (
+                "\"use island\"\nexport default function P() { return <div>{[<b/>]}</div> }\n",
+                "child slot",
+            ),
+            (
+                "\"use island\"\nexport default function P() { return <div>{(<b/>)}</div> }\n",
+                "child slot",
+            ),
+            (
+                "\"use island\"\nexport default function P() { return <p class={x ? <b/> : <i/>} /> }\n",
+                "attribute",
+            ),
+            (
+                "\"use island\"\nexport default function P() { return <Child slot={<p/>} /> }\n",
+                "prop",
+            ),
+        ] {
+            let errs = crate::ir::lower_route(src).unwrap_err();
+            assert_eq!(errs[0].code, Code::RA014, "{src}");
+            assert!(
+                errs[0].message.contains("JSX inside a `{…}` expression"),
+                "{src}: {:?}",
+                errs[0].message
+            );
+            assert!(
+                errs[0].message.contains(expected),
+                "{src}: the message must name the position, got {:?}",
+                errs[0].message
+            );
+            assert!(
+                errs[0].fix.contains("children"),
+                "{src}: the fix must say where the JSX belongs: {:?}",
+                errs[0].fix
+            );
+        }
+    }
+
+    /// The refusal is by AST walk, so a plain comparison is *not* JSX. A string
+    /// heuristic (`contains("</")`, `contains('<')`) would refuse every one of
+    /// these, all of which emit valid JavaScript.
+    #[test]
+    fn a_comparison_in_an_expression_is_not_jsx() {
+        for src in [
+            "\"use island\"\nexport default function P() { return <div>{a < b}</div> }\n",
+            "\"use island\"\nexport default function P() { const f = (x) => x < 1; return <div>{f(0)}</div> }\n",
+            "\"use island\"\nexport default function P() { return <p class={a < b}>{a < b}</p> }\n",
+            "\"use island\"\nexport default function P() { return <div>{`a</b`}</div> }\n",
+        ] {
+            assert!(
+                crate::ir::lower_route(src).is_ok(),
+                "{src}: a comparison must not be mistaken for JSX"
+            );
+        }
+    }
+
+    /// I1: the analyzer accepts any body with *some* JSX return, so a second one
+    /// is legal TSX but lowering would emit only the first and drop the other
+    /// with no diagnostic. The nested `return` is the one the top-level scan does
+    /// not reach, which is exactly the case that used to vanish.
+    #[test]
+    fn a_second_jsx_return_is_refused() {
+        for src in [
+            // The second return is nested where the top-level scan cannot see it.
+            "\"use island\"\nexport default function P() { if (a) return <b/>; return <i/> }\n",
+            // A second top-level return is unreachable code, but it is still a
+            // return lowering did not emit.
+            "\"use island\"\nexport default function P() { return <b/>; return <i/> }\n",
+            // A conditional's nested return.
+            "\"use island\"\nexport default function P() { if (a) { return <b/> } return <i/> }\n",
+        ] {
+            let errs = crate::ir::lower_route(src).unwrap_err();
+            assert_eq!(errs[0].code, Code::RA014, "{src}");
+            assert!(
+                errs[0].message.contains("second JSX return"),
+                "{src}: {:?}",
+                errs[0].message
+            );
+            assert!(errs[0].span.0 > 0, "{src}: the diagnostic needs a location");
+        }
+    }
+
+    /// The dropped-return check must not fire for the shapes it is not about: a
+    /// nested *function* returns its own JSX from its own render, and a concise
+    /// arrow body is the JSX.
+    #[test]
+    fn the_dropped_return_check_ignores_nested_renderers() {
+        for src in [
+            // A component declared inside the route *returns* JSX, but that
+            // return belongs to `Item`'s render, not the route's. Counting it
+            // would refuse a perfectly ordinary nested component.
+            "\"use island\"\nexport default function P() { function Item() { return <li/> } return <ul><Item/></ul> }\n",
+            "\"use island\"\nexport default function P() { const Item = () => { return <li/> }; return <ul><Item/></ul> }\n",
+            // A concise arrow body is the JSX; there is no return statement.
+            "\"use island\"\nexport default (props: {}) => <p/>\n",
+            "\"use island\"\nexport default (props: {}) => { return <p/> }\n",
+            // A plain handler is not a renderer at all, and must stay legal.
+            "\"use island\"\nexport default function P() { return <button onClick={() => go()}>x</button> }\n",
+        ] {
+            assert!(
+                crate::ir::lower_route(src).is_ok(),
+                "{src}: a nested renderer is not a dropped return"
+            );
+        }
+    }
+
+    /// Task 11's positional contract, on the element it actually has to handle:
+    /// one with *both* attribute bindings and text slots. The k-th
+    /// [`Binding::Text`] must pair with the k-th [`IrNode::Expr`], whatever
+    /// attribute bindings precede them — the *k* counts text slots only.
+    #[test]
+    fn the_kth_text_binding_pairs_with_the_kth_expr_placeholder() {
+        let src = "\"use island\"\nexport default function P() { return <p class={tone} onClick={go}>{a}<b/>{c}</p> }\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        let IrNode::Element {
+            bindings, children, ..
+        } = r.tree
+        else {
+            panic!("expected element")
+        };
+
+        let text_bindings: Vec<&str> = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Text(expr) => Some(expr.as_str()),
+                _ => None,
+            })
+            .collect();
+        let placeholders: Vec<&str> = children
+            .iter()
+            .filter_map(|child| match child {
+                IrNode::Expr(expr) => Some(expr.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            text_bindings,
+            vec!["a", "c"],
+            "attribute bindings must not shift the text slots: {bindings:?}"
+        );
+        assert_eq!(
+            placeholders, text_bindings,
+            "the k-th text binding must pair with the k-th placeholder: {children:?}"
+        );
+        // And the attribute bindings are the leading two, in source order.
+        assert!(
+            matches!(
+                bindings.as_slice(),
+                [
+                    Binding::Attr { name: class, .. },
+                    Binding::Event { name: click, .. },
+                    Binding::Text(_),
+                    Binding::Text(_),
+                ] if class == "class" && click == "click"
+            ),
+            "got {bindings:?}"
+        );
+    }
+
+    /// C2: Task 11 emits the component body's statements above the template, so
+    /// `RouteIr` must carry their range. It is the body, not the whole function:
+    /// `function Page(props: …)` is not a statement.
+    #[test]
+    fn the_body_span_is_the_component_body() {
+        let src = "\"use island\"\nexport default function Page(props: {}) { const n = signal(0); return <p>{n()}</p> }\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        assert_eq!(
+            &src[r.body_span.0 as usize..r.body_span.1 as usize],
+            "{ const n = signal(0); return <p>{n()}</p> }"
+        );
+
+        // A concise arrow body has no statements, so the span is the expression.
+        let concise = "\"use island\"\nexport default (props: {}) => <p/>\n";
+        let r = crate::ir::lower_route(concise).unwrap();
+        assert_eq!(
+            &concise[r.body_span.0 as usize..r.body_span.1 as usize],
+            "<p/>"
         );
     }
 
@@ -1003,6 +1424,50 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    /// `<Child><p/></Child>` is how a component receives markup: per design
+    /// §7.2 it arrives at the callee as `props.children`. A lowering that put
+    /// the nodes anywhere else would silently drop them when Task 11 inlines.
+    #[test]
+    fn a_component_child_is_its_children() {
+        let src =
+            "\"use static\"\nexport default function P() { return <Child><p>hi</p></Child> }\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        let IrNode::Component {
+            name,
+            props,
+            children,
+        } = r.tree
+        else {
+            panic!("expected component")
+        };
+        assert_eq!(name, "Child");
+        assert!(props.is_empty(), "got {props:?}");
+        assert!(
+            matches!(
+                children.as_slice(),
+                [IrNode::Element { tag, children, .. }]
+                    if tag == "p" && matches!(children.as_slice(), [IrNode::Text(t)] if t == "hi")
+            ),
+            "got {children:?}"
+        );
+    }
+
+    /// An expression child of a component is an `IrNode::Expr` placeholder, the
+    /// same as on an element. There is no parent `bindings` list to pair it
+    /// with: the pairing belongs to whichever component inlines `<Child>`.
+    #[test]
+    fn a_component_expression_child_is_an_expr_placeholder() {
+        let src = "\"use island\"\nexport default function P() { return <Child>{x}</Child> }\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        let IrNode::Component { children, .. } = r.tree else {
+            panic!("expected component")
+        };
+        assert!(
+            matches!(children.as_slice(), [IrNode::Expr(e)] if e == "x"),
+            "got {children:?}"
+        );
     }
 
     /// A parenthesized return is how a multi-line body is formatted. Rejecting it
@@ -1111,7 +1576,7 @@ mod tests {
             ),
         ] {
             let errs = crate::ir::lower_route(src).unwrap_err();
-            assert_eq!(errs[0].code, Code::RA007, "{src}");
+            assert_eq!(errs[0].code, Code::RA014, "{src}");
             assert!(
                 errs[0].message.contains(expected),
                 "{src}: {:?}",
@@ -1126,6 +1591,10 @@ mod tests {
     /// constructed AST, and this test pins which side of the boundary the case
     /// falls on — if the parser ever starts accepting it, this fails and the
     /// branch becomes reachable.
+    ///
+    /// The message is Oxc's own English text, pinned to `oxc_parser = 0.159.0`
+    /// (see `Cargo.toml`); a parser upgrade that rewords it fails here, which is
+    /// the point — `RA007` is the code that carries the parser's message verbatim.
     #[test]
     fn an_empty_attribute_expression_is_a_parse_error() {
         let src = "\"use island\"\nexport default function P() { return <div title={} /> }\n";
@@ -1218,9 +1687,11 @@ mod tests {
         assert!(bindings.is_empty());
     }
 
-    /// Text is the source slice, so the whitespace JSX preserves is preserved
-    /// here. Trimming it would make `<b>a</b> <i>b</i>` render `a`-`b` with no
-    /// space — a difference the author can see and the compiler silently erased.
+    /// Text is the source slice, so the raw slice deliberately includes
+    /// whitespace that JSX itself would strip. Trimming it here would make the
+    /// emit step's job ambiguous: `<b>a</b> <i>b</i>` and `<b>a</b><i>b</i>`
+    /// would become indistinguishable, and a page could lose a visible space
+    /// with nothing reporting it.
     #[test]
     fn text_whitespace_is_preserved() {
         let src = "\"use static\"\nexport default function P() { return <p> a  b </p> }\n";
@@ -1230,6 +1701,44 @@ mod tests {
         };
         assert!(
             matches!(children.as_slice(), [IrNode::Text(t)] if t == " a  b "),
+            "got {children:?}"
+        );
+    }
+
+    /// The contract a multi-line element's indentation has to satisfy: every
+    /// inter-element whitespace run is its own [`IrNode::Text`], raw and
+    /// un-collapsed. React collapses whitespace-only lines; this IR records that
+    /// it deliberately does **not**, so Task 10 writes exactly these nodes.
+    #[test]
+    fn indented_multiline_element_keeps_raw_whitespace() {
+        let src = "\"use static\"\nexport default function P() {\n  return (\n    <div>\n      <b>a</b>\n      <i>b</i>\n    </div>\n  )\n}\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        let IrNode::Element {
+            tag,
+            children,
+            bindings,
+            ..
+        } = r.tree
+        else {
+            panic!("expected element")
+        };
+        assert_eq!(tag, "div");
+        assert!(bindings.is_empty());
+        assert!(
+            matches!(
+                children.as_slice(),
+                [
+                    IrNode::Text(lead),
+                    IrNode::Element { tag: b, .. },
+                    IrNode::Text(mid),
+                    IrNode::Element { tag: i, .. },
+                    IrNode::Text(tail),
+                ] if lead == "\n      "
+                    && b == "b"
+                    && mid == "\n      "
+                    && i == "i"
+                    && tail == "\n    "
+            ),
             "got {children:?}"
         );
     }
