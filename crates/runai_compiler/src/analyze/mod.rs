@@ -7,5 +7,7 @@
 pub mod component;
 pub mod props;
 
-pub use component::{ComponentInfo, ComponentKind, find_route_component, validate_route_component};
+pub use component::{
+    ComponentInfo, ComponentKind, find_components, find_route_component, validate_route_component,
+};
 pub use props::check_props;

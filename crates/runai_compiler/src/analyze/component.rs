@@ -1,11 +1,16 @@
-//! What the route's component is, and whether its export actually is one.
+//! What a file's components are, and whether its default export is one.
 //!
 //! A page file's **default export** is its route component. Nothing else is: a
 //! named export is an ordinary module export, and importing another file's
-//! component does not make it *this* route's component. So this module looks
-//! only for `export default …`, and a file without one reports
+//! component does not make it *this* route's component. So [`find_route_component`]
+//! looks only for `export default …`, and a file without one reports
 //! `RA011_BAD_ROUTE_EXPORT` rather than picking a plausible-looking named
 //! function and validating the wrong thing.
+//!
+//! [`find_components`] answers the wider question: *every* function in the file
+//! that returns JSX is a component, so every one of them owes a written props
+//! type (`RA006`) — not only the route. A page's `_shell.tsx` declares components
+//! too, which is why the props rule cannot live in route validation alone.
 //!
 //! The route component must be a component — a function that returns JSX — and
 //! it must take at most one parameter, because that single parameter is the
@@ -13,14 +18,14 @@
 //! never be filled.
 
 use oxc_ast::ast::{
-    ArrowFunctionBody, ExportDefaultDeclaration, ExportDefaultDeclarationKind, Expression,
-    Function, Program, Statement,
+    ArrowFunctionBody, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
+    Expression, Function, Program, Statement,
 };
 use oxc_span::GetSpan;
 
 use crate::diagnostic::{Code, Diagnostic};
 
-/// Whether the default export is a function this milestone can analyze.
+/// Whether a default export is a function this milestone can analyze.
 ///
 /// This distinction is load-bearing for `RA011`: "there is no default export" and
 /// "the default export is not a component" need different messages and different
@@ -39,14 +44,14 @@ pub enum ComponentKind {
     NotAFunction,
 }
 
-/// The shape of the route's default-exported component.
+/// The shape of a component found in a file.
 ///
 /// This is a summary, not the AST node itself: it records only the answers the
 /// analyses in this milestone ask, so later tasks do not have to re-walk the
 /// program to answer them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentInfo<'a> {
-    /// Whether the default export is a function at all. When it is
+    /// Whether this is a function at all. When it is
     /// [`ComponentKind::NotAFunction`], every other field is meaningless: there
     /// is no parameter list and no body to report, and the caller's only job is
     /// to emit the "existing export is not a component" repair.
@@ -72,22 +77,28 @@ pub struct ComponentInfo<'a> {
     /// annotation has to be on the parameter, which is the thing a reader sees
     /// when they ask "where does this value come from".
     pub has_props_type: bool,
+    /// From the start of the statement that declares this component through the
+    /// opening of its body, parameter list in between: the `{` of a block body
+    /// (`export default function Page(props) {`), or the whole concise expression
+    /// of an arrow (`const Badge = (props) => <b/>`) — the parentheses included.
+    ///
+    /// Together with [`params_span`](Self::params_span) this is the range `RA006`
+    /// rebuilds the exact signature line to write from, in the declaration form
+    /// the file already uses. Splicing the source rather than synthesizing a
+    /// `function` line is what stops the repair from naming a second declaration
+    /// of the same binding, which is a redeclaration error.
+    pub signature_span: (u32, u32),
+    /// The span of the parameter list. For a propless component this is the empty
+    /// `()`, which is exactly where the missing parameter goes.
+    pub params_span: (u32, u32),
+    /// The span of the declared name, so a diagnostic can point at the component
+    /// itself rather than at a pair of empty parentheses. Anonymous components
+    /// fall back to [`params_span`](Self::params_span).
+    pub name_span: (u32, u32),
     /// The function body's span, for analyses that are scoped to a component
     /// body. A concise arrow body (`() => <p/>`) has no `FunctionBody` node, so
     /// this is the expression's span instead.
     pub body_span: (u32, u32),
-    /// Whether the default export *is* the function literal, rather than a name
-    /// exported as default.
-    ///
-    /// `export default function Page(props) {…}` and `export default (props) =>
-    /// …` are inline: the fix text may say `export default function Page(…)`
-    /// because there is nothing to add — the existing declaration is the one to
-    /// edit. `export default Page` and `export { Page as default }` are not:
-    /// there the function is declared elsewhere and already exported, so a fix
-    /// that says `export default …` would tell an agent to write a **second**
-    /// default export, which is a parse error. Only meaningful when
-    /// [`kind`](Self::kind) is [`ComponentKind::Function`].
-    pub inline_default: bool,
     /// Whether some `return` statement in the body returns JSX directly.
     ///
     /// Deliberately syntactic, not dataflow: a body that returns an identifier
@@ -106,6 +117,13 @@ pub struct ComponentInfo<'a> {
     /// blocks: `if (x) return <p/>`, a `switch` arm, or a `try` block is not
     /// detected.
     pub returns_jsx: bool,
+    /// Whether this component is reachable as the file's default export.
+    ///
+    /// `true` for `export default function Page(…)`, `export default (props) =>
+    /// …`, and for a declaration the default export refers to by name. `false`
+    /// for every other component in the file, which owes a props type just the
+    /// same but is not a route.
+    pub is_default_export: bool,
 }
 
 impl<'a> ComponentInfo<'a> {
@@ -130,10 +148,38 @@ impl<'a> ComponentInfo<'a> {
         }
     }
 
-    /// The same summary, marked as reached through a name rather than an inline
-    /// `export default function …`.
-    fn not_inline(mut self) -> Self {
-        self.inline_default = false;
+    /// The declaration's signature line, rebuilt from `source` with its parameter
+    /// list replaced by `params`.
+    ///
+    /// `params` is written as it appears in the source, parentheses included
+    /// (`(props: Record<never, never>)`) — the span being replaced is the whole
+    /// list. This is the per-site half of `RA006`: the canonical fix says *what*
+    /// to do ("exactly one typed parameter"), and this says *where* — the exact
+    /// line to write. Slicing the source keeps `const Badge = (props) => …` a
+    /// `const` and `export default function Page` an `export default`, so
+    /// following the message cannot produce a second declaration of the same
+    /// binding.
+    pub fn signature(&self, source: &str, params: &str) -> String {
+        format!(
+            "{prefix}{params}{suffix}",
+            prefix = slice(source, (self.signature_span.0, self.params_span.0)),
+            suffix = slice(source, (self.params_span.1, self.signature_span.1)),
+        )
+    }
+
+    /// The span `RA006` points at: the parameters it asks to type, or the name
+    /// when there are none to point at.
+    pub fn props_span(&self) -> (u32, u32) {
+        if self.params == 0 {
+            self.name_span
+        } else {
+            self.params_span
+        }
+    }
+
+    /// The same summary, marked as reachable through the default export.
+    fn mark_default_export(mut self) -> Self {
+        self.is_default_export = true;
         self
     }
 
@@ -145,10 +191,11 @@ impl<'a> ComponentInfo<'a> {
     /// Resolving a binding therefore renames the summary, so diagnostic text
     /// points at the declaration the agent must edit instead of inventing a
     /// `Page` that is not in the file. Not renaming here would make a fix for
-    /// `export default AboutPage` say `function Page(props: Props)` and leave
-    /// `AboutPage` unannotated — the next run would report the same code again.
-    fn with_name(mut self, name: &'a str) -> Self {
+    /// `export default AboutPage` leave `AboutPage` unannotated — the next run
+    /// would report the same code again.
+    fn with_name(mut self, name: &'a str, span: (u32, u32)) -> Self {
         self.name = name;
+        self.name_span = span;
         self
     }
 }
@@ -169,7 +216,7 @@ pub fn find_route_component<'a>(program: &'a Program<'a>) -> Option<ComponentInf
             // `export { Page as default }`
             Statement::ExportNamedDeclaration(declaration) => {
                 if let Some(info) = component_from_specifiers(program, &declaration.specifiers) {
-                    return Some(info);
+                    return Some(info.mark_default_export());
                 }
             }
             // `export { Page as default } from "./page"`: a default export that
@@ -188,6 +235,162 @@ pub fn find_route_component<'a>(program: &'a Program<'a>) -> Option<ComponentInf
     None
 }
 
+/// Find every component in `program`: a function that returns JSX.
+///
+/// Exported or not, declaration or `const`-bound arrow/function expression. This
+/// is the wider question `RA006` asks, because *every* component owes a written
+/// props type — not only the route. A page's `_shell.tsx` declares components
+/// too, and none of them are the default export.
+///
+/// What it catches: a top-level `function X(…) {…}`, `const X = (…) => …`,
+/// `const X = (…) => {…}`, `const X = function (…) {…}`, each declared plainly or
+/// under `export`/`export default`, and each through parentheses.
+///
+/// What it does not catch, deliberately: methods, nested functions (a `const`
+/// inside another function's body is not a component a module reader can name),
+/// components built by a factory (`const X = component(…)`), components reaching
+/// this file through an `import`, and a `const A = …, B = …` list beyond its
+/// first declarator. It also cannot count a body that returns JSX indirectly
+/// (`return View`), for the same reason [`ComponentInfo::returns_jsx`] cannot.
+///
+/// A component that is the default export appears once. The default export is
+/// often reached by name, so the walk summarizes the declaration that holds it
+/// first; the duplicate is dropped by body span and the survivor is marked
+/// [`is_default_export`](ComponentInfo::is_default_export).
+pub fn find_components<'a>(program: &'a Program<'a>) -> Vec<ComponentInfo<'a>> {
+    let mut components = Vec::new();
+    for statement in &program.body {
+        match statement {
+            Statement::FunctionDeclaration(function) => push_if_component(
+                &mut components,
+                component_from_function(function, None, None),
+            ),
+            Statement::VariableDeclaration(declaration) => components_from_declaration(
+                program,
+                declaration,
+                statement_start(statement),
+                &mut components,
+            ),
+            // `export function Page(…)`, `export const Badge = …`
+            Statement::ExportDeclaration(declaration) => match &declaration.declaration {
+                Declaration::FunctionDeclaration(function) => push_if_component(
+                    &mut components,
+                    component_from_function(function, Some(declaration.span.start), None),
+                ),
+                Declaration::VariableDeclaration(variables) => components_from_declaration(
+                    program,
+                    variables,
+                    declaration.span.start,
+                    &mut components,
+                ),
+                _ => {}
+            },
+            // `export default function Page(…)`, `export default (props) => …`,
+            // `export default Page`. The default export is a component too, and
+            // the props rule is the same one.
+            Statement::ExportDefaultDeclaration(declaration) => push_if_component(
+                &mut components,
+                component_from_default(program, declaration),
+            ),
+            _ => {}
+        }
+    }
+
+    // One declaration can be summarized twice: once through its own statement
+    // and once through the default export that names it. Two `RA006`s for one
+    // untyped component would overstate the repair, and the body span identifies
+    // the declaration, so the duplicate is dropped.
+    let mut unique: Vec<ComponentInfo<'a>> = Vec::with_capacity(components.len());
+    for component in components {
+        if !unique
+            .iter()
+            .any(|seen| seen.body_span == component.body_span)
+        {
+            unique.push(component);
+        }
+    }
+
+    // Mark the route. Reaching a component by name means the walk necessarily
+    // summarized it as an ordinary declaration first, so this is the only place
+    // that knows both answers at once.
+    if let Some(route) = find_route_component(program) {
+        for component in &mut unique {
+            if component.body_span == route.body_span {
+                component.is_default_export = true;
+            }
+        }
+    }
+
+    unique
+}
+
+/// Push `info` when it is a component (a function that returns JSX).
+fn push_if_component<'a>(components: &mut Vec<ComponentInfo<'a>>, info: ComponentInfo<'a>) {
+    if info.returns_jsx {
+        components.push(info);
+    }
+}
+
+/// The start of a top-level statement, used as the start of a signature line.
+fn statement_start(statement: &Statement<'_>) -> u32 {
+    statement.span().start
+}
+
+/// Every component bound by a `const`/`let`/`var` initializer in `declaration`.
+///
+/// `start` is the enclosing statement's start, so an exported `const` is rebuilt
+/// as `export const Badge = …` and a plain one as `const Badge = …`.
+///
+/// A list (`const A = …, B = …`) is walked declarator by declarator. Only the
+/// first one owns the statement's `const` prefix; for the rest the signature is
+/// the declarator alone (`B = (props: …) => …`), which is the fragment to edit in
+/// place. Naming the whole statement for every declarator would give `B` a line
+/// that describes `A`.
+fn components_from_declaration<'a>(
+    program: &'a Program<'a>,
+    declaration: &'a oxc_ast::ast::VariableDeclaration<'a>,
+    start: u32,
+    components: &mut Vec<ComponentInfo<'a>>,
+) {
+    for (index, declarator) in declaration.declarations.iter().enumerate() {
+        let Some(init) = declarator.init.as_ref() else {
+            continue;
+        };
+        // The first declarator starts where the statement does (`const`, or the
+        // `export` before it); a later one starts at its own binding.
+        let start = if index == 0 {
+            start
+        } else {
+            declarator.span.start
+        };
+        let end = declarator.span.end;
+        let info = match init {
+            Expression::ArrowFunctionExpression(arrow) => component_from_arrow(arrow, start, end),
+            Expression::FunctionExpression(function) => {
+                component_from_function(function, Some(start), Some(end))
+            }
+            Expression::ParenthesizedExpression(parenthesized) => component_from_expression(
+                program,
+                &parenthesized.expression,
+                start,
+                end,
+                &mut Vec::new(),
+            ),
+            _ => continue,
+        };
+        // The declarator names the literal; a followed name (`const Alias = Page`)
+        // keeps the declaration it resolves to, whose parameters live there.
+        let info = match (
+            is_function_literal(init),
+            declarator.id.get_identifier_name(),
+        ) {
+            (true, Some(name)) => info.with_name(name.as_str(), span_of(declarator.id.span())),
+            _ => info,
+        };
+        push_if_component(components, info);
+    }
+}
+
 /// Summarize one `export default …` declaration.
 ///
 /// Every accepted shape produces a summary: a function literal one describing the
@@ -197,62 +400,72 @@ fn component_from_default<'a>(
     program: &'a Program<'a>,
     declaration: &'a ExportDefaultDeclaration<'a>,
 ) -> ComponentInfo<'a> {
-    match &declaration.declaration {
+    let (start, end) = (declaration.span.start, declaration.span.end);
+    let info = match &declaration.declaration {
         // `export default function Page(props) {…}`, the anonymous
         // `export default function (props) {…}` (the same node with no `id`),
         // and a function *expression*. Oxc has separate variants for the
         // declaration and expression forms, but they summarize identically.
         ExportDefaultDeclarationKind::FunctionDeclaration(function)
         | ExportDefaultDeclarationKind::FunctionExpression(function) => {
-            component_from_function(function, true)
+            component_from_function(function, Some(start), Some(end))
         }
         // `export default (props) => <p/>`
         ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-            component_from_arrow(arrow, true)
+            component_from_arrow(arrow, start, end)
         }
         // `export default (function Page() {…})`, `export default ((props) => …)`
         // and `export default (Page)`: parentheses are not part of the function,
         // but they are part of the AST shape the parser produces (verified on
         // 0.159.0), so unwrap them rather than calling it "not a component".
+        //
+        // The signature is sliced from the enclosing `export default`, so a
+        // rebuilt line keeps the parentheses it was written with.
         ExportDefaultDeclarationKind::ParenthesizedExpression(parenthesized) => {
-            component_from_expression(program, &parenthesized.expression, true, &mut Vec::new())
+            component_from_expression(
+                program,
+                &parenthesized.expression,
+                start,
+                end,
+                &mut Vec::new(),
+            )
         }
         // `export default Page`: a valid route when `Page` is a component
         // declared in this file. Resolving it is a body scan, not dataflow — if
         // it is declared here we can summarize it exactly, and if it is imported
         // we must not guess what it is.
         //
-        // Resolved or not, the export is a *name*, not an inline declaration:
-        // the fix may not tell the agent to write `export default …` again.
+        // The signature is the *declaration's*, so the rebuilt line is the one
+        // that declares the binding, not a second `export default`.
         ExportDefaultDeclarationKind::Identifier(identifier) => {
             resolve_local(program, identifier.name.as_str())
-                .map(|info| info.not_inline())
                 .unwrap_or_else(|| not_a_component(identifier.name.as_str(), identifier.span))
         }
         // `export default 42`, `export default class X {}`, `export default
         // pageFactory()`: an export, but nothing that renders.
         other => not_a_component("default", other.span()),
-    }
+    };
+    info.mark_default_export()
 }
 
-/// Summarize a parenthesized default-export expression by what is inside it.
+/// Summarize a parenthesized expression by what is inside it.
 ///
-/// `inline_default` says whether the expression *is* the default export (it is,
-/// when this is reached from an `export default (…)`) or merely the initializer
-/// of a name that some export refers to.
+/// `start` and `end` are the enclosing declaration's extent, so a rebuilt
+/// signature keeps the parentheses the source wrote.
 fn component_from_expression<'a>(
     program: &'a Program<'a>,
     expression: &'a Expression<'a>,
-    inline_default: bool,
+    start: u32,
+    end: u32,
     seen: &mut Vec<&'a str>,
 ) -> ComponentInfo<'a> {
     match expression {
-        Expression::ArrowFunctionExpression(arrow) => component_from_arrow(arrow, inline_default),
+        Expression::ArrowFunctionExpression(arrow) => component_from_arrow(arrow, start, end),
         Expression::FunctionExpression(function) => {
-            component_from_function(function, inline_default)
+            component_from_function(function, Some(start), Some(end))
         }
         Expression::ParenthesizedExpression(parenthesized) => {
-            component_from_expression(program, &parenthesized.expression, inline_default, seen)
+            component_from_expression(program, &parenthesized.expression, start, end, seen)
         }
         Expression::Identifier(identifier) => {
             resolve_local_inner(program, identifier.name.as_str(), seen)
@@ -273,11 +486,7 @@ fn component_from_specifiers<'a>(
 ) -> Option<ComponentInfo<'a>> {
     let specifier = default_specifier(specifiers)?;
     let local = specifier.local.name().as_str();
-    Some(
-        resolve_local(program, local)
-            .map(|info| info.not_inline())
-            .unwrap_or_else(|| not_a_component(local, specifier.span)),
-    )
+    Some(resolve_local(program, local).unwrap_or_else(|| not_a_component(local, specifier.span)))
 }
 
 /// The specifier exported as `default`, if there is one.
@@ -337,50 +546,85 @@ fn resolve_local_inner<'a>(
             .id
             .as_ref()
             .filter(|identifier| identifier.name == name)
-            .map(|_| component_from_function(function, false)),
+            .map(|_| component_from_function(function, None, None)),
         Statement::VariableDeclaration(declaration) => {
-            declaration.declarations.iter().find_map(|declarator| {
-                if !declarator
-                    .id
-                    .get_identifier_name()
-                    .is_some_and(|identifier| identifier.as_str() == name)
-                {
-                    return None;
-                }
-                // A function literal is anonymous (`const AboutPage = (props) =>
-                // …` has no function name at all), so the *declarator* names it.
-                // Without this, the summary says `"default"` and every diagnostic
-                // talks about a `Page` that does not exist in the file — an agent
-                // following the fix would annotate a new binding and leave the real
-                // one untouched.
-                //
-                // The declarator names the literal even when the literal names
-                // itself (`const AboutPage = function Actual() {…}`): `Actual` is
-                // scoped to the function body, so the module binding an agent can
-                // find and edit is `AboutPage`. A followed name (`const Alias =
-                // Page`) keeps the declaration it resolves to, because that is
-                // where the parameters live.
-                let init = declarator.init.as_ref()?;
-                let info = match init {
-                    Expression::ArrowFunctionExpression(arrow) => {
-                        component_from_arrow(arrow, false)
-                    }
-                    Expression::FunctionExpression(function) => {
-                        component_from_function(function, false)
-                    }
-                    Expression::ParenthesizedExpression(parenthesized) => {
-                        component_from_expression(program, &parenthesized.expression, false, seen)
-                    }
-                    _ => return None,
-                };
-                Some(if is_function_literal(init) {
-                    info.with_name(name)
-                } else {
-                    info
-                })
-            })
+            resolve_local_declaration(program, declaration, statement.span().start, name, seen)
         }
+        // `export const Page = …`: the statement an agent edits starts at
+        // `export`, not at `const`, so the rebuilt signature keeps the export
+        // keyword and cannot be applied as a second plain `const`.
+        Statement::ExportDeclaration(declaration) => match &declaration.declaration {
+            Declaration::VariableDeclaration(variables) => {
+                resolve_local_declaration(program, variables, declaration.span.start, name, seen)
+            }
+            Declaration::FunctionDeclaration(function) => function
+                .id
+                .as_ref()
+                .filter(|identifier| identifier.name == name)
+                .map(|_| component_from_function(function, Some(declaration.span.start), None)),
+            _ => None,
+        },
         _ => None,
+    })
+}
+
+/// [`resolve_local_inner`] for the declarators of one `const`/`let`/`var`.
+///
+/// `start` is the enclosing statement's start: `export const` or plain `const`.
+fn resolve_local_declaration<'a>(
+    program: &'a Program<'a>,
+    declaration: &'a oxc_ast::ast::VariableDeclaration<'a>,
+    start: u32,
+    name: &'a str,
+    seen: &mut Vec<&'a str>,
+) -> Option<ComponentInfo<'a>> {
+    declaration.declarations.iter().find_map(|declarator| {
+        if !declarator
+            .id
+            .get_identifier_name()
+            .is_some_and(|identifier| identifier.as_str() == name)
+        {
+            return None;
+        }
+        // A function literal is anonymous (`const AboutPage = (props) => …` has
+        // no function name at all), so the *declarator* names it. Without this,
+        // the summary says `"default"` and every diagnostic talks about a `Page`
+        // that does not exist in the file — an agent following the fix would
+        // annotate a new binding and leave the real one untouched.
+        //
+        // The declarator names the literal even when the literal names itself
+        // (`const AboutPage = function Actual() {…}`): `Actual` is scoped to the
+        // function body, so the module binding an agent can find and edit is
+        // `AboutPage`. A followed name (`const Alias = Page`) keeps the
+        // declaration it resolves to, because that is where the parameters live.
+        let init = declarator.init.as_ref()?;
+        let info = match init {
+            Expression::ArrowFunctionExpression(arrow) => {
+                component_from_arrow(arrow, start, declaration.span.end)
+            }
+            Expression::FunctionExpression(function) => {
+                component_from_function(function, Some(start), Some(declaration.span.end))
+            }
+            Expression::ParenthesizedExpression(parenthesized) => component_from_expression(
+                program,
+                &parenthesized.expression,
+                start,
+                declaration.span.end,
+                seen,
+            ),
+            _ => return None,
+        };
+        Some(
+            match (
+                is_function_literal(init),
+                declarator.id.get_identifier_name(),
+            ) {
+                (true, Some(binding)) => {
+                    info.with_name(binding.as_str(), span_of(declarator.id.span()))
+                }
+                _ => info,
+            },
+        )
     })
 }
 
@@ -396,23 +640,32 @@ fn not_a_component<'a>(name: &'a str, span: oxc_span::Span) -> ComponentInfo<'a>
         has_props_type: false,
         // Point at the export itself rather than an absent body, so the agent
         // sees which declaration to replace.
+        signature_span: span_of(span),
+        params_span: span_of(span),
+        name_span: span_of(span),
         body_span: span_of(span),
         returns_jsx: false,
-        // There is no inline component to edit; the fix must say "replace".
-        inline_default: false,
+        // `check_props` stops at `NotAFunction`; `RA011` owns this repair.
+        is_default_export: true,
     }
 }
 
 /// Summarize an arrow function, whose body may be a block or a single
 /// expression.
+///
+/// `(start, end)` is the enclosing declaration's extent: an `export default`, a
+/// `const` statement, or a parenthesized expression.
 fn component_from_arrow<'a>(
     arrow: &'a oxc_ast::ast::ArrowFunctionExpression<'a>,
-    inline_default: bool,
+    start: u32,
+    end: u32,
 ) -> ComponentInfo<'a> {
+    let body = arrow.body.span();
+    let params = span_of(arrow.params.span);
     let returns_jsx = match &arrow.body {
         // `(props) => <p/>`: the JSX is the body, there is no `return` to find.
         ArrowFunctionBody::JSXElement(_) | ArrowFunctionBody::JSXFragment(_) => true,
-        ArrowFunctionBody::FunctionBody(body) => returns_jsx(body.statements.iter()),
+        ArrowFunctionBody::FunctionBody(block) => returns_jsx(block.statements.iter()),
         // Any other concise body returns an expression. It is JSX only when it
         // is JSX itself; a `=> View` or `=> render()` is not followed (see
         // `ComponentInfo::returns_jsx`).
@@ -421,21 +674,43 @@ fn component_from_arrow<'a>(
 
     ComponentInfo {
         kind: ComponentKind::Function,
+        // An arrow function has no name of its own; only a binding can name it.
         name: "default",
         params: param_count(&arrow.params),
         has_props_type: has_single_annotated_param(&arrow.params),
-        body_span: span_of(arrow.body.span()),
+        signature_span: match &arrow.body {
+            // A block body opens with `{`: the signature line ends there.
+            ArrowFunctionBody::FunctionBody(block) => (start, block.span.start.saturating_add(1)),
+            // A concise body is the line to write up to the end of the
+            // declaration (which includes a wrapping `)` if there is one).
+            _ => (start, end),
+        },
+        params_span: params,
+        // Replaced by `with_name` when a binding names it.
+        name_span: params,
+        body_span: span_of(body),
         returns_jsx,
-        inline_default,
+        // Marked by `mark_default_export` or `find_components`, which are the
+        // only places that know whether this declaration is the default export.
+        is_default_export: false,
     }
 }
 
 /// Summarize a [`Function`] node (declaration or expression).
+///
+/// `start` and `end` are the enclosing declaration's extent when the caller knows
+/// it; `None` starts at the function itself and ends at its body.
 fn component_from_function<'a>(
     function: &'a Function<'a>,
-    inline_default: bool,
+    start: Option<u32>,
+    end: Option<u32>,
 ) -> ComponentInfo<'a> {
     let body = function.body.as_deref();
+    let params = span_of(function.params.span);
+    let name_span = function
+        .id
+        .as_ref()
+        .map_or(params, |identifier| span_of(identifier.span));
 
     ComponentInfo {
         kind: ComponentKind::Function,
@@ -446,14 +721,31 @@ fn component_from_function<'a>(
             .map_or("default", |identifier| identifier.name.as_str()),
         params: param_count(&function.params),
         has_props_type: has_single_annotated_param(&function.params),
+        signature_span: match body {
+            // The signature line ends at the `{` that opens the block body.
+            Some(body) => (
+                start.unwrap_or(function.span.start),
+                body.span.start.saturating_add(1),
+            ),
+            // `function f(props): void;` has no body. There is nothing to open,
+            // so the whole declaration is the signature.
+            None => (
+                start.unwrap_or(function.span.start),
+                end.unwrap_or(function.span.end),
+            ),
+        },
+        params_span: params,
+        name_span,
         body_span: match body {
             Some(body) => span_of(body.span),
-            // `function f(props): void;` has no body. There is nowhere to point
-            // and nothing to analyze, so use the function's own span.
+            // A bodyless declaration has nowhere to point and nothing to
+            // analyze, so use the function's own span.
             None => span_of(function.span),
         },
         returns_jsx: body.is_some_and(|body| returns_jsx(body.statements.iter())),
-        inline_default,
+        // Marked by `mark_default_export` or `find_components`, which are the only
+        // places that know whether this declaration is the default export.
+        is_default_export: false,
     }
 }
 
@@ -529,6 +821,27 @@ fn is_function_literal(expression: &Expression<'_>) -> bool {
 /// A [`Span`] as the `(start, end)` pair every diagnostic carries.
 fn span_of(span: oxc_span::Span) -> (u32, u32) {
     (span.start, span.end)
+}
+
+/// The `(start, end)` range of `source`, clamped to character boundaries.
+///
+/// Spans come from the parser that produced `source`, so they are in bounds by
+/// construction. The clamping is defensive: a diagnostic that panics while
+/// rendering is worse than one with a shorter quote, and a non-ASCII JSX
+/// attribute could land a byte offset mid-character.
+fn slice(source: &str, (start, end): (u32, u32)) -> &str {
+    let mut start = (start as usize).min(source.len());
+    let mut end = (end as usize).min(source.len());
+    while start > 0 && !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end > start && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < start {
+        return "";
+    }
+    &source[start..end]
 }
 
 /// Validate the route component's export shape.
@@ -616,7 +929,6 @@ fn existing_export_is_not_a_component(info: &ComponentInfo) -> Diagnostic {
 
     Diagnostic::new(Code::RA011, info.body_span, message)
 }
-
 #[cfg(test)]
 mod tests {
     use oxc_allocator::Allocator;
@@ -1007,7 +1319,7 @@ mod tests {
             .map(|diagnostic| diagnostic.code)
             .collect();
         codes.extend(
-            crate::analyze::props::check_props(&info)
+            crate::analyze::props::check_props(&info, src)
                 .iter()
                 .map(|diagnostic| diagnostic.code),
         );
@@ -1154,5 +1466,159 @@ mod tests {
         let (info, codes) = analyze(&alloc, src);
         assert!(codes.is_empty());
         assert!(info.unwrap().has_props_type);
+    }
+
+    /// Every component in the file, exported or not — the wider question `RA006`
+    /// asks. A `_shell.tsx` has no default export and still declares components.
+    #[test]
+    fn find_components_finds_every_jsx_function() {
+        let alloc = Allocator::default();
+        let src = "function Header(props: Props) { return <h1/> }\n\
+                   export function Footer(props: Props) { return <f/> }\n\
+                   const Badge = (props: Props) => <b/>\n\
+                   export const Chip = function (props: Props) { return <c/> }\n\
+                   function NotAComponent() { return 42 }\n\
+                   export default function Page(props: Props) { return <p/> }\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let names: Vec<&str> = find_components(program)
+            .iter()
+            .map(|component| component.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Header", "Footer", "Badge", "Chip", "Page"],
+            "NotAComponent does not return JSX and is not a component"
+        );
+    }
+
+    /// The default export is one of those components, and is marked as such —
+    /// reaching it by name means the walk summarizes the declaration first, so a
+    /// naive list would report it twice.
+    #[test]
+    fn find_components_marks_the_default_export_once() {
+        for src in [
+            "const AboutPage = (props: Props) => <p/>\nexport default AboutPage\n",
+            "const AboutPage = (props: Props) => <p/>\nexport { AboutPage as default }\n",
+            "export default function AboutPage(props: Props) { return <p/> }\n",
+            "export default (props: Props) => <p/>\n",
+        ] {
+            let alloc = Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let components = find_components(program);
+            assert_eq!(components.len(), 1, "{src}: {components:?}");
+            assert!(components[0].is_default_export, "{src}");
+            assert!(components[0].returns_jsx, "{src}");
+        }
+    }
+
+    /// A non-route component is not the default export, and a file with none has
+    /// no marked component at all.
+    #[test]
+    fn find_components_does_not_mark_other_components_as_the_route() {
+        let alloc = Allocator::default();
+        let src = "export default function Page(props: Props) { return <p/> }\n\
+                   function Badge(props: Props) { return <b/> }\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let components = find_components(program);
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0].name, "Page");
+        assert!(components[0].is_default_export);
+        assert_eq!(components[1].name, "Badge");
+        assert!(!components[1].is_default_export);
+    }
+
+    /// `signature_span` starts at the statement an agent edits and ends at the
+    /// `{` of a block body, so slicing between it and `params_span` rebuilds the
+    /// line to write rather than a fragment of it.
+    #[test]
+    fn signature_span_is_the_line_to_edit() {
+        for (src, expected_prefix, params, expected) in [
+            (
+                "export default function Page(props) { return <p/> }\n",
+                "export default function Page",
+                "(props: Props)",
+                "export default function Page(props: Props) {",
+            ),
+            (
+                "function Badge(props) { return <b/> }\n",
+                "function Badge",
+                "(props: Props)",
+                "function Badge(props: Props) {",
+            ),
+            (
+                "const Badge = (props) => <b/>\n",
+                "const Badge = ",
+                "(props: Props)",
+                "const Badge = (props: Props) => <b/>",
+            ),
+            (
+                "const Badge = (props) => { return <b/> }\n",
+                "const Badge = ",
+                "(props: Props)",
+                "const Badge = (props: Props) => {",
+            ),
+            (
+                "export const Badge = () => <b/>\n",
+                "export const Badge = ",
+                "(props: Record<never, never>)",
+                "export const Badge = (props: Record<never, never>) => <b/>",
+            ),
+        ] {
+            let alloc = Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let components = find_components(program);
+            let component = components.first().expect("fixture declares a component");
+            assert!(
+                component
+                    .signature(src, params)
+                    .starts_with(expected_prefix),
+                "{src}: {:?}",
+                component.signature(src, params)
+            );
+            assert_eq!(
+                component.signature(src, params),
+                expected,
+                "the rebuilt line must be the exact declaration to write"
+            );
+        }
+    }
+
+    /// The signature keeps a wrapping parenthesis, so the rebuilt line is still
+    /// the expression the file has.
+    #[test]
+    fn a_parenthesized_signature_keeps_its_parentheses() {
+        let alloc = Allocator::default();
+        let src = "export default ((props) => <p/>)\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let components = find_components(program);
+        let component = components.first().unwrap();
+        assert_eq!(
+            component.signature(src, "(props: Props)"),
+            "export default ((props: Props) => <p/>)"
+        );
+    }
+
+    /// A propless component points `RA006` at its name; one with props points at
+    /// the parameter list. Pointing at an empty `()` tells an agent nothing about
+    /// which component is meant when a file has several.
+    #[test]
+    fn props_span_points_at_the_parameter_list_or_the_name() {
+        let alloc = Allocator::default();
+        let src = "export default function Page() { return <p/> }\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let info = find_route_component(program).unwrap();
+        assert_eq!(
+            &src[info.props_span().0 as usize..info.props_span().1 as usize],
+            "Page"
+        );
+
+        let alloc = Allocator::default();
+        let src = "export default function Page(props) { return <p/> }\n";
+        let program = parse_tsx(&alloc, src).unwrap();
+        let info = find_route_component(program).unwrap();
+        assert_eq!(
+            &src[info.props_span().0 as usize..info.props_span().1 as usize],
+            "(props)"
+        );
     }
 }
