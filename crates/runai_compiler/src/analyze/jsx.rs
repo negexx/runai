@@ -50,7 +50,17 @@
 //!   dropping the other would render markup without part of a node;
 //! - JSX anywhere else in a route body statement (`const header = <h1/>`, a
 //!   nested renderer's `return`) — [`RouteIr::statements`] is copied into the
-//!   emitted `.mjs` verbatim, where JSX is a syntax error.
+//!   emitted `.mjs` verbatim, where JSX is a syntax error;
+//! - JSX outside the route's returned tree (a module-level `const header =
+//!   <h1/>`, a module-level helper that returns JSX) — module-level statements
+//!   are not emitted at all, so the markup is dropped while the returned tree
+//!   still references the symbol it was assigned to.
+//!
+//! Both of the last two are the same defect at two scopes: JSX the build cannot
+//! turn into JavaScript. They are refused only in a file where a route component
+//! exists: a `.tsx` file with no default export is a component module, where a
+//! module-level JSX declaration is legal and this milestone simply does not emit
+//! that module.
 //!
 //! [`RouteIr::statements`]: crate::ir::RouteIr::statements
 //!
@@ -85,14 +95,40 @@ use oxc_span::{GetSpan, Span};
 use crate::diagnostic::{Code, Diagnostic};
 use crate::source::{has_line_break, raw_text};
 
-/// The tags the runtime itself provides, in their capitalized declaration form.
+/// The tags the runtime itself provides, each with the repair its refusal carries.
 ///
 /// They look like components to [`dom_tag`]'s capitalization rule, but they are
 /// not: they are this framework's list, conditional, and async primitives, and no
 /// later task in this milestone's plan gives the agent a way to write them. A
 /// diagnostic that called them "a component" would point at an inlining
 /// mechanism that does not exist for them.
-const RUNTIME_TAGS: &[&str] = &["For", "Show", "When"];
+///
+/// One table, so "which tags are runtime primitives" and "what does this one
+/// tell the agent to do" cannot disagree: the old shape kept the tag list in a
+/// `const` and the repairs in a `match` ending in `unreachable!`, which would
+/// panic *while producing a diagnostic* if the const gained a tag the `match`
+/// did not.
+///
+/// `<When>`'s repair names the `pending` branch on purpose: a design.md
+/// `resource` only has its `pending` branch reachable at build time (§7.1), so
+/// "render the success branch" is not something the agent can apply.
+const RUNTIME: &[(&str, &str)] = &[
+    (
+        "For",
+        "Render the list one element at a time (spread the items into static markup), or wait \
+         for `<For>` support in a later plan.",
+    ),
+    (
+        "Show",
+        "Return one of the two elements conditionally from the component, or wait for `<Show>` \
+         support in a later plan.",
+    ),
+    (
+        "When",
+        "Render the `pending` branch directly (it is the only branch a prerendered page can \
+         show), or wait for `<When>` support in a later plan.",
+    ),
+];
 
 /// Elements that flow inline with their neighbours, so a dropped space is
 /// visible. Everything else is block-level: a newline around it is layout, not
@@ -115,12 +151,17 @@ pub const SPACE_FIX: &str = "Put both on one line, or write {\" \"} where you wa
 /// Every JSX rule `analyze` applies before lowering.
 ///
 /// One pass over the original program: the route's own render (fragment root,
-/// dropped returns), then each `RA014` refusal and the `RA007` ambiguity in
-/// source order. Returning every diagnostic — not just the first — means one run
-/// tells the agent everything to fix.
+/// dropped returns, body statements, module-level declarations), then each
+/// `RA014` refusal and the `RA007` ambiguity in source order. Returning every
+/// diagnostic — not just the first — means one run tells the agent everything to
+/// fix.
 ///
 /// Runs on **every** `.tsx` file, not only pages, so a `_shell.tsx` component is
-/// held to the same rules.
+/// held to the same rules. The scope rules are the exception: a fragment root, a
+/// second `return`, a body statement, and module-level JSX are all questions
+/// about *the route*, so they are asked only when [`route_render`] finds one. A
+/// module with no route is not emitted by this milestone at all, and a
+/// module-level JSX helper there is legal.
 pub fn check_jsx(program: &Program, source: &str) -> Vec<Diagnostic> {
     let mut checker = JsxChecker {
         source,
@@ -131,7 +172,7 @@ pub fn check_jsx(program: &Program, source: &str) -> Vec<Diagnostic> {
     // Everything here is about the *returned root* or the statements the
     // returned root replaces, so they are answered from one walk.
     if let Some(render) = route_render(program) {
-        checker.root(render);
+        checker.root(program, render);
     }
 
     checker.visit_program(program);
@@ -159,31 +200,28 @@ impl JsxChecker<'_> {
         raw_text(self.source, span).unwrap_or("")
     }
 
-    /// The two rules about the route's returned markup.
-    fn root(&mut self, render: RouteRender<'_>) {
-        match render.root {
-            Expression::JSXFragment(fragment) => self.diagnostics.push(unsupported(
-                fragment.span,
-                "a fragment as the route's returned JSX",
-                "Return exactly one element instead, wrapping the fragment's children in \
-                 `<main>…</main>` or whichever parent suits the page.",
-            )),
-            // `route_render` sees through parentheses, so a JSX element is the
-            // only other shape it can return.
-            Expression::JSXElement(_) => {}
-            // Unreachable, and kept so a future resolver change is a diagnostic.
-            other => self.diagnostics.push(unsupported(
-                other.span(),
-                "a root that is not JSX",
-                "Return one element from the route component, e.g. `return <main>…</main>`.",
-            )),
+    /// The rules about the route's returned markup and the scopes around it.
+    ///
+    /// `program` is needed for the module-level walk: the route component's body
+    /// is one scope, and everything outside it is the other.
+    fn root(&mut self, program: &Program<'_>, render: RouteRender<'_>) {
+        self.root_expression(render.root);
+
+        // Module-level declarations are never copied into the emitted module, so
+        // JSX there is dropped while the returned tree still refers to the symbol
+        // it was assigned to — a `ReferenceError`. Same defect as a body
+        // statement, one scope out. This runs for a concise arrow body too
+        // (`(props) => <p>{header}</p>` has no body statements but does have a
+        // module-level `header`).
+        let root_span = render.root.span();
+        if let Some(span) = jsx_outside_route_render(program, &render) {
+            self.diagnostics.push(module_jsx(span));
         }
 
         let (Some(body), Some(return_span)) = (render.body, render.return_span) else {
             return;
         };
         let returned = jsx_returns(body);
-        let root_span = render.root.span();
 
         // One root is emitted, so a second JSX return would lose the other branch
         // with no report. Only the route body is walked, and nested functions are
@@ -203,6 +241,27 @@ impl JsxChecker<'_> {
         // second return already has the more specific diagnostic above.
         if let Some(span) = jsx_in_body_statements(body, return_span, &returned) {
             self.diagnostics.push(body_jsx(span));
+        }
+    }
+
+    /// The fragment-root rule and the "root is not JSX" invariant.
+    fn root_expression(&mut self, root: &Expression<'_>) {
+        match root {
+            Expression::JSXFragment(fragment) => self.diagnostics.push(unsupported(
+                fragment.span,
+                "a fragment as the route's returned JSX",
+                "Return exactly one element instead, wrapping the fragment's children in \
+                 `<main>…</main>` or whichever parent suits the page.",
+            )),
+            // `route_render` sees through parentheses, so a JSX element is the
+            // only other shape it can return.
+            Expression::JSXElement(_) => {}
+            // Unreachable, and kept so a future resolver change is a diagnostic.
+            other => self.diagnostics.push(unsupported(
+                other.span(),
+                "a root that is not JSX",
+                "Return one element from the route component, e.g. `return <main>…</main>`.",
+            )),
         }
     }
 }
@@ -332,19 +391,25 @@ pub(crate) fn dom_tag<'a>(name: &'a JSXElementName<'a>) -> Result<&'a str, Refus
     match name {
         JSXElementName::Identifier(identifier) => {
             let tag = identifier.name.as_str();
-            // The parser lowercases nothing: a JSX *identifier* starting with a
-            // capital is React's component convention, whatever Oxc's node kind
-            // is called. The runtime's own `<For>`/`<Show>`/`<When>` share that
-            // spelling but are not components, so they get their own refusal.
+            // The parser lowercases nothing, and which *node kind* a name parses
+            // as depends only on the name: Oxc's `is_reference` is `!contains_dash
+            // &&` a first byte in `A-Z`, `_`, `$`, or non-ASCII
+            // (`oxc_parser-0.159.0/src/jsx/mod.rs:178-198`) — never on whether
+            // attributes are present. So this arm only sees a hyphenated name
+            // (`<my-element/>`) or one starting `a-z`, and `this` is its own node.
+            // Its capitalized branch is therefore reachable only for a hyphenated
+            // capital such as `<My-Element/>`; the runtime's `<For>`/`<Show>`/
+            // `<When>` and every other component name arrive at the arm below.
             if tag.starts_with(|c: char| c.is_ascii_uppercase()) {
                 Err(Refusal::capitalized(tag))
             } else {
                 Ok(tag)
             }
         }
-        // A tag with an attribute (or any dotted reference) parses as
-        // `IdentifierReference`; the same capitalization rule applies, so both
-        // arms must share it or `<For/>` and `<For each={x}/>` would disagree.
+        // No dash and a first byte in `A-Z`/`_`/`$`/non-ASCII: `<For/>` and
+        // `<For each={x}/>` are **both** this arm, and both are refused. The same
+        // capitalization rule applies, so the two arms cannot disagree about what
+        // a name means.
         JSXElementName::IdentifierReference(identifier) => {
             Err(Refusal::capitalized(identifier.name.as_str()))
         }
@@ -376,15 +441,12 @@ pub(crate) struct Refusal {
 impl Refusal {
     /// A capitalized tag: a component, or one of the runtime's primitives.
     ///
-    /// One entry point for both `JSXElementName` arms that can carry a capital, so
-    /// `<For/>` (an `Identifier`) and `<For each={x}/>` (an
-    /// `IdentifierReference`) cannot disagree about what they name.
+    /// One entry point for both `JSXElementName` arms that can carry a capital
+    /// (the `Identifier` arm only for a hyphenated name such as `<My-Element/>`,
+    /// the `IdentifierReference` arm for everything else), so the two arms cannot
+    /// disagree about what a name means.
     fn capitalized(tag: &str) -> Self {
-        if RUNTIME_TAGS.contains(&tag) {
-            Self::runtime(tag)
-        } else {
-            Self::component(tag)
-        }
+        Self::runtime(tag).unwrap_or_else(|| Self::component(tag))
     }
 
     /// A capitalized tag: a component this milestone cannot inline.
@@ -398,31 +460,22 @@ impl Refusal {
         }
     }
 
-    /// A runtime primitive: `<For>`, `<Show>`, or `<When>`.
+    /// A runtime primitive: `<For>`, `<Show>`, or `<When>`, or `None` for any
+    /// other tag.
     ///
     /// The honest repair is neither "inline it" (there is no markup to inline) nor
     /// "wait for component inlining" (this is not a component). The primitive
     /// lowers in a later plan, so the agent is told what to write until then and
-    /// which plan brings it.
-    fn runtime(tag: &str) -> Self {
-        let repair = match tag {
-            "For" => "Render the list one element at a time (spread the items into static \
-                      markup), or wait for `<For>` support in a later plan."
-                .to_string(),
-            "Show" => "Return one of the two elements conditionally from the component, or wait \
-                       for `<Show>` support in a later plan."
-                .to_string(),
-            "When" => "Render the `success` branch directly, or wait for `<When>` support in a \
-                       later plan."
-                .to_string(),
-            _ => unreachable!("RUNTIME_TAGS and this match must list the same tags"),
-        };
-        Self {
+    /// which plan brings it — both read from [`RUNTIME`], so a tag cannot be
+    /// listed there without a repair.
+    fn runtime(tag: &str) -> Option<Self> {
+        let (_, repair) = RUNTIME.iter().find(|(name, _)| *name == tag)?;
+        Some(Self {
             construct: "a runtime primitive (`<For>`, `<Show>`, `<When>`)",
             repair: format!(
                 "`<{tag}>` is a runtime primitive this milestone does not lower. {repair}"
             ),
-        }
+        })
     }
 }
 
@@ -679,6 +732,40 @@ pub(crate) fn jsx_in_body_statements<'a>(
     .find(|span| !excluded.contains(span))
 }
 
+/// The span of the first JSX node outside the route's own render, or `None`.
+///
+/// A route file emits one artifact: the route component's returned tree, plus (for
+/// an island) its body statements. **Module-level declarations are never
+/// emitted.** JSX there is therefore dropped while the returned tree still refers
+/// to the symbol it was bound to, which is a `ReferenceError` at runtime or a
+/// module that does not parse. This is the same defect as
+/// [`jsx_in_body_statements`], one scope out.
+///
+/// The excluded range is the route component's body — or, for a concise arrow
+/// body, the returned JSX itself, since that *is* the body. Everything inside is
+/// owned by the root, second-return, and body-statement rules; everything outside
+/// is module level.
+///
+/// [`check_jsx`] only calls this when [`route_render`] found a route. A `.tsx`
+/// file with no default export is a component module: this milestone does not
+/// emit it at all, so a module-level JSX helper there is accepted.
+pub(crate) fn jsx_outside_route_render<'a>(
+    program: &'a Program<'a>,
+    render: &RouteRender<'a>,
+) -> Option<Span> {
+    let route = render
+        .body
+        .map_or_else(|| render.root.span(), |body| body.span);
+
+    jsx_spans(|finder| {
+        for statement in &program.body {
+            finder.visit_statement(statement);
+        }
+    })
+    .into_iter()
+    .find(|span| span.start < route.start || span.end > route.end)
+}
+
 /// Collects the JSX each `return` statement returns, skipping nested functions.
 #[derive(Default)]
 struct JsxReturns {
@@ -817,12 +904,33 @@ fn unsupported(span: Span, construct: &str, repair: &str) -> Diagnostic {
 /// The construct and repair are shared with [`crate::ir::lower_route`], so the
 /// analysis list and the lowering list cannot describe the same refusal two ways.
 pub(crate) const BODY_JSX_CONSTRUCT: &str = "JSX in a route body statement";
-pub(crate) const BODY_JSX_REPAIR: &str = "the component body is copied into the module above \
-                                          the template, where JSX is a syntax error. Write the \
-                                          markup inline in the returned tree instead.";
+pub(crate) const BODY_JSX_REPAIR: &str = "the component body is copied into the generated \
+                                          module — the island's client module, or the prerender \
+                                          module a `\"use static\"` route runs at build time — \
+                                          where JSX is a syntax error. Write the markup inline \
+                                          in the returned tree instead.";
 
 fn body_jsx(span: Span) -> Diagnostic {
     unsupported(span, BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR)
+}
+
+/// The `RA014` for JSX in a module-level statement of a route file.
+///
+/// A route file's module-level declarations are **not** copied into the generated
+/// module: only the route component's own body statements are. The returned tree
+/// still refers to whatever the declaration bound, so the reference is to a
+/// symbol the build never emitted — a `ReferenceError`, or a module that does not
+/// parse. Shared with [`crate::ir::lower_route`], like the body-statement pair.
+pub(crate) const MODULE_JSX_CONSTRUCT: &str = "JSX outside the route's returned tree";
+pub(crate) const MODULE_JSX_REPAIR: &str = "module-level declarations of a route file are not \
+                                            copied into the generated module, so this markup \
+                                            would be dropped while the returned tree still \
+                                            refers to it. Write the markup inline in the returned \
+                                            tree, or move the helper into a component module (a \
+                                            `.tsx` file with no default export).";
+
+fn module_jsx(span: Span) -> Diagnostic {
+    unsupported(span, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR)
 }
 
 #[cfg(test)]
@@ -986,12 +1094,16 @@ mod tests {
     /// The runtime primitives say what the agent can actually do, and name the tag
     /// it wrote. "Inline it" is not a repair for a primitive, and "later plan"
     /// alone gives the agent nothing legal to try now.
+    ///
+    /// `<When>`'s repair names the `pending` branch, not the success branch: a
+    /// design.md `resource` only has `pending` reachable at build time (§7.1), so
+    /// "render the success branch" is advice the agent cannot apply.
     #[test]
     fn a_runtime_primitive_repair_is_actionable() {
         for (tag, repair) in [
             ("For", "one element at a time"),
             ("Show", "conditionally"),
-            ("When", "success"),
+            ("When", "`pending` branch"),
         ] {
             let src = format!("const a = <div><{tag} /></div>\n");
             let diagnostics = check(&src);
@@ -1113,6 +1225,28 @@ mod tests {
         }
     }
 
+    /// The capitalized branch of `dom_tag`'s `Identifier` arm is reachable only
+    /// for a *hyphenated* capital, and this is why the comment there is precise:
+    /// Oxc decides `Identifier` vs `IdentifierReference` by the name alone
+    /// (`!contains_dash &&` first byte in `A-Z`/`_`/`$`/non-ASCII), never by
+    /// attributes. So `<For/>` and `<For each={x}/>` are the same node kind, while
+    /// `<My-Element/>` is the only shape that lands in the other arm.
+    #[test]
+    fn a_hyphenated_capital_is_the_reachable_identifier_arm() {
+        let diagnostics = check("const a = <div><My-Element /></div>\n");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, Code::RA014);
+        assert!(
+            diagnostics[0].message.contains("a capitalized tag"),
+            "{:?}",
+            diagnostics[0].message
+        );
+
+        // A lowercase hyphenated name is a custom element, which a template can
+        // hold: it is not refused by the tag rule.
+        assert!(codes("const a = <div><my-element /></div>\n").is_empty());
+    }
+
     /// A component tag nested inside another component is reported once per tag,
     /// not once per ancestor. Asserting only the *count* would pass if one tag
     /// were reported twice and the other never, so each tag's message is counted.
@@ -1149,6 +1283,77 @@ mod tests {
             "the span must be exactly the line break: {:?}",
             diagnostics[0]
         );
+    }
+
+    /// A module-level declaration is never copied into the emitted module, so its
+    /// JSX is dropped while the returned tree still refers to the symbol it was
+    /// bound to. The reviewer's exact reproduction: lowering returned a tree with
+    /// `Expr("header")` and `statements: ""`, i.e. a module that names an
+    /// undefined symbol.
+    #[test]
+    fn module_level_jsx_is_ra014() {
+        for src in [
+            // The reproduction, verbatim.
+            "\"use island\"\nconst header = <h1>hi</h1>\nexport default function P(props: Record<never, never>) { return <p>{header}</p> }\n",
+            // A module-level helper that renders: `Header` is never emitted.
+            "\"use island\"\nfunction Header(props: Record<never, never>) { return <h1>x</h1> }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+            // The same, as a const-bound arrow.
+            "\"use island\"\nconst Header = (props: Record<never, never>) => <h1>x</h1>\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+            // A concise route body has no statements, so only the module walk can
+            // see this one.
+            "\"use island\"\nconst header = <h1>hi</h1>\nexport default (props: Record<never, never>) => <p>{header}</p>\n",
+        ] {
+            let diagnostics = check(src);
+            assert_eq!(diagnostics.len(), 1, "{src}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, Code::RA014, "{src}");
+            assert!(
+                diagnostics[0]
+                    .message
+                    .contains("JSX outside the route's returned tree"),
+                "{src}: the message must name the construct, got {:?}",
+                diagnostics[0].message
+            );
+        }
+    }
+
+    /// The refusal is scoped to files that **have** a route. A `.tsx` file with no
+    /// default export is a component module: this milestone emits nothing from it,
+    /// so a module-level JSX helper there is accepted, and a later plan that does
+    /// emit component modules is free to accept the same shape.
+    #[test]
+    fn a_non_route_module_may_hold_module_level_jsx() {
+        for src in [
+            "const header = <h1>hi</h1>\nexport function Header(props: Record<never, never>) { return header }\n",
+            "const header = <h1>hi</h1>\n",
+            // Defined plainly, not under `export`: still no default export.
+            "function Header(props: Record<never, never>) { return <h1>hi</h1> }\n",
+        ] {
+            assert!(codes(src).is_empty(), "{src}: {:?}", check(src));
+        }
+    }
+
+    /// The span is the module-level JSX itself, so the agent can find it — not the
+    /// route's `return` or the whole file.
+    #[test]
+    fn a_module_level_span_slices_the_offending_jsx() {
+        let src = "\"use island\"\nconst header = <h1>hi</h1>\nexport default function P(props: Record<never, never>) { return <p>{header}</p> }\n";
+        let diagnostics = check(src);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let (start, end) = diagnostics[0].span;
+        assert_eq!(&src[start as usize..end as usize], "<h1>hi</h1>");
+    }
+
+    /// A module-level statement with no JSX is ordinary: an import, a constant, a
+    /// helper. Refusing those would reject every real page.
+    #[test]
+    fn module_level_statements_without_jsx_are_clean() {
+        for src in [
+            "\"use static\"\nconst title = \"About\"\nexport default function P(props: Record<never, never>) { return <h1>{title}</h1> }\n",
+            "\"use island\"\nimport { signal } from \"runai\"\nconst n = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{n()}</p> }\n",
+            "\"use island\"\nfunction twice(x: number) { return x * 2 }\nexport default function P(props: Record<never, never>) { return <p>{twice(1)}</p> }\n",
+        ] {
+            assert!(codes(src).is_empty(), "{src}: {:?}", check(src));
+        }
     }
 
     /// `\r` is a line break too. A classic-Mac file separates its JSX lines with

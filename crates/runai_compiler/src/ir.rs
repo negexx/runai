@@ -55,8 +55,8 @@ use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
 use crate::analyze::jsx::{
-    BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR, dom_tag, jsx_in_body_statements, jsx_returns, jsx_spans,
-    route_render,
+    BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR, dom_tag,
+    jsx_in_body_statements, jsx_outside_route_render, jsx_returns, jsx_spans, route_render,
 };
 use crate::analyze::{find_route_component, validate_route_component};
 use crate::diagnostic::{Code, Diagnostic};
@@ -184,6 +184,18 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
         if let Some(span) = jsx_in_body_statements(body, return_span, &returned) {
             return Err(vec![unsupported(span, BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR)]);
         }
+    }
+
+    // Module-level declarations are never emitted, so JSX there is dropped while
+    // the returned tree still refers to the symbol it was bound to. Same invariant
+    // as above, one scope out; the range and the reason are shared with the
+    // analysis, so the two lists cannot drift.
+    if let Some(span) = jsx_outside_route_render(program, &render) {
+        return Err(vec![unsupported(
+            span,
+            MODULE_JSX_CONSTRUCT,
+            MODULE_JSX_REPAIR,
+        )]);
     }
 
     let tree = Lowerer { source: &stripped }.root(render.root)?;
@@ -1180,132 +1192,185 @@ mod tests {
     /// lowering handles. A construct lowering refuses that `check_jsx` misses is
     /// a defect, because `lower_route` is documented to assume analysis passed.
     ///
-    /// One fixture per refusal, plus the shapes that must stay legal. The
-    /// comparison is on code *and* on a named-construct substring, so a refusal
-    /// that changed identity cannot pass by both being `RA014`.
+    /// **One table drives both loops.** Driving only the analysis half from the
+    /// table (and the lowering half from a second, hand-maintained list) left the
+    /// claim half-checked: a construct added to lowering's arms but forgotten in
+    /// the analysis list failed nothing. Every fixture here is a whole route, so
+    /// both functions have something to say about it. The comparison is on code
+    /// *and* on a named-construct substring, so a refusal that changed identity
+    /// cannot pass by both being `RA014`.
     #[test]
     fn the_two_lists_are_equal() {
         use crate::analyze::jsx::check_jsx;
         use crate::source::parse_tsx;
 
-        // Every construct lowering has an arm for, with the construct its
-        // diagnostic must name. `check_jsx` must report the same code *and* the
-        // same construct on the original source, exactly once.
-        //
-        // Every fixture here is `RA014` because lowering's refusal arms are all
-        // `RA014`; the code half still matters, and the `RA007` assertion after the
-        // loop is what proves the comparison reads the code rather than assuming it.
-        let refused: &[(&str, Code, &str)] = &[
+        /// What lowering is expected to do with a fixture `check_jsx` refuses.
+        enum Lowering {
+            /// The same construct, under the same code: the two lists agree.
+            Refuses,
+            /// Analysis only, and lowering **deliberately accepts** it: the shape
+            /// is legal JavaScript, so it is one of the documented two.
+            Accepts,
+        }
+
+        let table: &[(&str, Code, &str, Lowering)] = &[
             (
-                "const a = <div><Greeting /></div>\n",
+                "\"use island\"\nexport default function P() { return <Greeting /> }\n",
                 Code::RA014,
                 "capitalized tag",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div><For each={x} /></div>\n",
+                "\"use island\"\nexport default function P() { return <For each={x} /> }\n",
                 Code::RA014,
                 "runtime primitive",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div><Show when={x} /></div>\n",
+                "\"use island\"\nexport default function P() { return <Show when={x} /> }\n",
                 Code::RA014,
                 "runtime primitive",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div><When value={x} /></div>\n",
+                "\"use island\"\nexport default function P() { return <When value={x} /> }\n",
                 Code::RA014,
                 "runtime primitive",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div><Shared.Header /></div>\n",
+                "\"use island\"\nexport default function P() { return <Shared.Header /> }\n",
                 Code::RA014,
                 "member-expression",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div><svg:rect /></div>\n",
+                "\"use island\"\nexport default function P() { return <svg:rect /> }\n",
                 Code::RA014,
                 "namespaced tag",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div><this /></div>\n",
+                "\"use island\"\nexport default function P() { return <this /> }\n",
                 Code::RA014,
                 "`<this>` tag",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div {...rest} />\n",
+                "\"use island\"\nexport default function P() { return <div {...rest} /> }\n",
                 Code::RA014,
                 "spread attribute",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div>{...items}</div>\n",
+                "\"use island\"\nexport default function P() { return <div>{...items}</div> }\n",
                 Code::RA014,
                 "spread child",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div title=<b/> />\n",
+                "\"use island\"\nexport default function P() { return <div title=<b/> /> }\n",
                 Code::RA014,
                 "an attribute whose value is itself JSX",
+                Lowering::Refuses,
             ),
             (
-                "const a = <div>{ok ? <b/> : null}</div>\n",
+                "\"use island\"\nexport default function P() { return <div>{ok ? <b/> : null}</div> }\n",
                 Code::RA014,
                 "JSX inside a `{…}` expression",
+                Lowering::Refuses,
             ),
             (
-                "export default function P() { return <><b/><i/></> }\n",
+                "\"use island\"\nexport default function P() { return <><b/><i/></> }\n",
                 Code::RA014,
                 "fragment as the route's returned JSX",
-            ),
-            (
-                "export default function P() { if (a) return <b/>; return <i/> }\n",
-                Code::RA014,
-                "second JSX return",
+                Lowering::Refuses,
             ),
             // A body statement is copied into the emitted `.mjs`, where its JSX
             // would be a syntax error.
             (
-                "export default function P() { const header = <h1>x</h1>; return <p>{header}</p> }\n",
+                "\"use island\"\nexport default function P() { const header = <h1>x</h1>; return <p>{header}</p> }\n",
                 Code::RA014,
                 "JSX in a route body statement",
+                Lowering::Refuses,
             ),
             (
-                "export default function P() { function Item() { return <li/> } return <ul/> }\n",
+                "\"use island\"\nexport default function P() { function Item() { return <li/> } return <ul/> }\n",
                 Code::RA014,
                 "JSX in a route body statement",
+                Lowering::Refuses,
             ),
-            // A body statement whose own subtree also has a refused construct: two
-            // `RA014`s in one file, so the construct comparison below cannot pass
-            // by filtering on the code alone.
+            // Module level: emitted nowhere, so the tree refers to a symbol the
+            // build never wrote. This is the shape round 2 added.
             (
-                "export default function P() { const x = <div {...rest} />; return <p/> }\n",
+                "\"use island\"\nconst header = <h1>x</h1>\nexport default function P() { return <p>{header}</p> }\n",
                 Code::RA014,
-                "spread attribute",
+                "JSX outside the route's returned tree",
+                Lowering::Refuses,
+            ),
+            (
+                "\"use island\"\nfunction Header() { return <h1>x</h1> }\nexport default function P() { return <p/> }\n",
+                Code::RA014,
+                "JSX outside the route's returned tree",
+                Lowering::Refuses,
+            ),
+            // The two documented analysis-only shapes, both asserted to *lower*
+            // below so "analysis only" is a claim about lowering, not an excuse.
+            //
+            // A whitespace ambiguity is not an unsupported construct: JSX deletes
+            // the space, which is exactly what lowering's whitespace rule does.
+            (
+                "\"use island\"\nexport default function P() { return <p><b>a</b>\n<i>b</i></p> }\n",
+                Code::RA007,
+                "line break between two inline elements",
+                Lowering::Accepts,
+            ),
+            // One root is emitted; lowering follows the first `return` and never
+            // sees the second.
+            (
+                "\"use island\"\nexport default function P() { if (a) return <b/>; return <i/> }\n",
+                Code::RA014,
+                "second JSX return",
+                Lowering::Accepts,
             ),
         ];
-        for (src, code, construct) in refused {
+
+        for (src, code, construct, lowering) in table {
             let alloc = oxc_allocator::Allocator::default();
             let program = parse_tsx(&alloc, src).unwrap();
             let analysis = check_jsx(program, src);
-            let matched: Vec<&Diagnostic> = analysis
+            let matched = analysis
                 .iter()
                 .filter(|d| d.code == *code && d.message.contains(construct))
-                .collect();
-            assert!(
-                !matched.is_empty(),
-                "check_jsx missed {construct} ({code:?}) lowering refuses: {src}\n{analysis:?}"
+                .count();
+            assert_eq!(
+                matched, 1,
+                "check_jsx must report {construct} ({code:?}) exactly once: {src}\n{analysis:?}"
             );
-            assert!(
-                matched.len() == 1,
-                "{construct} must be reported exactly once, not once per nearby refusal: {analysis:?}"
-            );
+
+            match lowering {
+                Lowering::Refuses => {
+                    let errs = crate::ir::lower_route(src).unwrap_err();
+                    assert_eq!(errs[0].code, *code, "{src}: {errs:?}");
+                    assert!(
+                        errs[0].message.contains(construct),
+                        "lowering refuses {src} without naming {construct}: {:?}",
+                        errs[0].message
+                    );
+                }
+                Lowering::Accepts => assert!(
+                    crate::ir::lower_route(src).is_ok(),
+                    "documented as analysis-only, but lowering refused it: {src}"
+                ),
+            }
         }
 
         // The comparison above is on `(code, construct)`, and the code has to
         // discriminate: an implementation that reported everything as `RA014`
-        // would pass the list above if every fixture were `RA014`. This fixture is
-        // `RA007` — a whitespace ambiguity, not an unsupported construct — and it
-        // is in the same list `check_jsx` answers.
-        let whitespace = "export default function P() { return <p><b>a</b>\n<i>b</i></p> }\n";
+        // would pass if every fixture were `RA014`. The table's `RA007` row is
+        // that proof, and this asserts the code it carries is not `RA014`.
+        let whitespace =
+            "\"use island\"\nexport default function P() { return <p><b>a</b>\n<i>b</i></p> }\n";
         let alloc = oxc_allocator::Allocator::default();
         let program = parse_tsx(&alloc, whitespace).unwrap();
         assert!(
@@ -1338,6 +1403,30 @@ mod tests {
                 "lowering refused a construct check_jsx accepted: {src}"
             );
         }
+
+        // The route/non-route boundary, asserted in both directions: a `.tsx` file
+        // with no default export is a component module, this milestone emits
+        // nothing from it, and a module-level JSX helper there is accepted —
+        // while `lower_route` still refuses it for the unrelated reason that it
+        // has no route (the analyzer's `RA011`, not this round's refusal).
+        let module = "\"use island\"\nconst header = <h1>x</h1>\nexport function Header(props: Record<never, never>) { return header }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, module).unwrap();
+        assert_eq!(
+            crate::analyze::find_route_component(program),
+            None,
+            "the fixture must have no route, or the boundary is not what is pinned"
+        );
+        assert!(
+            check_jsx(program, module).is_empty(),
+            "a non-route module's module-level JSX must stay accepted: {:?}",
+            check_jsx(program, module)
+        );
+        assert_eq!(
+            crate::ir::lower_route(module).unwrap_err()[0].code,
+            Code::RA011,
+            "a non-route module must be refused by the analyzer's rule, not by RA014"
+        );
     }
 
     /// A nested renderer with JSX is refused: its `return`'s markup is not part of

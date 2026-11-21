@@ -58,12 +58,15 @@ fn why(code: Code) -> &'static str {
              primitives (their lowering comes with a later plan and is not component inlining), \
              a namespaced tag, a `<this>` tag, JSX inside a `{…}` expression, a JSX-valued \
              attribute, a spread attribute or child, a fragment as the returned root, a second \
-             JSX return, and JSX in any other route body statement. Each would either drop part \
-             of a node or copy JSX into a JavaScript module where it cannot parse; emitting \
-             without it is wrong in a way nothing reports. The plan's later milestones lift \
-             these one slice at a time. An attribute with an empty expression (`name={}`) is \
-             deliberately **not** on this list: that is a parse error, reported as `RA007`, not \
-             valid syntax waiting for a later milestone."
+             JSX return, JSX in any other route body statement, and JSX in a module-level \
+             statement of a route file. Each would either drop part of a node or copy JSX into a \
+             JavaScript module where it cannot parse; emitting without it is wrong in a way \
+             nothing reports. Module-level JSX is refused only in a file that has a route: a \
+             `.tsx` file with no default export is a component module, and a helper there may \
+             legitimately hold module-level JSX. The plan's later milestones lift these one \
+             slice at a time. An attribute with an empty expression (`name={}`) is deliberately \
+             **not** on this list: that is a parse error, reported as `RA007`, not valid syntax \
+             waiting for a later milestone."
         }
     }
 }
@@ -138,10 +141,16 @@ mod tests {
             "returned root",
             "second JSX return",
             "JSX in any other route body statement",
+            "module-level statement of a route file",
             "`<For>`/`<Show>`/`<When>`",
         ] {
             assert!(body.contains(construct), "missing {construct}: {body}");
         }
+        // The scope boundary, because it is what keeps a component module legal.
+        assert!(
+            body.contains("a `.tsx` file with no default export is a component module"),
+            "the skill must state where the module-level refusal stops: {body}"
+        );
         // The runtime primitives are not components: a skill that sent an agent to
         // component inlining for them would describe a mechanism that does not
         // apply to the tag it wrote.
