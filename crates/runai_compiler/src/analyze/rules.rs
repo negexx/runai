@@ -9,8 +9,7 @@
 //!   an `effect`. The effect re-runs when the signals it reads change and it reads
 //!   the signal it writes, so the write feeds its own run.
 //! - `RA009_IMPLICIT_EFFECT`: a write whose nearest function is a component body.
-//!   A component body runs once, so the write runs once as well: no reader is
-//!   updated by it, and every reader that rendered with the old value stays stale.
+//!   The component body runs once, so the write cannot re-run the component.
 //!
 //! # The two exemptions a naive ancestor check gets wrong
 //!
@@ -32,11 +31,17 @@
 //! # Known hole: a write inside `derived` or `resource` is not flagged
 //!
 //! [`Primitive::Effect`] is the only compute function `RA002` covers, because that is
-//! the only one the plan gives a code to. But `derived(fn)` and `resource(fn)` re-run
-//! when a signal read inside `fn` changes (§7.1), so a write there has exactly the
+//! the only one the plan gives a code to. But `derived(fn)` and `resource(fn)` are
+//! driven by the signals read inside `fn` (§7.1), so a write there has the same
 //! self-dependency shape `RA002` describes. It is **deliberately unpinned by a code**
-//! here: inventing one would claim a rule the plan does not have, and the runtime
-//! rejects it. `a_write_inside_a_derived_is_not_ra002` and
+//! here: inventing one would claim a rule the plan does not have.
+//!
+//! The runtime catches only the self-dependent case. `resource`'s compute runs inside
+//! an effect, so a write to a signal it reads throws `effect cycle`; a `derived` that
+//! does the same throws the same error once a live effect reads that derived. A write
+//! to a signal the compute never reads is accepted silently in both cases.
+//!
+//! `a_write_inside_a_derived_is_not_ra002` and
 //! `a_write_inside_a_resource_is_not_flagged` pin the hole so a future reader sees a
 //! decision rather than an oversight. Closing it is a plan change, not a code change.
 //!
@@ -147,8 +152,8 @@ fn render_write(call: &AccessorCall, component: &ComponentInfo<'_>) -> Diagnosti
         Code::RA009,
         call.span,
         format!(
-            "`{name}` is written while component `{component}` renders; the body runs once, so \
-             this write runs once and updates no reader that already rendered with the old value",
+            "`{name}` is written while component `{component}` renders; the component body runs \
+             once, so this write cannot re-run the component",
             name = call.name,
             component = component.display_name(),
         ),
@@ -464,6 +469,37 @@ mod tests {
         let writes =
             "export default function P() { const n = signal(0); return <p class={n(1)}>x</p> }\n";
         assert_eq!(codes(writes), vec!["RA009_IMPLICIT_EFFECT"]);
+    }
+
+    /// The RA009 message must not restate the false claim the skill and explain were
+    /// corrected for: the runtime flushes writes synchronously, so a live subscriber
+    /// *does* see the new value. The message may only say the component body runs once,
+    /// so the write cannot re-run the component.
+    #[test]
+    fn the_write_during_render_message_states_only_the_true_consequence() {
+        let src = "import { signal } from \"runai\"\nexport default function P() { const n = signal(0); n(1); return <p/> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        let diagnostics = check_signal_rules(program, &b);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let message = &diagnostics[0].message;
+        // `updates no reader` and `already rendered` are the exact false claim this
+        // message carried before: `flush` is synchronous, so a live effect or `_setText`
+        // node already subscribed to `n` *does* re-run with the new value.
+        for false_claim in [
+            "stale",
+            "re-trigger",
+            "re-run the render",
+            "updates no reader",
+            "already rendered",
+        ] {
+            assert!(
+                !message.to_ascii_lowercase().contains(false_claim),
+                "false claim `{false_claim}` in the message: {message}"
+            );
+        }
+        assert!(message.contains("runs once"), "{message}");
     }
 
     /// The message names the accessor and the component so the diagnostic is

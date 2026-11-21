@@ -182,7 +182,7 @@ pub fn find_signal_bindings<'a>(program: &'a Program<'a>) -> SignalBindings {
 
 /// An accessor binding found by [`AccessorCollector`].
 struct Accessor {
-    /// The `const`'s binding name, e.g. `count`.
+    /// The binding's name, e.g. `count`.
     name: String,
     /// The binding identifier's span, for a message that points at the declaration.
     span: (u32, u32),
@@ -639,10 +639,9 @@ mod tests {
         assert!(b.accessor_calls.is_empty(), "{b:?}");
     }
 
-    /// A primitive is a primitive *however it is called*: a second argument (which
-    /// `effect`, `resource`, and `signal` all accept in the design) must not hide the
-    /// call site from `primitive_calls`, which `RA010` will read as its source of
-    /// truth.
+    /// A primitive is a primitive *however it is called*: a second argument (one a later
+    /// milestone may add, or that an agent passes by mistake) must not hide the call site
+    /// from `primitive_calls`, which `RA010` will read as its source of truth.
     #[test]
     fn a_multi_argument_primitive_is_still_a_primitive_call() {
         let b = bindings(

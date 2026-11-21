@@ -42,9 +42,8 @@ fn why(code: Code) -> &'static str {
              rendered text disagree: JSX deletes whitespace-only text containing a newline."
         }
         Code::RA009 => {
-            "Rendering must not have side effects. A component body runs once, so a write during \
-             render runs once too: it cannot repaint or update any reader that already rendered \
-             with the old value, and every such reader stays stale."
+            "Rendering must not have side effects. The component body runs once, so this write \
+             cannot re-run the component."
         }
         Code::RA010 => {
             "Static routes ship zero bytes of JavaScript. There is no runtime on the page to run a \
@@ -150,28 +149,59 @@ mod tests {
 
     /// The RA009 repair must be *legal on its own*: `RA002` fires unconditionally for a
     /// write whose nearest function is an `effect` body, so a fix that says "move it into
-    /// an `effect`" lands the agent in `RA002` at the same span on the next run. The
-    /// explain must not name a re-render mechanism this design denies: a component body
-    /// runs once.
+    /// an `effect`" lands the agent in `RA002` at the same span on the next run.
+    ///
+    /// The text must also state only what the runtime does. It flushes writes
+    /// synchronously, so an already-live subscriber — an effect or a `_setText` node —
+    /// *does* see the new value (`effect(() => seen.push(n()))` then `n(1)` gives
+    /// `seen === [0, 1]`). The one unconditionally true consequence is that the component
+    /// body runs once, so the write cannot re-run the component. Every earlier wording
+    /// asserted a reader consequence the runtime denies, so the false-claim family is
+    /// banned here and in `render_write`'s message (pinned in `analyze::rules`).
     #[test]
-    fn ra009_offers_a_repair_that_is_not_ra002_and_no_denied_mechanism() {
+    fn ra009_offers_a_legal_repair_and_states_only_the_true_consequence() {
+        // The claims the runtime disproves, in every casing.
+        const FALSE_CLAIMS: [&str; 5] = [
+            "stale",
+            "re-trigger",
+            "re-run the render",
+            "updates no reader",
+            "already rendered",
+        ];
+        let assert_clean = |what: &str, text: &str| {
+            for false_claim in FALSE_CLAIMS {
+                assert!(
+                    !text.to_ascii_lowercase().contains(false_claim),
+                    "false claim `{false_claim}` in the {what}: {text}"
+                );
+            }
+        };
+
         let fix = Code::RA009.fix_template();
-        assert!(!fix.contains("effect("), "illegal repair: {fix}");
+        // Any casing of `effect` — `effect(`, `` `effect` ``, "an effect" — names a
+        // repair that is `RA002` at the same span, so a bare `effect(` check is not
+        // enough. `to_ascii_lowercase` also covers `Effect`.
+        assert!(
+            !fix.to_ascii_lowercase().contains("effect"),
+            "illegal repair, names `effect` in some casing: {fix}"
+        );
         assert!(fix.contains("Derive the value"), "{fix}");
         assert!(fix.contains("event handler"), "{fix}");
+        assert_clean("fix", fix);
 
         let explain = Code::RA009.explain();
+        assert_clean("explain", explain);
         assert!(
-            !explain.contains("re-trigger"),
-            "denied mechanism: {explain}"
-        );
-        assert!(
-            explain.contains("stays stale") || explain.contains("stay stale"),
-            "{explain}"
+            explain.contains("runs once") || explain.contains("cannot re-run the component"),
+            "the true half is missing: {explain}"
         );
 
         let why = skill_body(Code::RA009);
-        assert!(!why.contains("re-trigger"), "denied mechanism: {why}");
+        assert_clean("skill body", &why);
+        assert!(
+            why.contains("runs once") || why.contains("cannot re-run the component"),
+            "the true half is missing from the skill: {why}"
+        );
     }
 
     /// Task 15 ships this body to users, and the RA014 skill must say which

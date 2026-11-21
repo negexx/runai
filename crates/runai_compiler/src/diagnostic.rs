@@ -98,9 +98,8 @@ impl Code {
             }
             Code::RA009 => {
                 "A signal is written during render: in the component body or in a JSX expression \
-                 container. A component body runs once, so the write runs once too: it cannot \
-                 update a reader that already rendered with the old value, and every such reader \
-                 stays stale. Rendering must not have side effects."
+                 container. The component body runs once, so this write cannot re-run the \
+                 component. Rendering must not have side effects."
             }
             Code::RA010 => {
                 "A `\"use static\"` route uses a signal, a derived value, an effect, a resource, \
@@ -162,8 +161,8 @@ impl Code {
             // land the agent straight in `RA002` at the same span.
             Code::RA009 => {
                 "Derive the value instead of writing it, or move the write into the event handler \
-                 that causes the change. Rendering runs once, so a write during render updates no \
-                 reader that already rendered."
+                 that causes the change. The component body runs once, so this write cannot \
+                 re-run the component."
             }
             Code::RA010 => "Change line 1 to \"use island\" to ship JavaScript for this route.",
             Code::RA011 => {
