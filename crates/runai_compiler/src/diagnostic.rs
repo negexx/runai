@@ -69,9 +69,12 @@ impl Code {
     pub fn explain(&self) -> &'static str {
         match self {
             Code::RA001 => {
-                "A signal is read in the component body, outside any tracking scope. The read \
-                 runs once and never again: no effect owns it, so nothing re-runs when the \
-                 signal changes, and the value on screen is the value at first render."
+                "A signal is read directly in the component body, outside any tracking scope. The \
+                 read runs once and never again: no effect owns it, so nothing re-runs when the \
+                 signal changes, and the value on screen is the value at first render. A read \
+                 whose nearest enclosing function is *not* the component body — an event handler, \
+                 or any other nested callback such as `setTimeout(() => n())` — is not this rule: \
+                 it runs when that callback runs."
             }
             Code::RA002 => {
                 "A signal is written inside an `effect(...)` argument. An effect re-runs when \

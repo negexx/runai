@@ -10,9 +10,13 @@
 pub mod component;
 pub mod jsx;
 pub mod props;
+pub mod rules;
+pub mod signals;
 
 pub use component::{
     ComponentInfo, ComponentKind, find_components, find_route_component, validate_route_component,
 };
 pub use jsx::check_jsx;
 pub use props::check_props;
+pub use rules::check_signal_rules;
+pub use signals::{AccessorCall, SignalBindings, find_signal_bindings};

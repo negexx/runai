@@ -18,7 +18,13 @@ fn why(code: Code) -> &'static str {
     match code {
         Code::RA001 => {
             "A read there runs once and never again: no effect owns it, so nothing re-runs when \
-             the signal changes. The value on screen is the value at first render."
+             the signal changes. The value on screen is the value at first render. This is why \
+             `RA001` only fires when the read's *nearest enclosing function* is the component \
+             body itself: a read inside an event handler (`onClick={() => count()}`) or any other \
+             nested callback (`setTimeout(() => count(), 10)`) runs when that callback runs, so it \
+             sees the current value and nothing is frozen. Those reads are correct and are never \
+             flagged. A read inside `derived(...)`, `effect(...)`, `resource(...)`, or a JSX \
+             expression slot is likewise owned by that tracking scope, not by the render."
         }
         Code::RA002 => {
             "An effect re-runs when the signals it reads change. Writing a signal it reads makes \
