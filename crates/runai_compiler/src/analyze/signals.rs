@@ -197,6 +197,11 @@ struct Accessor {
 ///
 /// Any nesting: the walk reaches `const`s in functions and blocks alike, because an
 /// accessor created inside a component body is exactly the common case.
+///
+/// Any *declaration kind* too — `let`/`var` are collected although the plan writes
+/// `const`. This is deliberate, not an oversight: an accessor bound by `let` is the same
+/// reactive value at the same symbol, so skipping it would make `RA001`/`RA009` depend
+/// on a style detail the plan only expresses as convention.
 struct AccessorCollector<'s> {
     scoping: &'s Scoping,
     primitives: &'s [(SymbolId, Primitive)],
@@ -330,6 +335,27 @@ impl CallCollector<'_> {
 
     /// Record `call` if its callee is an accessor or a primitive.
     fn record(&mut self, symbol: SymbolId, call: &CallExpression<'_>) {
+        // A primitive is a primitive *however it is called*: `effect(fn, opts)` and
+        // `resource(fn, { … })` are still primitive call sites, and the arity gate
+        // below is about the *accessor* call shapes `RA001`/`RA009` define. Recording
+        // the primitive first keeps [`SignalBindings::primitive_calls`] complete, which
+        // is what `RA010` will read.
+        if let Some((_, primitive)) = self
+            .primitives
+            .iter()
+            .find(|(primitive, _)| *primitive == symbol)
+        {
+            self.primitive_calls.push((call.span.start, call.span.end));
+            // `effect` is the only scope `RA002` asks about: a write whose nearest
+            // function is this one makes the write a dependency of its own run.
+            if *primitive == Primitive::Effect
+                && let Some(scope) = argument_function_body(call)
+            {
+                self.effect_scopes.push(scope);
+            }
+            return;
+        }
+
         // A read is `x()`, a write is `x(v)`. Any other arity is not an accessor use
         // this milestone defines, and guessing at it would report a call shape the
         // design does not have.
@@ -347,23 +373,6 @@ impl CallCollector<'_> {
                 nearest_function: self.nearest_function(),
                 in_jsx_container: self.in_jsx_container(),
             });
-            return;
-        }
-
-        let Some((_, primitive)) = self
-            .primitives
-            .iter()
-            .find(|(primitive, _)| *primitive == symbol)
-        else {
-            return;
-        };
-        self.primitive_calls.push((call.span.start, call.span.end));
-        // `effect` is the only scope `RA002` asks about: a write whose nearest
-        // function is this one makes the write a dependency of its own run.
-        if *primitive == Primitive::Effect
-            && let Some(scope) = argument_function_body(call)
-        {
-            self.effect_scopes.push(scope);
         }
     }
 }
@@ -628,6 +637,49 @@ mod tests {
             "import { signal } from \"runai\"\nfunction P() { const n = signal(0); n(1, 2); return <p/> }\n",
         );
         assert!(b.accessor_calls.is_empty(), "{b:?}");
+    }
+
+    /// A primitive is a primitive *however it is called*: a second argument (which
+    /// `effect`, `resource`, and `signal` all accept in the design) must not hide the
+    /// call site from `primitive_calls`, which `RA010` will read as its source of
+    /// truth.
+    #[test]
+    fn a_multi_argument_primitive_is_still_a_primitive_call() {
+        let b = bindings(
+            "import { signal, effect, resource } from \"runai\"\n\
+             function P() { const n = signal(0, { equals: true }); effect(() => {}, { once: true }); resource(() => 1, { retries: 2 }); return <p/> }\n",
+        );
+        assert_eq!(b.primitive_calls.len(), 3, "{b:?}");
+        assert_eq!(b.effect_scopes.len(), 1, "{b:?}");
+    }
+
+    /// [`SignalBindings::accessor_symbols`] is index-aligned with
+    /// [`SignalBindings::accessors`]: entry `i` is *the* symbol of name `i`. The rules
+    /// rely on this pairing (they record a call's symbol, then look the name up), and
+    /// length alone does not prove it.
+    #[test]
+    fn accessor_symbols_are_the_symbols_of_the_accessors() {
+        let src = "import { signal, derived } from \"runai\"\n\
+                   const a = signal(0)\n\
+                   function P() { const b = signal(1); const c = derived(() => a() + b()); return <p/> }\n";
+        let b = bindings(src);
+        assert_eq!(b.accessors.len(), 3, "{b:?}");
+        assert_eq!(b.accessor_symbols.len(), b.accessors.len(), "{b:?}");
+
+        // Resolve each recorded symbol back to its declared name with a second semantic
+        // build: the names and the symbols have to agree position by position, not just
+        // in count.
+        let alloc = Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let semantic = oxc_semantic::SemanticBuilder::new().build(program).semantic;
+        let scoping = semantic.scoping();
+        for (index, (name, _)) in b.accessors.iter().enumerate() {
+            assert_eq!(
+                scoping.symbol_name(b.accessor_symbols[index]),
+                name,
+                "index {index} is misaligned"
+            );
+        }
     }
 
     /// The nearest function recorded for a call inside a component body is that

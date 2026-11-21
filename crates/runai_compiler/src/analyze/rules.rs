@@ -9,8 +9,8 @@
 //!   an `effect`. The effect re-runs when the signals it reads change and it reads
 //!   the signal it writes, so the write feeds its own run.
 //! - `RA009_IMPLICIT_EFFECT`: a write whose nearest function is a component body.
-//!   Rendering must not have side effects: the write either runs once and leaves
-//!   readers stale, or re-triggers the render that performed it.
+//!   A component body runs once, so the write runs once as well: no reader is
+//!   updated by it, and every reader that rendered with the old value stays stale.
 //!
 //! # The two exemptions a naive ancestor check gets wrong
 //!
@@ -28,6 +28,19 @@
 //! The one callback that *is* a tracking scope is the function handed to a primitive:
 //! `derived(fn)`, `effect(fn)`, and `resource(fn)` run it under tracking, so a read
 //! there is owned and is never `RA001`.
+//!
+//! # Known hole: a write inside `derived` or `resource` is not flagged
+//!
+//! [`Primitive::Effect`] is the only compute function `RA002` covers, because that is
+//! the only one the plan gives a code to. But `derived(fn)` and `resource(fn)` re-run
+//! when a signal read inside `fn` changes (§7.1), so a write there has exactly the
+//! self-dependency shape `RA002` describes. It is **deliberately unpinned by a code**
+//! here: inventing one would claim a rule the plan does not have, and the runtime
+//! rejects it. `a_write_inside_a_derived_is_not_ra002` and
+//! `a_write_inside_a_resource_is_not_flagged` pin the hole so a future reader sees a
+//! decision rather than an oversight. Closing it is a plan change, not a code change.
+//!
+//! [`Primitive::Effect`]: crate::analyze::signals::Primitive::Effect
 //!
 //! # Identity comes from [`SignalBindings`]
 //!
@@ -134,8 +147,8 @@ fn render_write(call: &AccessorCall, component: &ComponentInfo<'_>) -> Diagnosti
         Code::RA009,
         call.span,
         format!(
-            "`{name}` is written while component `{component}` renders; rendering must not have \
-             side effects, so a write here either runs once or re-triggers the render that did it",
+            "`{name}` is written while component `{component}` renders; the body runs once, so \
+             this write runs once and updates no reader that already rendered with the old value",
             name = call.name,
             component = component.display_name(),
         ),
@@ -263,6 +276,46 @@ mod tests {
     fn a_read_inside_a_derived_is_owned_by_it() {
         let src = "export default function P() { const n = signal(0); const d = derived(() => n() * 2); return <p>{d()}</p> }\n";
         assert!(codes(src).is_empty(), "{:?}", codes(src));
+    }
+
+    /// A write in an effect written as a `function` expression rather than an arrow is
+    /// still `RA002`. This is the half of `function_body`'s `FunctionExpression` arm the
+    /// suite did not exercise: if its span computation ever disagreed with the function
+    /// visitor's, `RA002` would silently stop firing while every other test stayed green.
+    #[test]
+    fn a_write_in_a_function_expression_effect_is_ra002() {
+        let src = "export default function P() { const n = signal(0); effect(function () { n(1) }); return <p/> }\n";
+        assert_eq!(codes(src), vec!["RA002_EFFECT_WRITE"]);
+    }
+
+    /// The effect is resolved by symbol, so an aliased import is still the `RA002`
+    /// scope. Otherwise `effect_scopes` would only be proven for the unaliased name.
+    #[test]
+    fn an_aliased_effect_is_still_an_effect_scope() {
+        let src = "import { signal, effect as eff } from \"runai\"\nexport default function P() { const n = signal(0); eff(() => { n(1) }); return <p/> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        let found: Vec<_> = check_signal_rules(program, &b)
+            .iter()
+            .map(|d| d.code.as_str().to_string())
+            .collect();
+        assert_eq!(found, vec!["RA002_EFFECT_WRITE"]);
+    }
+
+    /// The mirror of `a_write_inside_a_derived_is_not_ra002`: a `resource` compute
+    /// function re-runs when a signal it reads changes, so a write there has the same
+    /// self-dependency shape — and is likewise not flagged. Pinned so the hole reads as
+    /// a decision, not an oversight. See the module docs.
+    #[test]
+    fn a_write_inside_a_resource_is_not_flagged() {
+        let src = "import { signal, resource } from \"runai\"\n\
+                   export default function P() { const n = signal(0); const r = resource(() => { n(1); return 1 }); return <p/> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        let diagnostics = check_signal_rules(program, &b);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     /// A write in a JSX slot is still a write during render: the slot runs while the
@@ -428,8 +481,9 @@ mod tests {
         assert!(message.contains("`Counter`"), "{message}");
     }
 
-    /// The span is the callee identifier, so the agent edits the read and not the
-    /// declaration.
+    /// The span is the whole call, `n()` and not just the callee `n`, so the agent's
+    /// editor selects the read and the message points at it; the declaration is
+    /// elsewhere and unchanged.
     #[test]
     fn the_span_points_at_the_read() {
         let src = "import { signal } from \"runai\"\n\

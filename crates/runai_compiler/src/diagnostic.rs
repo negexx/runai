@@ -98,8 +98,9 @@ impl Code {
             }
             Code::RA009 => {
                 "A signal is written during render: in the component body or in a JSX expression \
-                 container. Rendering must not have side effects — the write either runs once \
-                 and leaves readers stale, or re-triggers the render that performed it."
+                 container. A component body runs once, so the write runs once too: it cannot \
+                 update a reader that already rendered with the old value, and every such reader \
+                 stays stale. Rendering must not have side effects."
             }
             Code::RA010 => {
                 "A `\"use static\"` route uses a signal, a derived value, an effect, a resource, \
@@ -156,9 +157,13 @@ impl Code {
                  names a line break between inline elements instead, the repair is the one it \
                  carries. Put both on one line, or write {\" \"} where you want the space."
             }
+            // Deliberately *not* "move it into an effect": `RA002` fires for every write whose
+            // nearest function is the function passed to `effect(...)`, so that repair would
+            // land the agent straight in `RA002` at the same span.
             Code::RA009 => {
-                "Move the write into an `effect(...)` or the event handler that causes the change, \
-                 so it runs in response to something rather than while markup is produced."
+                "Derive the value instead of writing it, or move the write into the event handler \
+                 that causes the change. Rendering runs once, so a write during render updates no \
+                 reader that already rendered."
             }
             Code::RA010 => "Change line 1 to \"use island\" to ship JavaScript for this route.",
             Code::RA011 => {

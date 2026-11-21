@@ -42,8 +42,9 @@ fn why(code: Code) -> &'static str {
              rendered text disagree: JSX deletes whitespace-only text containing a newline."
         }
         Code::RA009 => {
-            "Rendering must not have side effects. A write during render either runs once and \
-             leaves readers stale, or re-triggers the render that performed it."
+            "Rendering must not have side effects. A component body runs once, so a write during \
+             render runs once too: it cannot repaint or update any reader that already rendered \
+             with the old value, and every such reader stays stale."
         }
         Code::RA010 => {
             "Static routes ship zero bytes of JavaScript. There is no runtime on the page to run a \
@@ -126,6 +127,51 @@ mod tests {
                 code.as_str()
             );
         }
+    }
+
+    /// Task 15 ships this body to users, and the RA001 skill must document the
+    /// exemption that makes the rule livable: a read inside an event handler or any
+    /// other nested callback runs at call time, sees the current value, and is never
+    /// flagged. That is a stated deliverable of the task, so a reword cannot silently
+    /// drop it.
+    #[test]
+    fn ra001_documents_the_handler_and_nested_callback_exemption() {
+        let body = skill_body(Code::RA001);
+        for phrase in [
+            "`onClick={() => count()}`",
+            "`setTimeout(() => count(), 10)`",
+            "nested callback",
+            "sees the current value",
+            "never flagged",
+        ] {
+            assert!(body.contains(phrase), "missing {phrase}: {body}");
+        }
+    }
+
+    /// The RA009 repair must be *legal on its own*: `RA002` fires unconditionally for a
+    /// write whose nearest function is an `effect` body, so a fix that says "move it into
+    /// an `effect`" lands the agent in `RA002` at the same span on the next run. The
+    /// explain must not name a re-render mechanism this design denies: a component body
+    /// runs once.
+    #[test]
+    fn ra009_offers_a_repair_that_is_not_ra002_and_no_denied_mechanism() {
+        let fix = Code::RA009.fix_template();
+        assert!(!fix.contains("effect("), "illegal repair: {fix}");
+        assert!(fix.contains("Derive the value"), "{fix}");
+        assert!(fix.contains("event handler"), "{fix}");
+
+        let explain = Code::RA009.explain();
+        assert!(
+            !explain.contains("re-trigger"),
+            "denied mechanism: {explain}"
+        );
+        assert!(
+            explain.contains("stays stale") || explain.contains("stay stale"),
+            "{explain}"
+        );
+
+        let why = skill_body(Code::RA009);
+        assert!(!why.contains("re-trigger"), "denied mechanism: {why}");
     }
 
     /// Task 15 ships this body to users, and the RA014 skill must say which
