@@ -1222,6 +1222,8 @@ test("a For nested in a hidden Show stays live and renders what changed while hi
   visible(true)
   expect(root.textContent).toBe("")
   const runsAfterRemoval = rowRuns
+  // Pin the tally: with zero runs the leak assertion above would pass vacuously.
+  expect(runsAfterRemoval).toBe(2)
   tick(1)
   expect(rowRuns).toBe(runsAfterRemoval)
   // Removal while shown still works after that round trip.
@@ -1257,6 +1259,65 @@ test("For warns in dev about a duplicate key and still renders the first item", 
   // must not send it looking for a check this milestone does not ship.
   expect(warnings[0]).toContain("key 1")
   expect(warnings[0]).toContain("RA003, not yet implemented")
+})
+
+test("a duplicate key that cannot be stringified still warns and renders", () => {
+  // `by` is typed string | number but not checked at runtime. An object with a
+  // throwing `toString` would make `String(key)` throw inside the effect body;
+  // `flush` collects that and rethrows after the wave, leaving the list
+  // half-applied, so a duplicate key would abort the render. The warning must
+  // format defensively instead.
+  const bad = {
+    toString() {
+      throw new TypeError("no primitive")
+    },
+  }
+  const items = signal([
+    { id: bad, label: "first" },
+    { id: bad, label: "second" },
+  ])
+  const warn = console.warn
+  const warnings = []
+  console.warn = (m) => warnings.push(m)
+  const ul = document.createElement("ul")
+  try {
+    ul.appendChild(
+      For({
+        each: () => items(),
+        by: (i) => i.id,
+        children: (item) => document.createTextNode(item().label),
+      }),
+    )
+  } finally {
+    console.warn = warn
+  }
+  // No throw escaped: the first row is rendered and the duplicate is reported
+  // with the safe fallback (`typeof key`) rather than the unformattable key.
+  expect(ul.textContent).toBe("first")
+  expect(warnings.length).toBe(1)
+  expect(warnings[0]).toContain("duplicate key")
+  expect(warnings[0]).toContain("key object")
+  // The same guard covers the other documented shape: a null-prototype object,
+  // where `String()` throws "Cannot convert object to primitive value".
+  const bare = Object.create(null)
+  const bareItems = signal([{ id: bare, label: "a" }, { id: bare, label: "b" }])
+  const second = document.createElement("ul")
+  const secondWarnings = []
+  console.warn = (m) => secondWarnings.push(m)
+  try {
+    second.appendChild(
+      For({
+        each: () => bareItems(),
+        by: (i) => i.id,
+        children: (item) => document.createTextNode(item().label),
+      }),
+    )
+  } finally {
+    console.warn = warn
+  }
+  expect(second.textContent).toBe("a")
+  expect(secondWarnings.length).toBe(1)
+  expect(secondWarnings[0]).toContain("key object")
 })
 
 test("a Show nested in a Show inserts the live group after being re-shown", () => {

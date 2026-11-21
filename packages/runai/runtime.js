@@ -444,8 +444,21 @@ export function For(props) {
       // sees: naming a diagnostic that does not exist sends it looking for one.
       if (live.has(key)) {
         if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+          // A warning must never become a render abort: `key` is only *typed*
+          // string | number, and `String()` throws for an object with a throwing
+          // toString/Symbol.toPrimitive or a null-prototype object. Formatting
+          // defensively keeps the throw out of the effect body, where `flush`
+          // would collect it and leave `order`/`rows` half-applied.
+          // `String(key)` is deliberate rather than a `${key}` template literal:
+          // `String` accepts a Symbol, a template literal throws on one.
+          let shown
+          try {
+            shown = String(key)
+          } catch {
+            shown = typeof key
+          }
           console.warn(
-            `RUNAI_DEV duplicate key in For ignored: the row with key ${String(key)} is not rendered. Give each item a stable, unique key (RA003, not yet implemented).`,
+            `RUNAI_DEV duplicate key in For ignored: the row with key ${shown} is not rendered. Give each item a stable, unique key (RA003, not yet implemented).`,
           )
         }
         continue
