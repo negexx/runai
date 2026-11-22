@@ -498,6 +498,17 @@ pub(crate) struct RouteRender<'a> {
     /// The span of the `return` statement the root came from, for slicing the
     /// statements before it. `None` for a concise body.
     pub return_span: Option<Span>,
+    /// The route component's own parameter list — the fourth region the
+    /// emitters handle, and the only one they **do not copy**.
+    ///
+    /// Carried from the same walk that finds the root, because a caller asking
+    /// "what does the generated component declare?" needs the signature from the
+    /// node [`route_render`] already resolved. `RouteIr` carries the component's
+    /// name, statements, and markup but not its parameter text, so the emitted
+    /// signature is written by the emitter rather than sliced from the file —
+    /// which is why [`crate::analyze::reachable`] checks this region's *shape*
+    /// and not just its references.
+    pub params: &'a oxc_ast::ast::FormalParameters<'a>,
 }
 
 /// The JSX the default export returns, or `None` when there is no such export.
@@ -643,6 +654,7 @@ fn render_of_function<'a>(function: &'a Function<'a>) -> Option<RouteRender<'a>>
         root,
         body: Some(body),
         return_span: Some(returned),
+        params: &function.params,
     })
 }
 
@@ -657,6 +669,7 @@ fn render_of_arrow<'a>(
                 root,
                 body: Some(body),
                 return_span: Some(returned),
+                params: &arrow.params,
             })
         }
         concise => {
@@ -666,6 +679,7 @@ fn render_of_arrow<'a>(
                 root,
                 body: None,
                 return_span: None,
+                params: &arrow.params,
             })
         }
     }

@@ -1128,7 +1128,7 @@ git commit -m "feat(compiler): enforce static-route purity with RA010 and add an
 **Interfaces:**
 - Consumes: `RouteIr`, `IrNode`.
 - Produces:
-  - `pub fn emit_prerender(route: &RouteIr) -> String`. A self-contained ESM module exporting `render(): string`, with **no imports at all**. It defines an inline `_esc` HTML-escaping helper, runs the route's `statements`, and returns a template literal.
+  - `pub(crate) fn emit_prerender(route: &RouteIr) -> String`. A self-contained ESM module exporting `render(): string`, with **no imports at all**. It defines an inline `_esc` HTML-escaping helper, runs the route's `statements`, and returns a template literal. `pub(crate)` because only `emit_prerender_checked` is public: a caller cannot lower without gating on `analyze`.
   - `pub fn template_literal_body(node: &IrNode) -> String`. The HTML as the body of a JS template literal. Literal parts are escaped for template literals (`` ` ``, `\`, and `${`), and each `Expr` becomes `${_esc(<expr>)}`.
   - `pub fn emit_prerender_checked(source: &str, path: &str) -> Result<String, Vec<Diagnostic>>`, in `codegen/mod.rs`. It calls `analyze`, refuses on any error, then lowers and emits.
 
@@ -1244,7 +1244,7 @@ git commit -m "feat(compiler): emit self-contained prerender modules with no imp
 **Interfaces:**
 - Consumes: `RouteIr`, `IrNode`, `Binding`.
 - Produces:
-  - `pub fn emit_client(route: &RouteIr, runtime_url: &str) -> String`. An ESM module with exactly **one** import, from `runtime_url`. That import merges the route's own `"runai"` specifiers with the internal helpers it uses. The module ends by mounting the page into `#app`.
+  - `pub(crate) fn emit_client(route: &RouteIr, runtime_url: &str) -> String`. An ESM module with exactly **one** import, from `runtime_url`. That import merges the route's own `"runai"` specifiers with the internal helpers it uses. The module ends by mounting the page into `#app`. `pub(crate)` for the same reason as `emit_prerender`: only the `*_checked` form is public.
   - `pub fn template_html(node: &IrNode) -> String`. The markup, with each `Expr` child replaced by a `<!>` placeholder comment.
 
 **Emitted shape** (pinned, so the runtime API and the emitter cannot drift):
@@ -1362,7 +1362,9 @@ fn refuses_to_emit_when_analysis_reports_errors() {
 }
 ```
 
-This requires a second entry point in `codegen/mod.rs`: `pub fn emit_client_checked(source: &str, path: &str, runtime_url: &str) -> Result<String, Vec<Diagnostic>>`. It calls `analyze` and returns `Err` before lowering. Task 13's builder calls this one and `emit_prerender_checked`. `emit_client` stays as the pure IR emitter used by its own unit tests.
+This requires a second entry point in `codegen/mod.rs`: `pub fn emit_client_checked(source: &str, path: &str, runtime_url: &str) -> Result<String, Vec<Diagnostic>>`. It calls `analyze` and returns `Err` before lowering. Task 13's builder calls this one and `emit_prerender_checked`.
+
+Only the `*_checked` forms are public. `emit_client` and `emit_prerender` are `pub(crate)`, existing only for their own unit tests, so a caller inside this crate and outside the codegen module cannot lower without gating on `analyze`: the unchecked path is unreachable at compile time from outside, not merely discouraged by convention.
 
 - [ ] **Step 4: Run and verify pass**
 

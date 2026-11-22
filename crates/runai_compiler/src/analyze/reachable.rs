@@ -31,9 +31,14 @@
 //!    because the page genuinely needs a runtime. A reference that *is* a
 //!    primitive call is left to `RA010`, so one expression never gets two
 //!    diagnostics.
-//! 2. **the route's own parameter in a `"use static"` route.** `render()` takes
-//!    no arguments, so `{props}` would be `undefined` at build time. The repair
-//!    is not "move it": there is no props value to move.
+//! 2. **the route's own parameter, wherever the emitted module cannot declare
+//!    it.** In the markup or a component-body statement of a `"use static"`
+//!    route, `render()` takes no arguments, so the value is `undefined` at build
+//!    time. At **module scope it is refused in both modes**, because no emitter
+//!    declares the parameter there at all — the emitted component declares it and
+//!    the module does not — so `const x = props` is a `ReferenceError`. The repair
+//!    is a literal value, not "move it": a body statement is already in the body,
+//!    and a module statement has no `props` to move in the first place.
 //! 3. **the route component's own name in a `"use static"` route.** The
 //!    prerender module contains `render()` and nothing else — the component is
 //!    not declared there — so `const x = Page` or `{Page}` is a `ReferenceError`
@@ -48,12 +53,25 @@
 //!
 //! An island module imports its `"runai"` names and declares `function
 //! <Name>(props)`, so all of those are reachable there — that is the
-//! mode-dependent half of this rule.
+//! mode-dependent half of this rule. The module scope is the exception: no
+//! island declares `props` above the component either, so a parameter name there
+//! is refused in both modes.
 //!
 //! Everything else at module scope is emitted by [`RouteIr::module_statements`]
 //! and is therefore reachable, which is the round-3 ruling this module follows.
 //!
 //! [`RouteIr::module_statements`]: crate::ir::RouteIr::module_statements
+//!
+//! # The fourth region: the parameter list
+//!
+//! The parameter list is a region the emitters **rebuild** rather than copy:
+//! both write the component as `function <Name>(props)`. A default, a destructured
+//! pattern, a rest parameter, or a different name is therefore dropped, and
+//! everything it binds does not exist in the artifact. That is a **shape** rule,
+//! not a reachability one, so it fires in both modes: `props: P = owner` in an
+//! island is a real name (the island's import writes it) but a dropped default,
+//! so a reachability walk would be silent while the emitted component differs
+//! from the source. [`emitted_parameter_list`] owns it.
 //!
 //! # The third region: the component body
 //!
@@ -151,7 +169,21 @@ pub fn check_reachable_expressions(
         route: &route,
         runai: &runai,
         bindings,
+        // The names the route's own parameter list binds, so a reference to one
+        // of them is refused wherever it appears — including at module scope,
+        // where the semantic pass cannot resolve it to the parameter (a module
+        // statement is outside the component's scope in JavaScript).
+        parameter_bindings: parameter_bindings(render.params),
     };
+
+    // (0) The parameter list is a fourth region, and the only one the emitters
+    // **rebuild** rather than copy: both write `function <Name>(props)`. A
+    // default, a destructuring pattern, a rest parameter, or a different name is
+    // therefore dropped, and so is everything it binds. This is a shape rule
+    // rather than a reachability one — see `emitted_parameter_list`.
+    if let Some(diagnostic) = emitted_parameter_list(render.params) {
+        diagnostics.push(diagnostic);
+    }
 
     // (1) The returned markup. Anything declared inside the component body, or
     // inside an arrow parameter in the markup, is copied into the emitted
@@ -242,6 +274,17 @@ struct EmittedScope<'s, 'a> {
     route: &'s ComponentInfo<'a>,
     runai: &'s [RunaiImport],
     bindings: &'s SignalBindings,
+    /// Every `(name, declaration span)` the route's parameter list binds.
+    ///
+    /// Needed because the semantic pass does **not** resolve a module-level
+    /// reference to the component's parameter: JavaScript scoping makes those
+    /// different regions, and `oxc_semantic` is right to say so. The rule is not
+    /// JavaScript's scoping rule, though: the parameter is not in scope at module
+    /// level *because the emitted module never has it*, so the reference is a
+    /// `ReferenceError` and is refused. Matching on the name is what lets one
+    /// judge answer for all three regions, because an unresolved reference has no
+    /// symbol to compare.
+    parameter_bindings: Vec<String>,
 }
 
 impl EmittedScope<'_, '_> {
@@ -277,8 +320,19 @@ impl EmittedScope<'_, '_> {
         inside_emitted_function: impl Fn((u32, u32)) -> bool,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
-        // Unresolved: a language built-in, which every module has.
+        // Unresolved: a language built-in, which every module has — unless the
+        // name is one the route's own parameter list binds. That case is why this
+        // arm cannot simply return: a module-level `const x = props` resolves to
+        // nothing at all (JavaScript scoping), but the emitted module has no
+        // `props` either, so the statement is a `ReferenceError` at load.
         let Some(symbol) = reference.symbol else {
+            if self.names_a_parameter(&reference.name) {
+                diagnostics.push(route_parameter(
+                    reference.span,
+                    &reference.name,
+                    ParameterSite::ModuleScope,
+                ));
+            }
             return;
         };
         let declaration = declaration_of(self.scoping, symbol);
@@ -320,7 +374,11 @@ impl EmittedScope<'_, '_> {
             return;
         }
         if contains(self.route.params_span, declaration) {
-            diagnostics.push(route_parameter(reference.span, &reference.name));
+            diagnostics.push(route_parameter(
+                reference.span,
+                &reference.name,
+                ParameterSite::Component,
+            ));
             return;
         }
         if self.route.name_span == declaration {
@@ -334,9 +392,22 @@ impl EmittedScope<'_, '_> {
         // Everything else — a module-level value, a class, an enum, a function —
         // is emitted by `RouteIr::module_statements`, so it is reachable.
     }
+
+    /// Whether `name` is one the route's own parameter list binds.
+    ///
+    /// Only used for a reference the semantic pass could **not** resolve: a name
+    /// that resolves to a binding is judged by symbol, and a module-level name
+    /// that shadows a parameter (`const props = …`) resolves to its own binding
+    /// and is therefore never refused. That is the control in
+    /// `a_parameter_name_at_module_scope_is_refused_in_both_modes`: matching by
+    /// name alone would refuse the file's own `props`.
+    fn names_a_parameter(&self, name: &str) -> bool {
+        self.parameter_bindings.iter().any(|bound| bound == name)
+    }
 }
 
-/// One identifier reference in the returned markup or a module-level statement.
+/// One identifier reference in the returned markup, a component-body statement,
+/// or a module-level statement.
 struct Reference {
     name: String,
     span: (u32, u32),
@@ -345,8 +416,8 @@ struct Reference {
 }
 
 /// Collects every **value** identifier reference under whatever node the caller
-/// visits: the returned root for the markup walk, or one module-level statement
-/// for the module-level walk.
+/// visits: the returned root for the markup walk, one body statement for the body
+/// walk, or one module-level statement for the module-level walk.
 ///
 /// # Type positions are not references
 ///
@@ -424,8 +495,152 @@ fn is_primitive_callee(span: (u32, u32), bindings: &SignalBindings) -> bool {
         .any(|&(start, end)| span.0 == start && span.1 <= end)
 }
 
-/// `RA014`: a static page names a `"runai"` import, in its markup or at module
-/// scope.
+/// The names the route's parameter list binds, in source order.
+///
+/// A destructured parameter (`{ id }`, `[a, b]`) binds several names, and a
+/// pattern's default (`{ a = 1 }`) binds only its left side. `props` and a rest
+/// parameter's binding (`...props`) are the same question with a different shape,
+/// so all four go through [`BindingPattern::get_binding_identifiers`] rather than
+/// being special-cased here.
+fn parameter_bindings(params: &oxc_ast::ast::FormalParameters<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    for parameter in &params.items {
+        for identifier in parameter.pattern.get_binding_identifiers() {
+            names.push(identifier.name.as_str().to_string());
+        }
+    }
+    if let Some(rest) = &params.rest {
+        for identifier in rest.rest.argument.get_binding_identifiers() {
+            names.push(identifier.name.as_str().to_string());
+        }
+    }
+    names
+}
+
+/// `RA014` for a route signature both emitters would **drop**, or `None` when
+/// they can rebuild it.
+///
+/// The emitters do not copy the source's parameter list. Both write the
+/// component from [`RouteIr::name`] and [`RouteIr::statements`], so the emitted
+/// signature is always `function <Name>(props)` — one identifier, named `props`.
+/// Anything else in the source is therefore not emitted:
+///
+/// | Written | Emitted | Why it is refused |
+/// |---|---|---|
+/// | `props: P` | `props` | identical at runtime, so legal |
+/// | `ctx: P` | `props` | the body reads `ctx`, which the artifact does not have |
+/// | `{ id }: P` | `props` | the destructuring is gone, so `id` has no binding |
+/// | `...props: P[]` | `props` | the rest collection is gone |
+/// | `props: P = <expr>` | `props` | the default is gone, and `<expr>` is never evaluated |
+///
+/// **This is a shape rule, not a reachability rule**, and that is why it fires in
+/// both modes. The case that proved it — R2 — was `props: P = owner` in an
+/// *island*: `owner` is a real name there (the island emitter's own import
+/// writes it), so a reachability walk would say the reference is fine. It is the
+/// *parameter* that disappears, so the defect is the dropped signature rather
+/// than the reference, and no mode makes a default evaluable: nothing calls the
+/// emitted component with arguments.
+///
+/// **Zero parameters and two or more are not this rule's.** `RA006` asks the
+/// first one for a parameter and `RA011` refuses the second as a route shape, so
+/// the same file would get two rows for one problem. Only the exactly-one
+/// parameter case — where `RA006` and `RA011` are both satisfied and the emitter
+/// still rewrites the signature — reaches the checks below.
+fn emitted_parameter_list(params: &oxc_ast::ast::FormalParameters<'_>) -> Option<Diagnostic> {
+    // `RA006` demands a type annotation on the single parameter, and its repair
+    // replaces the whole parameter list — which removes a default, a
+    // destructuring pattern, and a rename in the same edit. So an unannotated
+    // parameter is that rule's row, and refusing its shape here would put two
+    // codes on one fix.
+    let annotated = params
+        .items
+        .iter()
+        .any(|parameter| parameter.type_annotation.is_some())
+        || params
+            .rest
+            .as_ref()
+            .is_some_and(|rest| rest.type_annotation.is_some());
+    if !annotated {
+        return None;
+    }
+
+    let only = match (params.items.as_slice(), &params.rest) {
+        // Exactly one parameter and no rest: the only shape the emitter rewrites
+        // without `RA006` or `RA011` already owning the file.
+        ([only], None) => only,
+        // A rest parameter with no items is one parameter by `RA006`'s count and
+        // `RA011`'s, so it is this rule's: the rest collection is dropped.
+        ([], Some(_)) => {
+            return Some(signature_refusal(
+                params,
+                "a rest parameter is dropped, because the emitted component takes one `props` value",
+            ));
+        }
+        // Zero parameters (`RA006`) and two or more (`RA011`) are already
+        // reported; a second row would describe one problem twice.
+        _ => return None,
+    };
+
+    // A destructuring pattern binds names the emitted `props` parameter does not
+    // declare, whatever those names are. Checked before the name test because
+    // `{ props }` would otherwise look like the plain identifier.
+    if matches!(
+        only.pattern,
+        oxc_ast::ast::BindingPattern::ObjectPattern(_)
+            | oxc_ast::ast::BindingPattern::ArrayPattern(_)
+    ) {
+        return Some(signature_refusal(
+            params,
+            "a destructuring pattern is dropped, and the names it binds are not declared in the \
+             emitted component",
+        ));
+    }
+
+    match only.pattern.get_identifier_name() {
+        Some(name) if name == "props" => {}
+        Some(_) => {
+            return Some(signature_refusal(
+                params,
+                "the emitted component names its parameter `props`, so a differently named \
+                 parameter is not declared in it",
+            ));
+        }
+        None => return None,
+    }
+
+    if only.initializer.is_some() {
+        return Some(signature_refusal(
+            params,
+            "the default value is dropped, because nothing calls the emitted component with \
+             arguments",
+        ));
+    }
+    None
+}
+
+/// `RA014` for a route signature the emitters cannot rebuild, pointing at the
+/// parameter list and naming the signature to write.
+///
+/// The repair is a literal signature rather than "move it into the body", because
+/// the parameter *is* the thing to rewrite: applying this text verbatim produces
+/// the one shape both emitters write.
+///
+/// `reason` is a complete clause, so the message composes without a conjunction
+/// that would double when the clause already carries one.
+fn signature_refusal(params: &oxc_ast::ast::FormalParameters<'_>, reason: &str) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        (params.span.start, params.span.end),
+        format!(
+            "this route signature is not emitted: the generated component is always written as \
+             `function <Name>(props)`, so {reason}. Write the parameter as `(props: <Type>)` and \
+             read the fields from `props` in the body."
+        ),
+    )
+}
+
+/// `RA014`: a static page names a `"runai"` import, in its markup, in a body
+/// statement, or at module scope.
 ///
 /// The prerender module contains no imports, so the repair cannot be "move it":
 /// taking the value into the body does not import it. The page needs the
@@ -442,23 +657,57 @@ fn runtime_import(span: (u32, u32), name: &str) -> Diagnostic {
     )
 }
 
-/// `RA014`: a static page's markup names the route's own parameter.
+/// `RA014`: a page names the route's own parameter where the emitted module has
+/// no such binding.
 ///
-/// The repair is not "move it into the body": a route is given no props, so
-/// there is no value to move. Whatever the markup needs has to be written there.
-fn route_parameter(span: (u32, u32), name: &str) -> Diagnostic {
-    Diagnostic::new(
-        Code::RA014,
-        span,
-        format!(
+/// Two regions, two reasons, one repair. In the markup or a body statement the
+/// emitted component's own parameter is the one that applies: a static route's
+/// `render()` takes no arguments, so the value is `undefined`; an island declares
+/// `function <Name>(props)`, so the same reference is legal there. At module scope
+/// no emitter declares the parameter in **either** mode, so the statement is a
+/// `ReferenceError` at load.
+///
+/// The repair is a literal value, not "write the value in the component body":
+/// the reference may already *be* in the body, so that sentence is circular and
+/// would leave an agent nowhere to go. Only the static markup/body case gets the
+/// directive as an alternative, because that is the one place it is the genuine
+/// escape hatch.
+fn route_parameter(span: (u32, u32), name: &str, site: ParameterSite) -> Diagnostic {
+    let message = match site {
+        ParameterSite::Component => format!(
             "`{name}` is the route's parameter, but a route is given no props and the \
              prerendered module takes no arguments, so `{name}` would be undefined at build \
-             time. Remove the reference, and write the value in the component body."
+             time. Replace the reference with a literal value, or change line 1 to \
+             \"use island\" to declare the parameter."
         ),
-    )
+        ParameterSite::ModuleScope => format!(
+            "`{name}` is the route's parameter, and a module-level statement is evaluated \
+             outside the component, where no `{name}` exists — the emitted component declares \
+             it and the module does not. Replace the reference with a literal value or a \
+             binding this file declares at module scope."
+        ),
+    };
+    Diagnostic::new(Code::RA014, span, message)
 }
 
-/// `RA014`: a static page names its own component.
+/// Where a reference to the route's parameter was found, which decides the reason
+/// [`route_parameter`] gives.
+///
+/// The rule is one code and one repair; only the explanation differs, because the
+/// two regions fail for different reasons and a single sentence would be false in
+/// one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterSite {
+    /// The returned markup or a component-body statement: the emitted component's
+    /// own parameter is the missing binding, and only a static route is refused.
+    Component,
+    /// A module-level statement: no emitter declares the parameter at module
+    /// scope, so both modes are a `ReferenceError`.
+    ModuleScope,
+}
+
+/// `RA014`: a static page names its own component, in its markup, in a body
+/// statement, or at module scope.
 ///
 /// The prerender module exports `render()` and declares nothing else — the
 /// component is rebuilt inside that function — so `Page` is not a binding there.
@@ -493,6 +742,15 @@ mod tests {
 
     fn codes(src: &str, mode: Mode) -> Vec<Code> {
         diagnostics(src, mode)
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect()
+    }
+
+    /// The codes of an already-computed list, so a test that needs the messages
+    /// as well does not run the analysis twice.
+    fn codes_of(diagnostics: &[Diagnostic]) -> Vec<Code> {
+        diagnostics
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect()
@@ -698,20 +956,109 @@ mod tests {
     }
 
     /// The route's parameter is **not** in scope at module level: `const x =
-    /// props` there resolves to nothing at all, not to the route's parameter. That
-    /// is a different defect from this rule's, and refusing it would mean
-    /// refusing every unresolved module-level name — including `Math` and DOM
-    /// globals — so it is deliberately out of scope. Asserted so the boundary is
-    /// written down rather than inferred.
+    /// props` there resolves to nothing at all, not to the route's parameter.
+    ///
+    /// **This test is the one P2 deliberately reverses.** Round 3 concluded from
+    /// that fact that the reference was "not this rule's read" and stayed
+    /// silent; the emitted module then threw at load, because the statement *is*
+    /// emitted and `props` has no module binding anywhere. The truth is the
+    /// opposite of the old conclusion: the parameter is not in scope at module
+    /// level in **either** mode, so the reference is a `ReferenceError` in both
+    /// and is refused in both. The old reasoning — "refusing it would mean
+    /// refusing every unresolved module-level name, including `Math`" — is
+    /// answered by name: only the names the route's own parameter list binds are
+    /// refused, which `Math` is not.
     #[test]
-    fn the_route_parameter_is_not_in_scope_at_module_scope() {
-        let src = "\"use static\"\nconst x = props\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n";
-        for mode in [Mode::Static, Mode::Island] {
+    fn a_parameter_name_at_module_scope_is_refused_in_both_modes() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nconst x = props\nexport default function Page(props: Record<never, never>) {{ return <p>{{x}}</p> }}\n"
+            )
+        };
+        for (directive, mode) in [
+            ("\"use static\"", Mode::Static),
+            ("\"use island\"", Mode::Island),
+        ] {
+            let diagnostics = diagnostics(&src(directive), mode);
+            assert_eq!(
+                codes_of(&diagnostics),
+                vec![Code::RA014],
+                "{directive}: the emitted module statement names a parameter it cannot see: {diagnostics:?}"
+            );
             assert!(
-                codes(src, mode).is_empty(),
-                "{mode:?}: module level cannot see the parameter, so it is not this rule's read"
+                diagnostics[0].message.contains("module-level statement"),
+                "{directive}: the reason is the region, so the message must name it: {diagnostics:?}"
             );
         }
+
+        // The control: a module-level binding of the same name is a *different*
+        // binding, so the module can see it and the statement is emitted. Refusing
+        // by name alone would fail here.
+        let own = "\"use static\"\nconst props = { a: 1 }\nconst x = props\nexport default function Page(props: Record<never, never>) { return <p>{x.a}</p> }\n";
+        for mode in [Mode::Static, Mode::Island] {
+            assert!(
+                codes(own, mode).is_empty(),
+                "{mode:?}: the module declares its own `props`, which resolves"
+            );
+        }
+    }
+
+    // --- Fix round 5: the parameter list is a fourth region --------------------
+
+    /// The emitters rebuild the route signature rather than copying it: the
+    /// emitted component is `function <Name>(props)`. So a parameter list the
+    /// rebuild cannot reproduce is not emitted as written, and everything it
+    /// binds is absent from the artifact.
+    ///
+    /// This is R2. `props: P = owner` is the case that motivated it: `owner` is
+    /// not a primitive call, so `RA010` never sees it, and the default was
+    /// dropped with no diagnostic. Refusing the *shape* is the honest rule,
+    /// because the defect is the dropped signature, not an unreachable name —
+    /// which is why the row appears in **both** modes. A reachability walk would
+    /// be silent in an island, where the island's own import makes `owner` a
+    /// real name.
+    #[test]
+    fn a_route_signature_the_emitter_cannot_rebuild_is_refused() {
+        for (label, params) in [
+            ("a default naming a runai value", "props: P = owner"),
+            (
+                "a default naming an ordinary call",
+                "props: P = ((n: number) => n)(1)",
+            ),
+            ("a destructured props object", "{ id }: P"),
+            ("a rest parameter", "...props: P[]"),
+            ("a renamed parameter", "ctx: P"),
+        ] {
+            for (directive, mode) in [
+                ("\"use static\"", Mode::Static),
+                ("\"use island\"", Mode::Island),
+            ] {
+                let src = format!(
+                    "{directive}\nimport {{ owner }} from \"runai\"\ntype P = Record<never, never>\nexport default function Page({params}) {{ return <p>hi</p> }}\n"
+                );
+                let diagnostics = diagnostics(&src, mode);
+                assert_eq!(
+                    codes_of(&diagnostics),
+                    vec![Code::RA014],
+                    "{label} ({directive}): one row, and not RA010's accident: {diagnostics:?}"
+                );
+                assert!(
+                    diagnostics[0].message.contains("(props:"),
+                    "{label} ({directive}): the repair must name the signature to write: {diagnostics:?}"
+                );
+            }
+        }
+
+        // The shape both emitters write stays clean in an island, and the static
+        // half is still `RA014` only for reading it — so this test cannot pass by
+        // refusing every parameter list.
+        let conforming = "\"use island\"\ntype P = Record<never, never>\nexport default function Page(props: P) { return <p>{props}</p> }\n";
+        assert!(
+            codes(conforming, Mode::Island).is_empty(),
+            "the signature both emitters write is legal: {conforming}"
+        );
+        let read = "\"use static\"\ntype P = Record<never, never>\nexport default function Page(props: P) { return <p>{props}</p> }\n";
+        assert_eq!(codes(read, Mode::Static), vec![Code::RA014]);
     }
 
     /// Every other module-level value stays reachable: the ruling, restated at

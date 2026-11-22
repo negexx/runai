@@ -423,8 +423,11 @@ impl<'a, 'b> EmittedModulePart<'a, 'b> {
 /// A **type declaration** is a fourth kind [`RouteIr::module_statements`] never
 /// contains, but this function does not exclude it: [`strip_types`] erased it
 /// before the emitters' tree exists. The typed tree `analyze` parses still has
-/// it, so the two trees differ by exactly that part — which is why the
-/// cross-tree test asserts the difference rather than ignoring it.
+/// it, along with the other statements `strip_types` erases — a `declare`
+/// statement and a bodyless overload signature — so the two trees differ by
+/// those statements, not by the type declaration alone. That is why the
+/// cross-tree test asserts the difference rather than ignoring it: it counts the
+/// typed tree's extra parts, so any *other* difference fails.
 ///
 /// This is the one definition of "emitted" **among the parts a caller can
 /// ask about**: [`module_statements`] renders these parts to text and
@@ -2154,7 +2157,8 @@ mod tests {
         }
 
         // `export * from "runai"` is the same statement shape: nothing is
-        // re-exported, even though the import rule does not refuse the source.
+        // re-exported. The import rule refuses the source too, so this is the
+        // artifact's half of one refusal.
         let runai = "\"use static\"\nexport * from \"runai\"\nexport default function Page(props: Record<never, never>) { return <p>hi</p> }\n";
         assert_eq!(
             crate::ir::lower_route(runai).unwrap().module_statements,

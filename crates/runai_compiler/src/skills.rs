@@ -61,7 +61,7 @@ fn why(code: Code) -> &'static str {
              decision that controls the 0 KB guarantee."
         }
         Code::RA014 => {
-            "The code covers three families, and each would be wrong silently rather than loudly. \
+            "The code covers four families, and each would be wrong silently rather than loudly. \
              \
              The JSX constructs it refuses are a capitalized tag or member-expression tag \
              (component inlining comes with a later plan), the runtime's own \
@@ -102,12 +102,23 @@ fn why(code: Code) -> &'static str {
              directive, `\"use island\"`. The route's own parameter in a `\"use static\"` route is \
              refused because `render()` takes no arguments, so `{props}` or `const x = props` \
              would be `undefined` at \
-             build time. A module-level declaration is deliberately **not** in this family: \
+             build time; at **module scope** it is refused in an island too, because no emitter \
+             declares the parameter there either. A `declare` statement is the fourth family: it \
+             is erased before emission, so the binding it introduces never exists in the generated \
+             module, and a route file cannot declare a binding it does not define. A module-level \
+             declaration is deliberately **not** in this family: \
              module-scope statements are copied into the emitted module above the component (design \
              §7.6 expects module-level state — \"module-scope signals are per-island too, since \
              each island is its own module instance\"), so a module-level `const` the markup names \
              is reachable. A component-body statement's own local is not in this family either: \
              the statement is copied into the component, so the local exists there. \
+             \
+             The parameter list itself is a **shape** the emitters rebuild rather than copy: both \
+             write the component as `function <Name>(props)`, so a default, a destructuring \
+             pattern, a rest parameter, or a different name is dropped, and everything it binds \
+             does not exist in the artifact. That is why `props: P = owner` is refused in an \
+             island where `owner` is otherwise a real name — the defect is the dropped signature, \
+             not the reference. \
              \
              An attribute with an empty expression (`name={}`) is deliberately **not** on this \
              list: that is a parse error, reported as `RA007`, not valid syntax waiting for a later \
@@ -316,6 +327,8 @@ mod tests {
             "no imports and does not declare the component",
             "route component's own name",
             "route's own parameter",
+            "A `declare` statement is the fourth family",
+            "The parameter list itself is a **shape**",
         ] {
             assert!(
                 body.contains(phrase),
@@ -335,11 +348,19 @@ mod tests {
             "import it from `\"runai\"`",
             "rewrite it as named imports",
             "`\"use island\"`",
-            "write the value in the component body",
+            "replace the parameter reference with a literal value",
+            "replace it with a value this file defines",
+            "write the parameter as `(props: <Type>)`",
             "`export =` as `export default`",
         ] {
             assert!(fix.contains(repair), "missing repair `{repair}`: {fix}");
         }
+        // The circular repair must be gone: a reference may already be in the
+        // component body, so "write the value in the body" leaves nowhere to go.
+        assert!(
+            !fix.contains("write the value in the component body"),
+            "the circular parameter repair is gone: {fix}"
+        );
         // The import clause comes first: an agent reading only `fix` on an import
         // diagnostic must not be led to the JSX repairs.
         assert!(
@@ -348,7 +369,7 @@ mod tests {
             "the import repair must precede the JSX repairs: {fix}"
         );
 
-        // The explain carries all three families, so `runai check` on an import
+        // The explain carries all four families, so `runai check` on an import
         // diagnostic does not explain a JSX construct the file does not contain.
         let explain = Code::RA014.explain();
         for family in [
@@ -356,6 +377,7 @@ mod tests {
             "an `import` or re-export",
             "a value the generated module",
             "`import x = require(…)`",
+            "A `declare` statement is refused",
         ] {
             assert!(explain.contains(family), "missing `{family}`: {explain}");
         }

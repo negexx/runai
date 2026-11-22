@@ -173,7 +173,7 @@ impl Code {
             }
             Code::RA014 => {
                 "The parser accepted this file: this is a limitation of the compiler, not a \
-                 syntax error. It covers three families. A JSX construct this milestone cannot \
+                 syntax error. It covers four families. A JSX construct this milestone cannot \
                  lower (a component tag, a spread, a fragment root, and so on), where lowering \
                  reports the construct instead of dropping it, because markup emitted without \
                  part of a node is wrong in a way nothing reports. A module the emitted file \
@@ -184,12 +184,16 @@ impl Code {
                  does not have — each route is emitted from its own file, so a second module \
                  cannot be resolved or inlined. A re-export is refused even when its source is \
                  `\"runai\"`, because the emitted module never carries one, so accepting it would \
-                 drop the statement silently. And a value the generated module cannot see — a \
+                 drop the statement silently. A `declare` statement is refused because type \
+                 stripping erases it before the route is emitted, so the binding it introduces \
+                 never exists in the generated module — a route file defines the values it names. \
+                 And a value the generated module cannot see — a \
                  `\"runai\"` name or the route component's own name at module scope, in a \
                  component-body statement, or in a \
                  `\"use static\"` route's markup, whose prerender module has no imports and does \
                  not declare the component, or the route's own parameter there, which the \
-                 prerender call supplies with nothing. A module-level declaration is *not* in \
+                 prerender call supplies with nothing, or at module scope, where no emitter \
+                 declares it. A module-level declaration is *not* in \
                  this family: module-scope statements are emitted above the component. Neither is \
                  a component-body statement's own local, which is emitted inside the component."
             }
@@ -252,16 +256,20 @@ impl Code {
                  with the name used or exported here; a \
                  default or namespace `\"runai\"` import is not a form the emitted module writes, \
                  so rewrite it as named imports; write `import x = require(…)` as an `import`, and \
-                 `export =` as `export default` or a named export. For a value the generated \
-                 module cannot see — a `\"runai\"` name, or the route's own component, at module \
-                 scope, in a component-body statement, or in a `\"use static\"` route's markup, or \
-                 the route's own parameter in a \
+                 `export =` as `export default` or a named export. For a `declare` statement, \
+                 replace it with a value this file defines, because it is erased before emission. \
+                 For a route signature the emitter rewrites as `function <Name>(props)` — a \
+                 default, a destructuring pattern, a rest parameter, or a different name — write \
+                 the parameter as `(props: <Type>)` and read the fields from `props`. For a value \
+                 the generated module cannot see — a `\"runai\"` name, or the route's own \
+                 component, at module scope, in a component-body statement, or in a `\"use static\"` \
+                 route's markup, or the route's own parameter in a \
                  `\"use static\"` route — do what the message names: change line 1 to \
-                 `\"use island\"` for the first two, and remove the reference or write the value in \
-                 the component body for the parameter. For a JSX construct, write the spread out, \
-                 move the JSX into the children or the returned tree, give the attribute or prop a \
-                 value, wrap a root fragment in one parent element, render a runtime primitive's \
-                 markup directly, or keep exactly one JSX return."
+                 `\"use island\"` for the first two, and replace the parameter reference with a \
+                 literal value. For a JSX construct, write the spread out, move the JSX into the \
+                 children or the returned tree, give the attribute or prop a value, wrap a root \
+                 fragment in one parent element, render a runtime primitive's markup directly, or \
+                 keep exactly one JSX return."
             }
         }
     }

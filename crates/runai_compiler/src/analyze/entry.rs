@@ -112,6 +112,7 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     // an agent sees first, and a refusal it cannot reach is a false negative.
     diagnostics.extend(check_jsx(program, source));
     diagnostics.extend(check_imports(program, source));
+    diagnostics.extend(check_erased_declarations(program, path));
 
     // One semantic build for the signal rules. A page with a known mode pays one
     // more later, in stage 5, and only when it has a route component to check.
@@ -139,6 +140,130 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     }
 
     diagnostics
+}
+
+/// `RA014` for a `declare` statement in a **route file**, or `None` anywhere else.
+///
+/// `declare` says "this binding exists at runtime because something outside this
+/// file provides it". That is true for a library's ambient types; it is false for
+/// a route file, because the file is **emitted**, and
+/// [`crate::strip::strip_types`] erases every `declare` before emission. So the
+/// binding does not exist in the artifact, while the typed tree `analyze` parses
+/// still resolves it — the markup compiles in analysis and throws a
+/// `ReferenceError` at build time. That pair is the accept-then-reject class this
+/// task exists to close, so the statement is refused rather than made
+/// referenceable: there is no value to emit, because the author never wrote one.
+///
+/// **Every `declare` form binds, and every one is erased**, so each is refused:
+/// `declare const`/`let`/`var`, `declare function` (which has no body at all),
+/// `declare class`, `declare enum`, `declare namespace`, `declare module`, and
+/// `declare global`, plus the `export declare …` spellings of each. Detection is
+/// on the AST node's own `declare` flag rather than on the source text, so
+/// `"declare"` inside a string is not a false positive and a form the parser
+/// normalizes differently is not a false negative.
+///
+/// **A page only.** A component module is not emitted by this milestone, so a
+/// `declare` there describes nothing about an artifact and the props/JSX rules are
+/// all it owes — the same boundary [`crate::analyze::reachable`] draws.
+///
+/// **A bodyless overload signature is deliberately not this rule.** It is erased
+/// by the same mechanism, but it declares a name the implementation beside it
+/// also declares, so the *binding* exists in the artifact and the file runs. It
+/// is legal TypeScript for a file that is emitted; `declare` is not, because
+/// nothing else declares its binding.
+fn check_erased_declarations(program: &Program<'_>, path: &str) -> Vec<Diagnostic> {
+    if !is_page(path) {
+        return Vec::new();
+    }
+    let mut diagnostics = Vec::new();
+    for statement in &program.body {
+        let declaration = match statement {
+            Statement::ExportDeclaration(exported) => &exported.declaration,
+            _ => {
+                if let Some(span) = ambient_statement_span(statement) {
+                    diagnostics.push(erased_declaration(span));
+                }
+                continue;
+            }
+        };
+        if let Some(span) = ambient_declaration_span(declaration) {
+            diagnostics.push(erased_declaration(span));
+        }
+    }
+    diagnostics
+}
+
+/// The span of a whole module-level statement that is `declare`-only, including
+/// the `export` in front of it, if it is one.
+///
+/// The span covers the whole statement rather than the name, because the
+/// statement *is* the thing to delete: there is no value to keep, and pointing at
+/// the identifier would suggest renaming it fixes the problem.
+fn ambient_statement_span(statement: &Statement<'_>) -> Option<(u32, u32)> {
+    match statement {
+        Statement::VariableDeclaration(variable) if variable.declare => {
+            Some((variable.span.start, variable.span.end))
+        }
+        Statement::FunctionDeclaration(function) if function.declare => {
+            Some((function.span.start, function.span.end))
+        }
+        Statement::ClassDeclaration(class) if class.declare => {
+            Some((class.span.start, class.span.end))
+        }
+        Statement::TSEnumDeclaration(enumeration) if enumeration.declare => {
+            Some((enumeration.span.start, enumeration.span.end))
+        }
+        Statement::TSNamespaceDeclaration(namespace) if namespace.declare => {
+            Some((namespace.span.start, namespace.span.end))
+        }
+        // `declare module "x" { … }` and `declare global { … }` are ambient by
+        // node kind; this syntax has no non-ambient spelling.
+        Statement::TSExternalModuleDeclaration(module) => {
+            Some((module.span.start, module.span.end))
+        }
+        Statement::TSGlobalDeclaration(global) => Some((global.span.start, global.span.end)),
+        _ => None,
+    }
+}
+
+/// [`ambient_statement_span`] for the declaration inside an `export …`.
+fn ambient_declaration_span(declaration: &oxc_ast::ast::Declaration<'_>) -> Option<(u32, u32)> {
+    match declaration {
+        oxc_ast::ast::Declaration::VariableDeclaration(variable) if variable.declare => {
+            Some((variable.span.start, variable.span.end))
+        }
+        oxc_ast::ast::Declaration::FunctionDeclaration(function) if function.declare => {
+            Some((function.span.start, function.span.end))
+        }
+        oxc_ast::ast::Declaration::ClassDeclaration(class) if class.declare => {
+            Some((class.span.start, class.span.end))
+        }
+        oxc_ast::ast::Declaration::TSEnumDeclaration(enumeration) if enumeration.declare => {
+            Some((enumeration.span.start, enumeration.span.end))
+        }
+        oxc_ast::ast::Declaration::TSNamespaceDeclaration(namespace) if namespace.declare => {
+            Some((namespace.span.start, namespace.span.end))
+        }
+        _ => None,
+    }
+}
+
+/// `RA014` for one `declare` statement.
+///
+/// The message says **why** rather than only what: an agent that reads
+/// "unsupported" will look for the milestone that supports it, and there is none
+/// — the statement's meaning is incompatible with emission, not with this
+/// milestone's slice of it.
+fn erased_declaration(span: (u32, u32)) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        span,
+        "a `declare` statement is erased before the route is emitted (`strip_types` removes \
+         it), so the binding it introduces never exists in the generated module and any \
+         reference to it is a `ReferenceError` at build time. Write the value in this file, or \
+         import it from `\"runai\"` and write the binding here; a route file cannot declare a \
+         binding it does not define.",
+    )
 }
 
 /// Whether `path` names a page file.
@@ -936,6 +1061,40 @@ mod tests {
         );
     }
 
+    /// The parameter-list rule must not add a second row for a route shape
+    /// `RA006` or `RA011` already refuses: zero parameters is `RA006`'s, and two
+    /// or more is `RA011`'s. Without this control, a rule firing on every
+    /// parameter list would put two codes on one problem, which is the
+    /// duplication `every_diagnostic_family_is_located_on_its_own_line` and
+    /// `an_untyped_route_produces_one_ra006_not_two` exist to catch.
+    #[test]
+    fn a_route_shape_ra006_or_ra011_owns_gets_no_second_row() {
+        let zero = "\"use static\"\nexport default function Page() { return <p>hi</p> }\n";
+        assert_eq!(
+            codes(&analyze(zero, "src/routes/index.page.tsx")),
+            vec![Code::RA006],
+            "zero parameters is RA006's, and nothing else"
+        );
+
+        let two = "\"use static\"\ntype P = Record<never, never>\nexport default function Page(props: P, other: P) { return <p>hi</p> }\n";
+        assert_eq!(
+            codes(&analyze(two, "src/routes/index.page.tsx")),
+            vec![Code::RA011],
+            "two parameters is RA011's, and nothing else"
+        );
+
+        // No type annotation on a `props = …` default is `RA006`'s as well, so
+        // the parameter rule stays silent rather than describing the same
+        // signature twice.
+        let untyped =
+            "\"use static\"\nexport default function Page(props = { a: 1 }) { return <p>hi</p> }\n";
+        assert_eq!(
+            codes(&analyze(untyped, "src/routes/index.page.tsx")),
+            vec![Code::RA006],
+            "an untyped default is RA006's row alone"
+        );
+    }
+
     /// The four nits from the review, as facts rather than comments: a
     /// `module_statements` that cannot name a `"runai"` value, cannot name the
     /// route, and does not carry a re-export. The existing
@@ -967,6 +1126,142 @@ mod tests {
                     route.module_statements
                 );
             }
+        }
+    }
+
+    /// P2: a reference to the route's parameter is refused **wherever the
+    /// emitted module cannot declare it**. Round 4 walked the body and refused
+    /// `const x = props` in a *static* route; round 3 had pinned the
+    /// module-scope twin as clean in both modes, so `const x = props` at module
+    /// scope was accepted and emitted a `ReferenceError` in **either** mode — a
+    /// module statement is outside the component, and neither emitter declares
+    /// `props` at module scope.
+    ///
+    /// The honest rule is therefore per region, and it follows the emitters
+    /// rather than a guess:
+    ///
+    /// | Region | Static | Island | Why |
+    /// |---|---|---|---|
+    /// | markup | refused | legal | the island declares `function <Name>(props)` |
+    /// | body | refused | legal | the same declaration is the body's scope |
+    /// | module scope | refused | refused | no module declares the parameter |
+    ///
+    /// The module-scope half is the part P2 reverses; the island body staying
+    /// clean is the part a "refuse the name everywhere" fix would break, so both
+    /// are asserted.
+    #[test]
+    fn the_route_parameter_is_refused_where_the_module_cannot_declare_it() {
+        let module_scope = |directive: &str| {
+            format!(
+                "{directive}\nconst x = props\nexport default function Page(props: Record<never, never>) {{ return <p>{{x}}</p> }}\n"
+            )
+        };
+        let body = |directive: &str| {
+            format!(
+                "{directive}\nexport default function Page(props: Record<never, never>) {{ const x = props; return <p>hi</p> }}\n"
+            )
+        };
+        let markup = |directive: &str| {
+            format!(
+                "{directive}\nexport default function Page(props: Record<never, never>) {{ return <p>{{props}}</p> }}\n"
+            )
+        };
+
+        // Module scope: no emitter declares the parameter there, so both modes
+        // are a `ReferenceError`.
+        for directive in ["\"use static\"", "\"use island\""] {
+            let d = analyze(&module_scope(directive), "src/routes/index.page.tsx");
+            assert_eq!(
+                codes(&d),
+                vec![Code::RA014],
+                "module scope ({directive}) must be refused: {d:?}"
+            );
+            assert!(
+                d[0].message.contains("route's parameter"),
+                "module scope: the parameter rule owns this: {d:?}"
+            );
+        }
+
+        // The body and the markup: the island declares `function <Name>(props)`,
+        // so the reference is legal there and refused only when static.
+        for directive in ["\"use static\"", "\"use island\""] {
+            let is_static = directive.contains("static");
+            for (region, src) in [("body", body(directive)), ("markup", markup(directive))] {
+                let d = analyze(&src, "src/routes/index.page.tsx");
+                if is_static {
+                    assert_eq!(
+                        codes(&d),
+                        vec![Code::RA014],
+                        "{region} ({directive}): {d:?}"
+                    );
+                } else {
+                    assert!(
+                        d.is_empty(),
+                        "{region} ({directive}): an island declares the parameter: {d:?}"
+                    );
+                }
+            }
+        }
+
+        // The statement is still emitted — the gate is `analyze`, not lowering —
+        // so the refusal is about the artifact rather than lowering's contract.
+        assert!(
+            lower_route(&module_scope("\"use static\""))
+                .unwrap()
+                .module_statements
+                .contains("const x = props"),
+            "the statement the diagnostic names is the statement the module carries"
+        );
+    }
+
+    /// R2: the parameter list is the fourth region. The emitters do not copy it:
+    /// both rebuild the component as `function <Name>(props)`, so a default, a
+    /// destructuring pattern, a rest parameter, or a renamed parameter is
+    /// **dropped**, and everything it binds does not exist in the artifact.
+    ///
+    /// The case that proved it: `props: P = owner` in an **island** was clean.
+    /// `RA010` never sees it (`owner` is not a primitive call), and a
+    /// reachability walk would stay silent too, because the island's own import
+    /// makes `owner` a real name — it is the *parameter*, not a reference, that
+    /// the emitter cannot write. So the rule is about the signature's shape, and
+    /// it fires in both modes.
+    #[test]
+    fn a_route_signature_the_emitters_drop_is_refused_in_both_modes() {
+        for params in [
+            "props: P = owner",
+            "props: P = ((n: number) => n)(1)",
+            "{ id }: P",
+            "...props: P[]",
+            "ctx: P",
+        ] {
+            for directive in ["\"use static\"", "\"use island\""] {
+                let src = format!(
+                    "{directive}\nimport {{ owner }} from \"runai\"\ntype P = Record<never, never>\nexport default function Page({params}) {{ return <p>hi</p> }}\n"
+                );
+                let d = analyze(&src, "src/routes/index.page.tsx");
+                assert_eq!(
+                    codes(&d),
+                    vec![Code::RA014],
+                    "`({params})` ({directive}): the emitter drops this parameter: {d:?}"
+                );
+                assert!(
+                    d[0].message.contains("(props:"),
+                    "`({params})`: the repair names the signature to write: {d:?}"
+                );
+            }
+        }
+
+        // The parameter named `props` with a type annotation is exactly what both
+        // emitters write, so it must stay legal. Without this control the rule
+        // could refuse every parameter list and pass above.
+        for directive in ["\"use static\"", "\"use island\""] {
+            let src = format!(
+                "{directive}\ntype P = Record<never, never>\nexport default function Page(props: P) {{ return <p>hi</p> }}\n"
+            );
+            assert!(
+                analyze(&src, "src/routes/index.page.tsx").is_empty(),
+                "`(props: P)` ({directive}) is the signature both emitters write"
+            );
         }
     }
 
@@ -1097,6 +1392,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// R3: a `declare` statement is **erased** before anything is emitted, yet
+    /// the typed tree `analyze` parses still resolves the name it binds. So
+    /// `declare const theme: string` produced no diagnostic while
+    /// `strip_types` deleted the statement and left `{theme}` in the markup —
+    /// a `ReferenceError` at build time, accepted by `check`.
+    ///
+    /// Every declaration form is refused, because every one of them is erased
+    /// and every one can bind a name the tree reads: `declare const`, a
+    /// `declare function` (which does not even have a body), `declare class`,
+    /// `declare let`, `declare enum`, `declare namespace`, `declare module`,
+    /// `declare global`, and the `export declare` spellings. The reason is the
+    /// one thing they share, so it is the one thing the message says.
+    #[test]
+    fn a_declare_statement_is_ra014_because_it_is_erased() {
+        for statement in [
+            "declare const theme: string",
+            "declare let theme: string",
+            "declare function helper(): string",
+            "declare class Store {}",
+            "declare enum E { A }",
+            "declare namespace N { const x: number }",
+            "declare module \"thing\" { export const x: number }",
+            "declare global { interface Window { x: number } }",
+            "export declare const theme: string",
+            "export declare function helper(): string",
+        ] {
+            for directive in ["\"use static\"", "\"use island\""] {
+                let src = format!(
+                    "{directive}\n{statement}\nexport default function Page(props: Record<never, never>) {{ return <p>{{theme}}</p> }}\n"
+                );
+                let d = analyze(&src, "src/routes/index.page.tsx");
+                assert_eq!(
+                    codes(&d),
+                    vec![Code::RA014],
+                    "{statement} ({directive}): one row at the declaration: {d:?}"
+                );
+                assert_eq!(d[0].line, 2, "{statement}: the statement is the site");
+                assert!(
+                    d[0].message.contains("erased"),
+                    "{statement}: the reason is erasure, not syntax: {d:?}"
+                );
+                assert!(
+                    !d[0].message.contains("no bundler"),
+                    "{statement}: no import is unresolved, so the bundler reason is false: {d:?}"
+                );
+            }
+        }
+
+        // A component module is not emitted by this milestone, so a `declare`
+        // there describes no artifact. It owes only the props and JSX rules —
+        // the same boundary `reachable` draws for module-level values — so the
+        // statement stays legal. Without this control, dropping the `is_page`
+        // guard would pass every page test above.
+        let component_module = "declare const theme: string\nexport function Header(props: Record<never, never>) { return <h1>{theme}</h1> }\n";
+        assert!(
+            analyze(component_module, "src/routes/_shell.tsx").is_empty(),
+            "a component module is not emitted, so `declare` there says nothing about an artifact"
+        );
+
+        // The same file as a page *is* refused, so the control above is not
+        // passing because the walk never ran.
+        assert!(
+            !analyze(component_module, "src/routes/shell.page.tsx").is_empty(),
+            "the same declaration in a page is refused"
+        );
+
+        // The control: an ordinary module-level declaration is emitted, so the
+        // exact same markup is clean. Without this, a rule that refused every
+        // module-level declaration would pass the cases above.
+        let ordinary = "\"use static\"\nconst theme = \"dark\"\nexport default function Page(props: Record<never, never>) { return <p>{theme}</p> }\n";
+        assert!(
+            analyze(ordinary, "src/routes/index.page.tsx").is_empty(),
+            "a module-level const is emitted, so the tree may name it"
+        );
+
+        // A bodyless overload signature is erased by the same mechanism, but the
+        // implementation beside it is emitted — so the *name* resolves at build
+        // time and the file compiles and runs. A rule keyed on "erased" alone
+        // would refuse this legal file.
+        let overloaded = "\"use static\"\nfunction helper(x: string): string;\nfunction helper(x: string) { return x }\nexport default function Page(props: Record<never, never>) { return <p>{helper(\"a\")}</p> }\n";
+        assert!(
+            analyze(overloaded, "src/routes/index.page.tsx").is_empty(),
+            "an overload signature is erased but its implementation declares the name"
+        );
     }
 
     #[test]
