@@ -152,8 +152,9 @@ pub struct RouteIr {
     ///   from the runtime URL, and the prerender module writes none at all;
     /// - a re-export (`export … from "./x"`, `export * from "./x"`) — it points
     ///   at another module, and the emitted module either has one import (an
-    ///   island's, from the runtime URL) or none. `check_imports` refuses it for
-    ///   the same reason, so this is the invariant, not the agent's first signal;
+    ///   island's, from the runtime URL) or none. `check_imports` refuses it,
+    ///   `"runai"` sources included, so this is the invariant, not the agent's
+    ///   first signal;
     /// - type declarations, which [`strip_types`] already erased.
     ///
     /// It is guaranteed **JSX-free**: [`crate::analyze::jsx::check_jsx`] refuses
@@ -185,6 +186,19 @@ pub struct RouteIr {
 /// byte in the file the agent opened. That is why `check_jsx` runs first on the
 /// original source: its spans are the agent's own, and it refuses every construct
 /// that would produce a diagnostic here.
+///
+/// # `lower_route` is not a gate, and the emitters are `pub(crate)`
+///
+/// `lower_route` is deliberately **not** a verdict: it reads
+/// [`RouteIr::statements`] and [`RouteIr::module_statements`] but does not know
+/// whether a name in them resolves, because that needs a semantic pass. So a
+/// caller must gate on [`crate::analyze::analyze`] first — and Task 10/11's
+/// emitters (`emit_prerender`, `emit_client`) are `pub(crate)` **by design**,
+/// with only their `*_checked` forms public. Those checked forms are the ones
+/// that call `analyze`; the unchecked pair exists only for their own unit tests.
+/// The naming is the invariant: a `pub` emitter name that does not end in
+/// `_checked` would be a path from a source file to an artifact with no rule
+/// pass in between, which is the accept-then-reject class this task closes.
 ///
 /// # Errors
 ///
@@ -246,6 +260,23 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
     })
 }
 
+/// The body statements both emitters copy into the generated component: every
+/// statement before the JSX `return` that replaces the template.
+///
+/// One definition, two consumers: [`statements`] slices this range to text and
+/// [`crate::analyze::reachable`] walks the same statements for references. A
+/// statement after the `return` is unreachable code and is never emitted, so it
+/// is not walked either. A concise body (`(props) => <p/>`) has no body
+/// statements — the JSX *is* the body — and yields an empty iterator.
+pub(crate) fn emitted_body_statements<'a>(
+    body: &'a oxc_ast::ast::FunctionBody<'a>,
+    return_span: Span,
+) -> impl Iterator<Item = &'a Statement<'a>> {
+    body.statements
+        .iter()
+        .filter(move |statement| statement.span().end <= return_span.start)
+}
+
 /// Every statement in the route body before the JSX `return`, as stripped
 /// JavaScript.
 ///
@@ -253,6 +284,10 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
 /// (a nested function, a multi-line call) exactly as they are and drops the
 /// `return` itself, which is the one statement the template replaces. A concise
 /// body (`(props) => <p/>`) is the JSX, so there is nothing to emit.
+///
+/// The statements sliced are exactly [`emitted_body_statements`] — the range the
+/// reference walk visits — so the two cannot disagree about what the generated
+/// component declares.
 fn statements(
     source: &str,
     body: Option<&oxc_ast::ast::FunctionBody>,
@@ -262,12 +297,9 @@ fn statements(
         return String::new();
     };
 
-    let Some(first) = body.statements.first() else {
+    let Some(first) = emitted_body_statements(body, return_span).next() else {
         return String::new();
     };
-    if first.span().start >= return_span.start {
-        return String::new();
-    }
 
     let start = first.span().start as usize;
     let end = return_span.start as usize;
@@ -283,7 +315,8 @@ fn statements(
 /// Design §7.6 expects module-level state ("module-scope signals are per-island
 /// too"), so the emitters need the file's module level, not just the component
 /// body. Three kinds of statement are **not** included, each because an emitter
-/// owns it:
+/// owns it, and a fourth is absent for a different reason — the same list
+/// [`RouteIr::module_statements`] documents:
 ///
 /// - `import` declarations — the island emitter writes exactly one import from
 ///   the runtime URL and the prerender module writes none, so an import here
@@ -292,8 +325,12 @@ fn statements(
 ///   `export { … as default }` statement that names it — the emitters declare
 ///   the component from [`RouteIr::name`] and [`RouteIr::statements`], so
 ///   keeping the original statement would declare it twice;
-/// - type declarations, which [`strip_types`] already erased, so they never
-///   appear in this source.
+/// - a re-export (`export … from "x"`, `export * from "x"`) — it names a second
+///   module, and the emitted module writes one import (the island's) or none, so
+///   there is nothing to re-export from. `check_imports` refuses the statement
+///   first, `"runai"` sources included;
+/// - type declarations — not excluded here but **absent**, because
+///   [`strip_types`] already erased them from the source this function slices.
 ///
 /// Slicing each statement's own span keeps multi-line declarations exactly as
 /// written, and keeps source order, which matters for a module-level `const` a
@@ -378,8 +415,32 @@ impl<'a, 'b> EmittedModulePart<'a, 'b> {
 /// Three kinds of statement are **not** here, each because an emitter owns it:
 /// an `import` ([`is_emitter_owned_statement`]); the route component's own
 /// declaration and its `export … default` (the emitters rebuild the component
-/// from [`RouteIr::name`] and [`RouteIr::statements`]); and a re-export, which
-/// names a second module the emitted file does not import.
+/// from [`RouteIr::name`] and [`RouteIr::statements`]); and a re-export
+/// (`export … from "x"`, `export * from "x"`), which names a second module the
+/// emitted file does not import. `check_imports` refuses that last kind first,
+/// `"runai"` sources included.
+///
+/// A **type declaration** is a fourth kind [`RouteIr::module_statements`] never
+/// contains, but this function does not exclude it: [`strip_types`] erased it
+/// before the emitters' tree exists. The typed tree `analyze` parses still has
+/// it, so the two trees differ by exactly that part — which is why the
+/// cross-tree test asserts the difference rather than ignoring it.
+///
+/// This is the one definition of "emitted" **among the parts a caller can
+/// ask about**: [`module_statements`] renders these parts to text and
+/// [`crate::analyze::reachable`] walks them for references, so the walk and the
+/// artifact agree for any one tree.
+///
+/// **What it does not prove:** `analyze` and `lower_route` do not hand this
+/// function the same tree. `analyze` parses the *typed* source, and
+/// `lower_route` parses [`strip_types`]'s output, which is a re-print — so the
+/// spans differ, and a type declaration exists in one and not the other. The
+/// agreement is per-tree. What keeps the two callers' *decisions* equal is that
+/// neither re-derives the exclusion set: both call this one function. A type
+/// annotation changing which statements are emitted would be a `strip_types`
+/// bug, not a second definition of "emitted". Cross-tree equality for a typed
+/// fixture is asserted by
+/// `emitted_parts_agree_across_the_typed_and_stripped_trees`.
 pub(crate) fn emitted_module_parts<'a, 'b>(
     program: &'b Program<'a>,
     route: &ComponentInfo<'a>,
@@ -1840,11 +1901,16 @@ mod tests {
         assert_eq!(r.statements, "", "the body is empty");
     }
 
-    /// `emitted_module_parts` is the one definition of "emitted" that both
-    /// consumers share: [`module_statements`] renders it, and
-    /// `crate::analyze::reachable` walks it for references. Pinned here so the
-    /// pair cannot drift into "carried but unchecked" or "checked but never
-    /// written": the parts list is compared against the text it renders.
+    /// `emitted_module_parts` is the one definition of "emitted" **per tree**:
+    /// [`module_statements`] renders it, and `crate::analyze::reachable` walks it
+    /// for references. Pinned here so the pair cannot drift into "carried but
+    /// unchecked" or "checked but never written": the parts list is compared
+    /// against the text it renders.
+    ///
+    /// It does **not** compare the two callers' trees to each other — `analyze`
+    /// parses the typed source and `lower_route` parses `strip_types`'s re-print.
+    /// That boundary is pinned separately, by
+    /// `emitted_parts_agree_across_the_typed_and_stripped_trees`.
     #[test]
     fn emitted_module_parts_and_rendered_statements_agree() {
         use oxc_allocator::Allocator;
@@ -1893,6 +1959,99 @@ mod tests {
         }
     }
 
+    /// The typed→stripped boundary does not change **which value declarations**
+    /// the emitters carry.
+    ///
+    /// `analyze` and `lower_route` see different trees: `analyze` parses the
+    /// typed source, `lower_route` parses [`crate::strip::strip_types`]'s
+    /// re-print. Comparing those trees byte for byte is meaningless — spans and
+    /// type syntax differ — so the claim that survives is the one the consumers
+    /// depend on: for the same file, the parts list selects the same
+    /// **declarations**. A type annotation must not add, remove, or reorder an
+    /// emitted declaration.
+    ///
+    /// The one difference the typed tree does have is named and asserted rather
+    /// than tolerated: `type Alias = string` is a statement in the typed tree and
+    /// is erased from the stripped one. `analyze` therefore walks it, and every
+    /// reference inside it is type-only, which is why the names and the verdicts
+    /// still agree. Pinning the count difference keeps that the *only* one.
+    #[test]
+    fn emitted_parts_agree_across_the_typed_and_stripped_trees() {
+        use oxc_allocator::Allocator;
+
+        let src = "\"use static\"\nimport { owner } from \"runai\"\nimport type { Data } from \"./data\"\nexport * from \"./data\"\ntype Alias = string\nconst title: string = \"A\"\nconst n: number = 1\nexport default function Page(props: Record<never, never>) { return <h1>{title}{n}</h1> }\n";
+
+        // The tree `analyze` parses: the file as the agent wrote it.
+        let typed_alloc = Allocator::default();
+        let typed = crate::source::parse_tsx(&typed_alloc, src).unwrap();
+        let typed_route = crate::analyze::find_route_component(typed).unwrap();
+        let typed_names = declared_names(&module_statements(src, typed, &typed_route));
+        let typed_parts = emitted_module_parts(typed, &typed_route);
+
+        // The tree `lower_route` parses: strip_types' re-print.
+        let stripped = crate::strip::strip_types(src).unwrap();
+        let stripped_alloc = Allocator::default();
+        let program = crate::source::parse_tsx(&stripped_alloc, &stripped).unwrap();
+        let route = crate::analyze::find_route_component(program).unwrap();
+        let stripped_names = declared_names(&module_statements(&stripped, program, &route));
+        let stripped_parts = emitted_module_parts(program, &route);
+
+        assert_eq!(
+            typed_names, stripped_names,
+            "the typed and stripped trees must select the same declarations:\n\
+             typed: {typed_names:?}\nstripped: {stripped_names:?}"
+        );
+        assert_eq!(
+            typed_names,
+            vec!["title".to_string(), "n".to_string()],
+            "the two values, in source order, and nothing else"
+        );
+
+        // The named difference: the typed tree carries the type declaration, and
+        // the stripped tree does not. Any *other* difference would mean a type
+        // annotation changed the emitted module, which is the defect this pins.
+        let typed_texts: Vec<&str> = typed_parts
+            .iter()
+            .map(|part| match part {
+                EmittedModulePart::Statement(statement) => {
+                    crate::source::raw_text(src, statement.span()).unwrap_or("")
+                }
+                EmittedModulePart::Declarators { .. } => "<declarators>",
+            })
+            .collect();
+        assert_eq!(
+            typed_texts.len(),
+            stripped_parts.len() + 1,
+            "the typed tree carries exactly one extra part: {typed_texts:?}"
+        );
+        assert!(
+            typed_texts
+                .iter()
+                .any(|text| text.trim_start().starts_with("type Alias")),
+            "the extra part is the type declaration: {typed_texts:?}"
+        );
+    }
+
+    /// The names a rendered `module_statements` declares, in the order the
+    /// declarations appear.
+    fn declared_names(rendered: &str) -> Vec<String> {
+        let mut names: Vec<(usize, String)> = Vec::new();
+        for keyword in ["const ", "let ", "var ", "function ", "class "] {
+            for (at, _) in rendered.match_indices(keyword) {
+                let after = &rendered[at + keyword.len()..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                    .collect();
+                if !name.is_empty() {
+                    names.push((at, name));
+                }
+            }
+        }
+        names.sort_by_key(|(at, _)| *at);
+        names.into_iter().map(|(_, name)| name).collect()
+    }
+
     /// Source order, and every module-level declaration shape: a const, a
     /// function, a class, and a module-level signal. A later declaration may read
     /// an earlier one, so order is part of the contract.
@@ -1921,10 +2080,14 @@ mod tests {
         }
     }
 
-    /// Three kinds of statement are the emitters' own and must not appear:
-    /// imports (the island emitter writes one, the prerender module none), the
-    /// route component's declaration (the emitters rebuild it from `name` and
-    /// `statements`), and its `export default`/`export { … as default }`.
+    /// Three of the four kinds of statement that are the emitters' own must not
+    /// appear: imports (the island emitter writes one, the prerender module
+    /// none), the route component's declaration (the emitters rebuild it from
+    /// `name` and `statements`), and its `export default`/`export { … as default
+    /// }`. The fourth — a re-export — has its own fixture,
+    /// `module_statements_exclude_a_reexport`, because it is a different
+    /// statement shape rather than a different route shape; the `type` kind is
+    /// never in this source at all, `strip_types` having erased it.
     ///
     /// Written for every route shape the analyzer accepts, because the excluded
     /// statement's span differs per shape — an inline export, a named declaration

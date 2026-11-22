@@ -81,7 +81,11 @@ fn why(code: Code) -> &'static str {
              inlined, and the emitted module would not load. The same holds for a re-export \
              (`export … from \"./x\"`, `export * from \"./x\"`): the emitted file writes one \
              import or none, so the statement names a module nothing resolves. This lifts when \
-             bundling lands. A default (`import runai from \"runai\"`) or namespace (`import * as \
+             bundling lands. A re-export whose source *is* `\"runai\"` is refused for a different \
+             reason — the statement is never emitted, so accepting it would drop the author's \
+             statement with no diagnostic — and the repair is `import { owner } from \
+             \"runai\"`, then use or export the written binding. A default (`import runai from \
+             \"runai\"`) or namespace (`import * as \
              runai from \"runai\"`) import of `\"runai\"` is refused because the island emitter \
              writes exactly one import, merging the route's named specifiers only; the repair is \
              to rewrite the declaration as named imports. And the CommonJS spellings TypeScript \
@@ -92,15 +96,18 @@ fn why(code: Code) -> &'static str {
              \
              The third family is a value the generated module genuinely cannot see, and it has \
              two members only. A `\"runai\"` name, or the route component's own name, used at \
-             module scope or in a `\"use static\"` route's markup is refused because the prerender \
-             module contains no imports and does not declare the component, so the repair is the \
+             module scope, in a component-body statement, or in a `\"use static\"` route's markup \
+             is refused because the prerender module contains no imports and does not declare the \
+             component, so the repair is the \
              directive, `\"use island\"`. The route's own parameter in a `\"use static\"` route is \
-             refused because `render()` takes no arguments, so `{props}` would be `undefined` at \
+             refused because `render()` takes no arguments, so `{props}` or `const x = props` \
+             would be `undefined` at \
              build time. A module-level declaration is deliberately **not** in this family: \
              module-scope statements are copied into the emitted module above the component (design \
              §7.6 expects module-level state — \"module-scope signals are per-island too, since \
              each island is its own module instance\"), so a module-level `const` the markup names \
-             is reachable. \
+             is reachable. A component-body statement's own local is not in this family either: \
+             the statement is copied into the component, so the local exists there. \
              \
              An attribute with an empty expression (`name={}`) is deliberately **not** on this \
              list: that is a parse error, reported as `RA007`, not valid syntax waiting for a later \

@@ -7,28 +7,30 @@
 //!
 //! # What is reachable, and why the list is short
 //!
-//! The emitters write [`RouteIr::module_statements`] above the component and
-//! [`RouteIr::statements`] inside it, so a name in the returned markup resolves
-//! if it is declared in either place. Design §7.6 expects module-level state —
-//! "module-scope signals are per-island too, since each island is its own module
-//! instance" — so a module-level `const title = "About"` referenced by
-//! `<h1>{title}</h1>` is **legal**, and round 3 of this task removed the earlier
-//! refusal that called it unreachable.
+//! The emitters write [`RouteIr::module_statements`] above the component,
+//! [`RouteIr::statements`] inside it, and the returned markup as its template, so
+//! a name resolves if it is declared in any of those. Design §7.6 expects
+//! module-level state — "module-scope signals are per-island too, since each
+//! island is its own module instance" — so a module-level `const title = "About"`
+//! referenced by `<h1>{title}</h1>` is **legal**, and round 3 of this task removed
+//! the earlier refusal that called it unreachable.
 //!
-//! Two scopes are walked, because the emitters write two: the returned markup
-//! and the file's **module level**. A module statement is emitted above the
-//! component, so a name it references has to exist in the emitted module too —
-//! and the prerender module has no imports and does not declare the component at
-//! all.
+//! **Three** scopes are walked, because the emitters write three: the returned
+//! markup, the component body's statements (the range before the JSX `return`,
+//! which both emitters copy verbatim), and the file's **module level**. A module
+//! statement is emitted above the component and a body statement inside it, so a
+//! name either one references has to exist in the emitted module too — and the
+//! prerender module has no imports and does not declare the component at all.
 //!
 //! Exactly four things stay refused:
 //!
-//! 1. **a `"runai"` name in a `"use static"` route**, whether the markup or a
-//!    module-level statement names it. The prerender module contains no imports
-//!    at all, so the name is not evaluable there. The repair is the directive,
-//!    `"use island"` — the same escape hatch `RA010` points at, because the page
-//!    genuinely needs a runtime. A reference that *is* a primitive call is left
-//!    to `RA010`, so one expression never gets two diagnostics.
+//! 1. **a `"runai"` name in a `"use static"` route**, whether the markup, a
+//!    body statement, or a module-level statement names it. The prerender module
+//!    contains no imports at all, so the name is not evaluable there. The repair
+//!    is the directive, `"use island"` — the same escape hatch `RA010` points at,
+//!    because the page genuinely needs a runtime. A reference that *is* a
+//!    primitive call is left to `RA010`, so one expression never gets two
+//!    diagnostics.
 //! 2. **the route's own parameter in a `"use static"` route.** `render()` takes
 //!    no arguments, so `{props}` would be `undefined` at build time. The repair
 //!    is not "move it": there is no props value to move.
@@ -52,6 +54,32 @@
 //! and is therefore reachable, which is the round-3 ruling this module follows.
 //!
 //! [`RouteIr::module_statements`]: crate::ir::RouteIr::module_statements
+//!
+//! # The third region: the component body
+//!
+//! The body is a third emitted region with a reachability question of its own.
+//! Both emitters copy the statements *before* the JSX `return` into the generated
+//! component — the range [`crate::ir::emitted_body_statements`] returns, and the
+//! same range [`RouteIr::statements`] slices to text — so a name those statements
+//! read has to exist in the emitted module exactly as a name the markup reads
+//! does. Before this walk existed the body was covered by neither other walk: the
+//! markup walk starts at the returned root, and the module walk skips the route
+//! component's own declaration.
+//!
+//! A body walk judges a reference with body locals **allowed**, using the same
+//! `contains(body, …)` test the markup walk uses. A local declared in the body is
+//! copied into the emitted component, so it is reachable; a reference to it from
+//! *outside* the body region is not, because a module statement or the markup
+//! cannot see the component's locals. Ordering and temporal-dead-zone inside the
+//! emitted function are JavaScript's rules, not this rule's: this walk asks only
+//! "does the name exist in the emitted module", which is the same question it asks
+//! at the other two scopes.
+//!
+//! That arm is currently **silence** either way (see [`EmittedScope::judge`]): the
+//! fall-through is permissive, so a body local produces no diagnostic whether the
+//! arm fires or not. It is kept as the statement of the rule, not as tested
+//! behaviour, and the tests that look like they pin it are recording a false
+//! positive that would appear if the fall-through ever stopped being permissive.
 //!
 //! # Scope: only a page, and only one that has a mode
 //!
@@ -81,7 +109,8 @@ use crate::ir::emitted_module_parts;
 use crate::source::Mode;
 
 /// `RA014` for every value the generated module cannot name: one walk of the
-/// returned markup, and a second of the file's module level.
+/// returned markup, one of the component body's emitted statements, and one of
+/// the file's module level.
 ///
 /// `bindings` is [`crate::analyze::signals::find_signal_bindings`]'s answer for
 /// the same program; only its [`SignalBindings::primitive_calls`] spans are read
@@ -149,7 +178,38 @@ pub fn check_reachable_expressions(
         );
     }
 
-    // (2) The module level. Every statement `RouteIr::module_statements` will
+    // (2) The component body's statements — the range before the JSX `return`,
+    // which both emitters copy into the generated component. A body local is
+    // therefore reachable here: the same `contains(body, …)` test the markup walk
+    // uses, because the statement that declares it is inside the copied range.
+    //
+    // The range is [`crate::ir::emitted_body_statements`], the one function that
+    // decides which body statements are emitted, so this walk cannot check a
+    // statement the module omits (after the `return`) nor skip one it carries.
+    if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
+        for statement in crate::ir::emitted_body_statements(body, return_span) {
+            let mut declared = References {
+                scoping,
+                references: Vec::new(),
+            };
+            declared.visit_statement(statement);
+            for reference in declared.references {
+                // A later statement's `const` is still inside the body region, so
+                // the test is the markup walk's: the declaration is copied into
+                // the emitted function, which is what makes the name exist. Order
+                // within the emitted function is JavaScript's business, not this
+                // rule's.
+                emitter.judge(
+                    mode,
+                    &reference,
+                    |declaration| contains((body.span.start, body.span.end), declaration),
+                    &mut diagnostics,
+                );
+            }
+        }
+    }
+
+    // (3) The module level. Every statement `RouteIr::module_statements` will
     // carry is evaluated in the emitted module, so a name it uses has the same
     // reachability question as the markup's.
     //
@@ -189,8 +249,27 @@ impl EmittedScope<'_, '_> {
     /// not have.
     ///
     /// `inside_emitted_function` answers "is this declaration copied into the
-    /// emitted component?" — the markup walk passes the route body's span, the
-    /// module walk answers `false` because no module statement declares it.
+    /// emitted component?" — the markup walk and the body walk pass the route
+    /// body's span, the module walk answers `false` because no module statement
+    /// declares it.
+    ///
+    /// # This predicate is not currently load-bearing, and that is recorded
+    ///
+    /// The last arm is **silence**, so a reference to a body local ends exactly
+    /// the same whether this predicate returns `true` or the code falls through:
+    /// it is not a `"runai"` name, not the parameter, and not the component, so
+    /// nothing is pushed. Deleting the arm (the `contains(body, …)` call) leaves
+    /// every test green — verified by mutation, twice, on both walks.
+    ///
+    /// It is kept because it states the rule the walk implements ("a body local
+    /// is emitted; a module value is emitted; a `"runai"` name is not"), and
+    /// because the arm becomes load-bearing the moment the fall-through stops
+    /// being permissive. The day a later task refuses something at this
+    /// fall-through — say a name that is neither a module statement nor a body
+    /// local — the arm is what keeps `const title = …; return <h1>{title}</h1>`
+    /// from becoming a false positive. Recorded rather than deleted so the next
+    /// reader does not re-derive it, and so nobody mistakes the tests for proof
+    /// that the arm fires.
     fn judge(
         &self,
         mode: Mode,
@@ -714,6 +793,144 @@ mod tests {
         for src in [
             "\"use static\"\nexport * from \"./data\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
             "\"use static\"\nexport { team } from \"./data\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+        ] {
+            assert!(codes(src, Mode::Static).is_empty(), "{src}");
+        }
+    }
+
+    // --- Fix round 4: the component body is the third emitted region ----------
+
+    /// The body statements are copied into the generated component, so a name
+    /// they read has the same reachability question as one the markup reads. A
+    /// `"runai"` value in a **static** route's body is a `ReferenceError` in the
+    /// prerender module, which has no imports at all — the same defect as the
+    /// markup case, one region over, and it was walked by neither other walk
+    /// (the markup walk starts at the root, and the module walk skips the route
+    /// declaration).
+    #[test]
+    fn a_runai_value_in_the_body_is_refused_when_static() {
+        let src = "\"use static\"\nimport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { const o = owner; return <p>hi</p> }\n";
+        let diagnostics = diagnostics(src, Mode::Static);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Change line 1 to \"use island\""),
+            "the repair is the directive: {diagnostics:?}"
+        );
+        let span = diagnostics[0].span;
+        assert_eq!(
+            &src[span.0 as usize..span.1 as usize],
+            "owner",
+            "the refusal names the reference, not the statement: {diagnostics:?}"
+        );
+
+        // The island module writes the import, so the very same statement is
+        // fine there: the client emitter's import makes `owner` a name.
+        assert!(
+            codes(src, Mode::Island).is_empty(),
+            "an island imports the name the body statement reads"
+        );
+
+        // A statement *after* the JSX `return` is unreachable code and is never
+        // emitted, so a reference there is not a `ReferenceError`. This is the
+        // boundary between "walk the body" and "walk the emitted statements": the
+        // range stops at the return, exactly as `RouteIr::statements` does.
+        let after_return = "\"use static\"\nimport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>hi</p>; const later = owner }\n";
+        assert!(
+            codes(after_return, Mode::Static).is_empty(),
+            "a statement after the return is not emitted, so it names nothing"
+        );
+    }
+
+    /// `const x = props` in a **static** body is a distinct sub-case of the
+    /// parameter rule: `props` *is* resolved (to the route parameter), so the
+    /// "unresolved names are built-ins" boundary does not cover it. `render()`
+    /// takes no arguments, so the value would be `undefined` at build time.
+    #[test]
+    fn the_route_parameter_in_the_body_is_refused_when_static() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { const x = props; return <p>hi</p> }\n";
+        let diagnostics = diagnostics(src, Mode::Static);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("route's parameter"),
+            "the parameter rule owns this, not the unresolved boundary: {diagnostics:?}"
+        );
+
+        assert!(
+            codes(src, Mode::Island).is_empty(),
+            "an island declares `function P(props)`"
+        );
+    }
+
+    /// The body walk judges a body local by the same `contains(body, …)` test the
+    /// markup walk uses, so `const title = …; return <h1>{title}</h1>` stays clean
+    /// — and a body statement reading an **earlier** body local is clean too. Both
+    /// directions are asserted, because the cheap wrong fix (refusing every body
+    /// reference that is not the module level) passes the refusal tests and fails
+    /// these.
+    #[test]
+    fn a_body_local_is_reachable_from_the_body_and_from_the_markup() {
+        for src in [
+            // The reviewer's false-positive case: a body local read by the markup.
+            "\"use static\"\nexport default function P(props: Record<never, never>) { const title = \"About\"; return <h1>{title}</h1> }\n",
+            // A body statement reading an earlier body local.
+            "\"use static\"\nexport default function P(props: Record<never, never>) { const a = 1; const b = a + 1; return <p>{b}</p> }\n",
+            // A body-local function with its own parameter, called from the body.
+            "\"use static\"\nexport default function P(props: Record<never, never>) { const twice = (n: number) => n * 2; const v = twice(2); return <p>{v}</p> }\n",
+        ] {
+            for mode in [Mode::Static, Mode::Island] {
+                assert!(codes(src, mode).is_empty(), "{mode:?}: {src}");
+            }
+        }
+    }
+
+    /// The third walk must not refuse the body of a **concise arrow** route: there
+    /// are no body statements, only the returned expression, which the markup walk
+    /// already owns. The control is the same concise shape naming the parameter,
+    /// which is refused — so this is not passing because nothing is walked.
+    #[test]
+    fn a_concise_arrow_body_has_no_statements_for_the_third_walk() {
+        let clean = "\"use static\"\nimport { owner } from \"runai\"\nexport default (props: Record<never, never>) => <p>{String(1)}</p>\n";
+        assert!(codes(clean, Mode::Static).is_empty(), "{clean}");
+
+        let refused =
+            "\"use static\"\nexport default (props: Record<never, never>) => <p>{props}</p>\n";
+        assert_eq!(codes(refused, Mode::Static), vec![Code::RA014]);
+    }
+
+    /// A **module-level function that is never called** and names a `"runai"`
+    /// value is still refused: the statement is emitted into the module, so the
+    /// reference is a `ReferenceError` at load whether or not anything calls it.
+    /// This pins the indirect case, which held by construction before it had a
+    /// fixture.
+    #[test]
+    fn an_uncalled_module_function_that_names_a_runai_value_is_refused() {
+        let src = "\"use static\"\nimport { owner } from \"runai\"\nfunction helper() { return owner }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let diagnostics = diagnostics(src, Mode::Static);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Change line 1 to \"use island\""),
+            "the module statement is emitted, so its body is in the module: {diagnostics:?}"
+        );
+
+        assert!(
+            codes(src, Mode::Island).is_empty(),
+            "an island imports `owner`, so the helper resolves"
+        );
+    }
+
+    /// A `"runai"` re-export is silent here: `entry.rs`'s import rule owns the
+    /// statement, in every mode, and `module_statements` excludes it, so one root
+    /// cause is one row and this walk reports nothing at a statement the emitted
+    /// module never carries.
+    #[test]
+    fn a_runai_reexport_is_left_to_the_import_rule() {
+        for src in [
+            "\"use static\"\nexport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+            "\"use static\"\nexport * from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
         ] {
             assert!(codes(src, Mode::Static).is_empty(), "{src}");
         }

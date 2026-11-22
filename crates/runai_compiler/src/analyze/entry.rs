@@ -10,10 +10,10 @@
 //!    the import rule, and [`check_signal_rules`];
 //! 4. for a `"use static"` page: [`check_static_mode`];
 //! 5. for a page whose mode is known: [`check_reachable_expressions`], so every
-//!    plain expression the markup evaluates names something the generated module
-//!    actually has — a `"runai"` import in a static route or the route's own
-//!    parameter in a static route are the two refusals; a module-level value is
-//!    emitted by `RouteIr::module_statements` and is therefore reachable.
+//!    plain expression the markup, a body statement, or a module-level statement
+//!    evaluates names something the generated module actually has — a `"runai"`
+//!    import or the route's own parameter in a static route are the refusals; a
+//!    module-level value and a body local are emitted and therefore reachable.
 //!
 //! A file whose name starts with `_` is **never** a page. `_shell.tsx` is a
 //! component module: it owes the props, JSX, import, and signal checks, but no
@@ -171,12 +171,16 @@ fn is_page(path: &str) -> bool {
 ///   named imports; "move it into the component body" would be a syntax error,
 ///   which is why this declaration is refused here rather than left to the
 ///   reference rule;
-/// - **a re-export** — `export … from "./x"`, `export * from "./x"`, whose
-///   source is not `"runai"`. The emitted module writes one import (the island's,
-///   from the runtime URL) or none, so the re-export names a module nothing
-///   resolves. A route file has nothing legitimate to re-export in this
-///   milestone: it emits one component, and [`crate::ir::module_statements`]
-///   excludes re-exports for the same reason.
+/// - **a re-export** — `export … from "./x"`, `export * from "./x"`. The emitted
+///   module writes one import (the island's, from the runtime URL) or none, so
+///   the re-export names a module nothing resolves. A route file has nothing
+///   legitimate to re-export in this milestone: it emits one component, and
+///   [`crate::ir::module_statements`] excludes re-exports for the same reason.
+///   **A `"runai"` source is refused too**, and not because of the bundler: the
+///   statement is still excluded from the artifact, so accepting it would drop
+///   the author's statement with no diagnostic. The repair names the form an
+///   island can write — `import { owner } from "runai"`, then use or export the
+///   written binding.
 ///
 /// **The two CommonJS spellings TypeScript allows are refused too**, because
 /// [`crate::strip::strip_types`] rewrites them into JavaScript that a `.mjs`
@@ -265,29 +269,50 @@ fn check_import(
     ))
 }
 
-/// `RA014` for a re-export of a module other than `"runai"`, or `None`.
+/// `RA014` for a re-export, or `None` only for the type-only spellings.
 ///
 /// The emitted module writes one import (the island's, from the runtime URL) or
 /// none, so a re-export names a module nothing resolves — the same defect the
 /// import rule exists for, one export out. The repair is to inline the value,
 /// not to move the statement: nothing declares it in this file.
+///
+/// **This includes a `"runai"` source.** `export { owner } from "runai"` is
+/// excluded from `module_statements` (an emitted module writes one import or
+/// none), so if it were also accepted here the author's statement would vanish
+/// from the artifact with no diagnostic — silent data loss, which is worse than
+/// a wrong render. The message names the legal rewrite, which an island can
+/// actually perform: `import { owner } from "runai"` and then use or export the
+/// written binding. `export * from "runai"` has no specifier list an emitter
+/// could write, so the same refusal applies.
+///
+/// The repair therefore differs by source: a foreign module's value has to be
+/// written here, while a `"runai"` value is imported here and used or exported
+/// from the written binding. No repair says "move the statement", which is not
+/// something either emitter can do.
 fn check_reexport(module: &oxc_ast::ast::StringLiteral<'_>, source: &str) -> Option<Diagnostic> {
-    if module.value.as_str() == Some(PRIMITIVE_SOURCE) {
-        // The brief's boundary: a `"runai"` re-export is not the bundler family.
-        // It is still excluded from `module_statements` (an emitted module
-        // writes none), so nothing is re-exported; a route file's exports have no
-        // consumer in this milestone, so that is inert rather than a load error.
-        return None;
-    }
     let written =
         raw_text(source, module.span).unwrap_or_else(|| module.value.as_str().unwrap_or(""));
+    // Two different reasons, so the message does not tell an agent the wrong one:
+    // a foreign module has no bundler, while a `"runai"` re-export is a statement
+    // the emitter simply never writes — so its defect is silent loss, not an
+    // unresolvable module.
+    let reason = if module.value.as_str() == Some(PRIMITIVE_SOURCE) {
+        format!(
+            "cannot re-export from {written} yet: the generated module writes its own imports and \
+             never a re-export, so this statement would be dropped with no trace."
+        )
+    } else {
+        format!(
+            "cannot re-export from {written} yet: this milestone has no bundler, and a route \
+             file is emitted from its own text with no re-export."
+        )
+    };
     Some(Diagnostic::new(
         Code::RA014,
         (module.span.start, module.span.end),
         format!(
-            "cannot re-export from {written} yet: this milestone has no bundler, and a route \
-             file is emitted from its own text with no re-export. Write the value in this file, \
-             or import it from `\"{PRIMITIVE_SOURCE}\"` and use it here."
+            "{reason} Write the value in this file, or import it from `\"{PRIMITIVE_SOURCE}\"` and \
+             use or export the written binding here."
         ),
     ))
 }
@@ -388,8 +413,10 @@ fn unwritable_runai_import(
 /// module the emitted file would have to resolve — and reporting the inline form
 /// would demand a rewrite that fixes nothing.
 ///
-/// `specifier_kinds` is a closure rather than a slice so the same rule serves the
-/// two node types without either owing the other a conversion.
+/// `specifier_kinds` is the slice of each specifier's own `export_kind`; a slice
+/// rather than a closure because the caller has the specifiers in hand and the
+/// two node shapes differ only in where they store the kind, not in how the rule
+/// is decided.
 fn is_type_only_reexport(
     declaration_kind: ImportOrExportKind,
     specifier_kinds: &[ImportOrExportKind],
@@ -700,6 +727,168 @@ mod tests {
                 .module_statements
                 .contains("export { helper }"),
             "a local re-export is emitted"
+        );
+    }
+
+    /// A `"runai"` re-export used to be **silently dropped**: `check_reexport`
+    /// returned early for `PRIMITIVE_SOURCE`, and
+    /// `is_emitter_owned_statement` excludes every re-export, so the author wrote
+    /// a statement, the artifact had nothing, and no diagnostic said so. Silent
+    /// data loss is worse than a wrong render, so the `"runai"` source now gets
+    /// the same `RA014` the foreign case gets. The message's repair is legal for
+    /// an island: `import { owner } from "runai"`, then use or export the written
+    /// binding.
+    #[test]
+    fn a_reexport_of_runai_is_refused_and_never_emitted() {
+        for statement in [
+            "export { owner } from \"runai\"",
+            "export * from \"runai\"",
+            "export * as ns from \"runai\"",
+        ] {
+            for directive in ["\"use static\"", "\"use island\""] {
+                let src = format!(
+                    "{directive}\n{statement}\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+                );
+                let d = analyze(&src, "src/routes/index.page.tsx");
+                assert_eq!(
+                    codes(&d),
+                    vec![Code::RA014],
+                    "{statement} ({directive}): one row, in both modes: {d:?}"
+                );
+                assert_eq!(d[0].line, 2, "{statement}: the statement is the site");
+                assert!(
+                    d[0].message.contains("re-export"),
+                    "{statement}: the message must name the re-export: {d:?}"
+                );
+                assert!(
+                    d[0].message.contains("never a re-export"),
+                    "{statement}: a `\"runai\"` re-export is refused for silent loss, not for the \
+                     missing bundler: {d:?}"
+                );
+                assert!(
+                    !d[0].message.contains("no bundler"),
+                    "{statement}: the bundler reason would be false here: {d:?}"
+                );
+                assert!(
+                    d[0].message.contains("import it from `\"runai\"`"),
+                    "{statement}: the repair is the named-import rewrite: {d:?}"
+                );
+
+                // The statement is still excluded from the artifact — that is the
+                // half that made silence data loss, so it is asserted here.
+                let route = lower_route(&src).expect("the analyzer is the gate, not lowering");
+                assert_eq!(
+                    route.module_statements, "",
+                    "{statement}: a re-export is never emitted: {:?}",
+                    route.module_statements
+                );
+            }
+        }
+    }
+
+    /// The indirect module case: a module-level function that is **never called**
+    /// and names a `"runai"` value. The statement is emitted into the module, so
+    /// the reference is a `ReferenceError` at load regardless of any call — it
+    /// held by construction before this fixture, and is pinned now.
+    #[test]
+    fn an_uncalled_module_function_naming_a_runai_value_is_ra014() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nimport {{ owner }} from \"runai\"\nfunction helper() {{ return owner }}\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            )
+        };
+
+        let d = analyze(&src("\"use static\""), "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert_eq!(d[0].line, 3, "the reference in the helper: {d:?}");
+        assert!(
+            d[0].message.contains("Change line 1 to \"use island\""),
+            "the repair is the directive: {d:?}"
+        );
+
+        assert!(
+            analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "an island imports `owner`, so the uncalled helper resolves"
+        );
+    }
+
+    /// The component **body** is the third emitted region, end to end. A body
+    /// statement naming a `"runai"` value or the route parameter used to be
+    /// accepted by `check` and copied verbatim into `statements`, which is a
+    /// `ReferenceError` at Task 10's render. Both are refused now; the island half
+    /// of the `"runai"` case is clean, and a body local is clean in both modes.
+    #[test]
+    fn a_body_statement_naming_a_refused_value_is_ra014() {
+        let runai = |directive: &str| {
+            format!(
+                "{directive}\nimport {{ owner }} from \"runai\"\nexport default function P(props: Record<never, never>) {{ const o = owner; return <p>hi</p> }}\n"
+            )
+        };
+        let d = analyze(&runai("\"use static\""), "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert_eq!(d[0].line, 3, "{d:?}");
+        assert!(
+            d[0].message.contains("Change line 1 to \"use island\""),
+            "{d:?}"
+        );
+        assert!(
+            lower_route(&runai("\"use static\""))
+                .unwrap()
+                .statements
+                .contains("const o = owner"),
+            "the statement the diagnostic names is the one the component carries"
+        );
+        assert!(
+            analyze(&runai("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "an island writes the import the body statement reads"
+        );
+
+        let parameter = "\"use static\"\nexport default function P(props: Record<never, never>) { const x = props; return <p>hi</p> }\n";
+        let d = analyze(parameter, "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert!(
+            d[0].message.contains("route's parameter"),
+            "a static body's `props` is the parameter rule: {d:?}"
+        );
+        assert!(
+            analyze(
+                &parameter.replace("\"use static\"", "\"use island\""),
+                "src/routes/index.page.tsx"
+            )
+            .is_empty(),
+            "an island declares the parameter"
+        );
+    }
+
+    /// N4: a **concise arrow** route plus a module-level value, through `analyze`
+    /// — the pair the body walk must not confuse. The concise body has no
+    /// statements, so the third walk visits nothing; the module-level value is
+    /// emitted, so the markup may name it. The `{props}` control proves the
+    /// fixture is not clean because nothing is walked.
+    #[test]
+    fn a_concise_arrow_route_may_name_a_module_level_value_end_to_end() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nconst title = \"About\"\nexport default (props: Record<never, never>) => <p>{{title}}</p>\n"
+            )
+        };
+        for directive in ["\"use static\"", "\"use island\""] {
+            let d = analyze(&src(directive), "src/routes/about.page.tsx");
+            assert!(
+                d.is_empty(),
+                "a module-level value is emitted, so the concise body may name it: {d:?}"
+            );
+            let route = lower_route(&src(directive)).expect("a concise route lowers");
+            assert_eq!(route.statements, "", "a concise body has no statements");
+            assert!(route.module_statements.contains("const title"));
+        }
+
+        let control =
+            "\"use static\"\nexport default (props: Record<never, never>) => <p>{props}</p>\n";
+        assert_eq!(
+            codes(&analyze(control, "src/routes/about.page.tsx")),
+            vec![Code::RA014],
+            "the concise body is walked"
         );
     }
 

@@ -182,12 +182,16 @@ impl Code {
                  form the client module emits, and `import x = require(…)` or `export =` is \
                  rewritten by type stripping into `require`/`module.exports`, which an ES module \
                  does not have — each route is emitted from its own file, so a second module \
-                 cannot be resolved or inlined. And a value the generated module cannot see — a \
-                 `\"runai\"` name or the route component's own name at module scope or in a \
+                 cannot be resolved or inlined. A re-export is refused even when its source is \
+                 `\"runai\"`, because the emitted module never carries one, so accepting it would \
+                 drop the statement silently. And a value the generated module cannot see — a \
+                 `\"runai\"` name or the route component's own name at module scope, in a \
+                 component-body statement, or in a \
                  `\"use static\"` route's markup, whose prerender module has no imports and does \
                  not declare the component, or the route's own parameter there, which the \
                  prerender call supplies with nothing. A module-level declaration is *not* in \
-                 this family: module-scope statements are emitted above the component."
+                 this family: module-scope statements are emitted above the component. Neither is \
+                 a component-body statement's own local, which is emitted inside the component."
             }
         }
     }
@@ -244,11 +248,14 @@ impl Code {
             }
             Code::RA014 => {
                 "For an import or re-export, inline the value or import it from `\"runai\"`; a \
+                 re-export whose source is `\"runai\"` becomes `import { owner } from \"runai\"` \
+                 with the name used or exported here; a \
                  default or namespace `\"runai\"` import is not a form the emitted module writes, \
                  so rewrite it as named imports; write `import x = require(…)` as an `import`, and \
                  `export =` as `export default` or a named export. For a value the generated \
                  module cannot see — a `\"runai\"` name, or the route's own component, at module \
-                 scope or in a `\"use static\"` route's markup, or the route's own parameter in a \
+                 scope, in a component-body statement, or in a `\"use static\"` route's markup, or \
+                 the route's own parameter in a \
                  `\"use static\"` route — do what the message names: change line 1 to \
                  `\"use island\"` for the first two, and remove the reference or write the value in \
                  the component body for the parameter. For a JSX construct, write the spread out, \
