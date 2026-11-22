@@ -1122,17 +1122,82 @@ git commit -m "feat(compiler): enforce static-route purity with RA010 and add an
 
 ### Task 10: Prerender codegen
 
+This is the first task that produces an artifact, so it is also the first task where
+"the analyzer accepted it" and "the artifact can hold it" have to be the same
+statement. Seven things the current pipeline accepts would be dropped, duplicated,
+or would crash on the way into a prerender module; each is closed here rather than in
+a later review. They are listed in Step 3, and every one was reproduced by execution
+before this text was written.
+
 **Files:**
 - Create: `crates/runai_compiler/src/codegen/mod.rs`, `crates/runai_compiler/src/codegen/prerender.rs`
+- Create: `crates/runai_compiler/src/analyze/emitted_names.rs`
+- Modify: `crates/runai_compiler/src/lib.rs` (add `pub mod codegen;`)
+- Modify: `crates/runai_compiler/src/analyze/mod.rs` (wire `emitted_names`)
+- Modify: `crates/runai_compiler/src/analyze/entry.rs` (call the new rule)
+- Modify: `crates/runai_compiler/src/analyze/jsx.rs` (void-element children, duplicate attributes, early return)
+- Modify: `crates/runai_compiler/src/analyze/component.rs` (async/generator route components)
+- Modify: `crates/runai_compiler/src/strip.rs` (the enum panic)
+- Modify: `crates/runai_compiler/src/ir.rs` (the reserved-name lists)
 
 **Interfaces:**
-- Consumes: `RouteIr`, `IrNode`.
+- Consumes: `RouteIr`, `IrNode`, `Binding`, `Mode`, `analyze`, `Diagnostic`.
 - Produces:
-  - `pub(crate) fn emit_prerender(route: &RouteIr) -> String`. A self-contained ESM module exporting `render(): string`, with **no imports at all**. It defines an inline `_esc` HTML-escaping helper, runs the route's `statements`, and returns a template literal. `pub(crate)` because only `emit_prerender_checked` is public: a caller cannot lower without gating on `analyze`.
-  - `pub fn template_literal_body(node: &IrNode) -> String`. The HTML as the body of a JS template literal. Literal parts are escaped for template literals (`` ` ``, `\`, and `${`), and each `Expr` becomes `${_esc(<expr>)}`.
-  - `pub fn emit_prerender_checked(source: &str, path: &str) -> Result<String, Vec<Diagnostic>>`, in `codegen/mod.rs`. It calls `analyze`, refuses on any error, then lowers and emits.
+  - `pub(crate) fn emit_prerender(route: &RouteIr) -> String`. A self-contained ESM module exporting `render(): string`, with **no imports at all**. It writes `module_statements` at module scope, then the escaping helpers, then `render()`, which runs `statements` and returns one template literal. `pub(crate)` because only `emit_prerender_checked` is public: a caller cannot lower without gating on `analyze`.
+  - `pub fn template_literal_body(node: &IrNode) -> String`. The HTML as the body of a JS template literal. Literal text escapes `` ` ``, `\`, and `${`; each `Expr` becomes `${_esc(<expr>)}`; each `Binding::Attr` becomes `${_attr("<name>", <expr>)}`. Static attributes are written inline.
+  - `pub fn emit_prerender_checked(source: &str, path: &str) -> Result<String, Vec<Diagnostic>>`, in `codegen/mod.rs`. It calls `analyze`, refuses on any error, then lowers and emits. It also refuses a route whose mode is not `Static`: a `"use island"` page is `emit_client_checked`'s, and a prerender module for it would carry signals into a file with no runtime.
 
-- [ ] **Step 1: Write the failing tests**
+**Emitted shape** (pinned; `_attr` is new in this task and is the reason a dynamic attribute survives):
+
+```js
+const _esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c])
+const _attr = (name, v) => (v == null || v === false ? "" : ` ${name}="${v === true ? "" : _esc(v)}"`)
+<module_statements>
+export function render() {
+<statements>
+  return `<template_literal_body>`
+}
+```
+
+`_attr` reproduces `_setAttr`'s documented policy — `null`, `undefined`, and `false`
+write no attribute at all, `true` writes the bare attribute (`disabled`), and `0` and
+`""` are real values — so one source renders the same attribute in both modes. It
+builds the whole ` name="value"` segment because a template literal cannot omit an
+attribute conditionally, and the segment is the only spelling that keeps `null`
+out of the output.
+
+**No `import` anywhere in this module, including `"runai"`.** That is why
+`analyze` refuses a `"runai"` name in a static route; the constraint is not cosmetic.
+
+- [ ] **Step 0: Fix the `enum` panic in `strip_types` (RED first)**
+
+A TypeScript `enum` in a route file panics the transformer:
+
+```text
+Transformer requires `Scoping` produced with `SemanticBuilder::with_enum_eval(true)`
+to correctly transform `enum E`.
+```
+
+The panic is in `oxc_transformer`, is reachable through `lower_route`, and
+`analyze` reports **nothing** for that file — so `runai check` would say clean and
+the emitter would abort the process. Write the failing test first:
+
+```rust
+// crates/runai_compiler/src/strip.rs (tests)
+#[test]
+fn an_enum_is_stripped_instead_of_panicking() {
+    let stripped = strip_types("\"use island\"\nenum E { A }\nexport default function P() { return <p>{E.A}</p> }\n").unwrap();
+    assert!(!stripped.contains("enum E"), "{stripped}");
+    assert!(stripped.contains("E.A"), "{stripped}");
+}
+```
+
+Then add `.with_enum_eval(true)` to the `SemanticBuilder` in `strip_types` and say
+why in the comment: the TypeScript transform evaluates enums, and without the flag
+it panics rather than returning a diagnostic. `strip_types`'s contract is
+`Result<_, Vec<Diagnostic>>`; a panic there breaks it.
+
+- [ ] **Step 1: Write the failing emitter tests**
 
 ```rust
 // crates/runai_compiler/src/codegen/prerender.rs (tests)
@@ -1141,13 +1206,21 @@ mod tests {
     use super::*;
     use crate::ir::lower_route;
 
+    /// Every emitted module must parse as ESM. A test that only greps for a
+    /// substring cannot tell an artifact from a syntax error.
+    fn assert_parses(js: &str) {
+        let alloc = oxc_allocator::Allocator::default();
+        let ret = oxc_parser::Parser::new(&alloc, js, oxc_span::SourceType::mjs()).parse();
+        assert!(ret.diagnostics.is_empty(), "emitted code must parse: {js}\n{:?}", ret.diagnostics);
+    }
+
     #[test]
     fn emits_no_imports_for_static_route() {
         let src = "\"use static\"\nexport default function P() { return <div class=\"a\">hi</div> }\n";
-        let route = lower_route(src).unwrap();
-        let js = emit_prerender(&route);
+        let js = emit_prerender(&lower_route(src).unwrap());
         assert!(!js.contains("import"), "static output must not import: {js}");
-        assert!(js.contains("export"));
+        assert!(js.contains("export function render()"));
+        assert_parses(&js);
     }
 
     fn body(src: &str) -> String {
@@ -1174,6 +1247,12 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_attribute_is_written_bare() {
+        let src = "\"use static\"\nexport default function P() { return <input disabled/> }\n";
+        assert_eq!(body(src), "<input disabled>");
+    }
+
+    #[test]
     fn a_double_quote_in_a_single_quoted_attribute_is_escaped() {
         let src = "\"use static\"\nexport default function P() { return <p title='say \"hi\"'>x</p> }\n";
         assert_eq!(body(src), "<p title=\"say &quot;hi&quot;\">x</p>");
@@ -1185,51 +1264,259 @@ mod tests {
         let js = emit_prerender(&lower_route(src).unwrap());
         assert!(js.contains("${_esc(name)}"), "{js}");
         assert!(js.contains("const name = \"<Ada>\""), "{js}");
+        assert_parses(&js);
     }
 
     #[test]
-    fn backticks_in_text_cannot_break_the_template_literal() {
-        let src = "\"use static\"\nexport default function P() { return <p>a ` b ${c}</p> }\n";
+    fn a_dynamic_attribute_survives_as_an_attribute() {
+        let src = "\"use static\"\nexport default function P() { const cls = \"a\"; return <p class={cls}>hi</p> }\n";
+        let html = body(src);
+        assert_eq!(html, "<p${_attr(\"class\", cls)}>hi</p>");
         let js = emit_prerender(&lower_route(src).unwrap());
-        let alloc = oxc_allocator::Allocator::default();
-        let ret = oxc_parser::Parser::new(&alloc, &js, oxc_span::SourceType::mjs()).parse();
-        assert!(ret.diagnostics.is_empty(), "{js}");
+        assert!(js.contains("const _attr ="), "{js}");
+        assert_parses(&js);
+    }
+
+    #[test]
+    fn module_statements_are_written_above_render_and_body_statements_inside() {
+        let src = "\"use static\"\nconst title = \"About\"\nexport default function P() { const upper = title; return <h1>{upper}</h1> }\n";
+        let js = emit_prerender(&lower_route(src).unwrap());
+        let module = js.find("const title = \"About\"").expect("module statement written");
+        let render = js.find("export function render()").expect("render written");
+        let inner = js.find("const upper = title").expect("body statement written");
+        assert!(module < render, "module statements go above render(): {js}");
+        assert!(render < inner, "body statements go inside render(): {js}");
+        assert_parses(&js);
+    }
+
+    #[test]
+    fn a_backtick_or_backslash_in_text_cannot_break_the_template_literal() {
+        // A `$` followed by `{` cannot occur in JSX *text* (the `{` starts an
+        // expression), but a backtick and a backslash can, and both are literal
+        // characters of the template literal's body.
+        let src = "\"use static\"\nexport default function P() { return <p>a ` b \\ c</p> }\n";
+        let js = emit_prerender(&lower_route(src).unwrap());
+        assert_parses(&js);
+        assert!(js.contains("a \\` b \\\\ c"), "both escaped: {js}");
+    }
+
+    #[test]
+    fn a_placeholder_in_a_static_attribute_is_escaped_not_interpolated() {
+        // A `$` + `{` pair IS reachable in a quoted attribute value, and a raw copy would
+        // interpolate `x` when the template literal is evaluated — a
+        // ReferenceError at build time, or a silently wrong attribute, with no
+        // diagnostic. Attribute values are literal text too.
+        let src = "\"use static\"\nexport default function P() { return <p title=\"${x}\">hi</p> }\n";
+        let js = emit_prerender(&lower_route(src).unwrap());
+        assert_parses(&js);
+        assert!(js.contains("\\${x}"), "the placeholder must be escaped: {js}");
+    }
+
+    #[test]
+    fn the_declared_helpers_are_exactly_the_reserved_names() {
+        // The emitter and the refusal rule share one list, so a helper added
+        // without a rule (or a rule for a helper that no longer exists) fails
+        // here rather than shipping a shadowing hole.
+        let js = emit_prerender(&lower_route("\"use static\"\nexport default function P() { return <p>hi</p> }\n").unwrap());
+        for name in crate::ir::PRERENDER_NAMES {
+            assert!(js.contains(name), "reserved name `{name}` is not emitted: {js}");
+        }
+        for helper in ["_esc", "_attr", "render"] {
+            assert!(crate::ir::PRERENDER_NAMES.contains(&helper), "`{helper}` is emitted but not reserved");
+        }
     }
 }
 ```
 
 The real escaping of `<Ada>` to `&lt;Ada&gt;` is asserted end to end in Task 13, where the module actually runs.
 
-- [ ] **Step 2: Run and verify failure**
+- [ ] **Step 2: Write the failing refusal tests**
 
-Run: `cargo test -p runai_compiler prerender`
-Expected: FAIL — `emit_prerender` not found.
+Each of these is an accept-then-reject today. Write them in the module that owns the
+rule, run them, and watch each fail for the stated reason.
 
-- [ ] **Step 3: Implement**
+```rust
+// crates/runai_compiler/src/analyze/jsx.rs (tests)
 
-`template_literal_body` writes tags with their attributes in source order, separated by single spaces, and quotes every value with `"`. Entities in values and text are never decoded or re-encoded. The one change: a literal `"` inside a value that was single-quoted in the source becomes `&quot;`, so the output stays valid HTML. Void elements (`area base br col embed hr img input link meta source track wbr`) get no closing tag.
+#[test]
+fn a_void_element_with_children_is_ra014() {
+    let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p><br>x</br></p> }\n";
+    let d = check_jsx(&crate::source::parse_tsx(&oxc_allocator::Allocator::default(), src).unwrap(), src);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].code, Code::RA014);
+    assert!(d[0].message.contains("void"), "{}", d[0].message);
+}
 
-`emit_prerender` returns:
+#[test]
+fn a_duplicate_attribute_is_ra014() {
+    let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div class=\"a\" class=\"b\">x</div> }\n";
+    // ... same shape; message names the duplicated attribute (`class`).
+}
 
-```js
-const _esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c])
-export function render() {
-  <statements>
-  return `<template_literal_body>`
+#[test]
+fn an_early_non_jsx_return_is_ra014() {
+    let src = "\"use static\"\nexport default function P(props: Record<never, never>) { const on = false; if (on) return null; return <p>hi</p> }\n";
+    // ... same shape; message says render() returns one string.
+}
+
+// crates/runai_compiler/src/analyze/component.rs (tests)
+
+#[test]
+fn an_async_route_component_is_ra014() {
+    let src = "\"use island\"\nexport default async function P(props: Record<never, never>) { return <p>hi</p> }\n";
+    // ... RA014; message says both modes call the component synchronously.
+}
+
+#[test]
+fn a_generator_route_component_is_ra014() {
+    let src = "\"use island\"\nexport default function* P(props: Record<never, never>) { yield 1; return <p>hi</p> }\n";
+    // ... RA014.
+}
+
+// crates/runai_compiler/src/analyze/emitted_names.rs (tests)
+
+#[test]
+fn a_module_declaration_named_render_is_ra014() {
+    let src = "\"use static\"\nconst render = 1\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+    let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+    assert_eq!(d[0].code, Code::RA014);
+    assert!(d[0].message.contains("render"), "{}", d[0].message);
+}
+
+#[test]
+fn an_export_alias_named_render_is_ra014() {
+    let src = "\"use static\"\nconst x = 1\nexport { x as render }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+    // ... RA014: the module would export `render` twice.
+}
+
+#[test]
+fn a_body_binding_named_esc_is_ra014() {
+    let src = "\"use static\"\nexport default function P(props: Record<never, never>) { const _esc = (v: string) => \"no\"; const name = \"<Ada>\"; return <p>{name}</p> }\n";
+    // ... RA014: the body binding would shadow the escaper the template calls.
+}
+
+#[test]
+fn a_reference_to_a_reserved_name_is_ra014() {
+    let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{_esc(\"x\")}</p> }\n";
+    // ... RA014, and NOT a silent `${_esc(_esc)}`: an undeclared name must not
+    // resolve to the compiler's own helper.
+}
+
+#[test]
+fn a_type_alias_named_render_is_allowed() {
+    // The false positive this rule must never make: `strip_types` erases it, so
+    // nothing is emitted under that name. Same lesson as `RA014` refusing a type
+    // in a value position (Task 9, review round 2).
+    let src = "\"use static\"\ntype render = 1\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+    assert!(crate::analyze::analyze(src, "src/routes/about.page.tsx").is_empty());
+}
+
+#[test]
+fn a_member_property_named_render_is_allowed() {
+    let src = "\"use static\"\nconst o = { render: \"x\" }\nexport default function P(props: Record<never, never>) { return <p>{o.render}</p> }\n";
+    // A property name is not a binding. Refusing it would reject an ordinary page.
 }
 ```
 
-It must contain no `import`. RA010 has already guaranteed that `statements` holds no primitives or handlers.
+- [ ] **Step 3: Implement**
+
+**`codegen/prerender.rs`.** `template_literal_body` writes tags with their attributes
+in source order, separated by single spaces, and quotes every static value with `"`.
+Entities in values and text are never decoded or re-encoded. Three changes on the way
+out: a literal `"` inside a value that was single-quoted in the source becomes
+`&quot;`; every literal chunk — **text nodes and static attribute values alike** — has
+`` ` ``, `\`, and `${` escaped for the template literal; and an attribute with no value
+is written bare (`disabled`), not `disabled=""`. The second rule covers both because
+the whole template is one literal: an escape applied to text and not to an attribute
+leaves `${x}` interpolating, which is the "one region covered, another not" failure
+this project has already paid for four times. Void
+elements (`area base br col embed hr img input link meta source track wbr`) get no
+closing tag. An `IrNode::Element` whose tag is void and whose children are non-empty is
+unreachable — Step 3's rule refuses it before lowering — so the emitter does not need a
+branch for it; say so in the doc comment rather than silently dropping children.
+
+`emit_prerender` writes, in this order: `_esc`, `_attr`, `module_statements` (verbatim,
+each on its own line), then `export function render() {`, `statements` (verbatim),
+`return ` + the template literal, `}`, `}`.
+
+**`codegen/mod.rs`.** The checked wrapper:
+
+```rust
+pub fn emit_prerender_checked(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
+    let diagnostics = analyze(source, path);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        return Err(diagnostics);
+    }
+    let route = lower_route(source)?;
+    if route.mode != Mode::Static {
+        return Err(vec![Diagnostic::new(
+            Code::RA014,
+            (0, 0),
+            format!(
+                "`{path}` is a \"use island\" route: the prerender emitter writes static routes only. \
+                 Change line 1 to \"use static\", or emit it with `emit_client_checked`."
+            ),
+        )]);
+    }
+    Ok(emit_prerender(&route))
+}
+```
+
+**`analyze/emitted_names.rs`.** One rule, `check_emitted_names(mode, program, source)`,
+wired from `entry.rs` for every page with a known mode. In `Static` mode the reserved
+names are [`crate::ir::PRERENDER_NAMES`]; Task 11 adds the island set to the same
+constant list, so this rule is written once and gains data, not a second walk.
+
+It reports `RA014` for three shapes, in three regions:
+
+1. a **declaration** in an emitted module statement ([`crate::ir::emitted_module_parts`])
+   or an emitted body statement ([`crate::ir::emitted_body_statements`]) whose bound
+   name is reserved;
+2. an **export specifier** (`export { x as render }`, `export const render = …`) whose
+   *exported* name is reserved — the emitted module already exports `render`;
+3. a **reference** to a reserved name, in the markup, the body, or the module level.
+
+Shape 3 is the one that would otherwise be silent rather than loud: an undeclared
+`_esc` in a template resolves to the compiler's own helper and renders its source text.
+Reuse the `References` visitor from `analyze::reachable` (or lift it to `pub(crate)`)
+rather than writing a second walk, and filter type-only references exactly as that
+module does — a reference in a type position is erased by `strip_types` and must never
+be refused. Member properties (`o.render`) and object keys (`{ render: 1 }`) are not
+identifier references and must stay legal.
+
+**The other four refusals**, each in the module that already walks that region:
+
+- **void element with children** — `jsx.rs`, in the element walk. Compare against the
+  same `VOID_ELEMENTS` const the emitter uses (export it `pub(crate)` from
+  `codegen/prerender.rs`, or move it to `ir.rs` where both can reach it without
+  `analyze` importing `codegen`).
+- **duplicate attribute** — `jsx.rs`, in `attributes`. Compare the name as written.
+  The reason is mode divergence: a static template keeps the first, an island's
+  `_setAttr` applies the last.
+- **early return** — `jsx.rs`, next to the existing second-JSX-return rule. Every
+  `return` before the root `return` is refused, JSX or not: `render()` returns one
+  string, so an early exit cannot return another value.
+- **async or generator route component** — `component.rs`. `ComponentInfo` gains
+  `is_async: bool` and `is_generator: bool` (three constructor sites), and
+  `validate_route_component` reports `RA014` for either. One rule for both modes:
+  the client emitter calls the component synchronously and uses its return value, so
+  an `async` handler is a promise-shaped node in `mount`, and `await`/`yield` copied
+  into a non-async, non-generator `function render()` is a syntax error.
 
 - [ ] **Step 4: Run and verify pass**
 
 Run: `cargo test -p runai_compiler prerender`
+Expected: PASS, 12 tests.
+Run: `cargo test -p runai_compiler emitted_names`
 Expected: PASS, 7 tests.
+Run: `cargo test --workspace`
+Expected: PASS — 299 existing tests plus the new ones, and the `enum` fixture returns
+a module instead of panicking.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/runai_compiler/src
+git add crates/runai_compiler/src docs/superpowers/plans/2026-11-20-runai-foundation.md
 git commit -m "feat(compiler): emit self-contained prerender modules with no imports"
 ```
 
