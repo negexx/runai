@@ -137,6 +137,16 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     // not one per rule.
     if let Some(mode) = mode {
         diagnostics.extend(check_reachable_expressions(mode, program, &bindings));
+        // (6) The names the emitted module declares for itself — `_esc`, `_attr`,
+        // `render` — are reserved. This runs for a page whose mode is known, for
+        // the same reason the reachability rule does: which module is emitted is
+        // undecided without a mode, so which names it declares is too. It is a
+        // separate pass from reachability because it answers a different
+        // question ("does this name collide with the emitter's own?") and reads
+        // the shared reserved list, not the module's bindings.
+        diagnostics.extend(crate::analyze::emitted_names::check_emitted_names(
+            mode, program,
+        ));
     }
 
     diagnostics

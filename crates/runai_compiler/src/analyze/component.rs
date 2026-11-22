@@ -124,6 +124,22 @@ pub struct ComponentInfo<'a> {
     /// for every other component in the file, which owes a props type just the
     /// same but is not a route.
     pub is_default_export: bool,
+    /// Whether the function carries the `async` modifier.
+    ///
+    /// Both emitters call the route component **synchronously** and use its return
+    /// value: a `"use static"` route's `render()` returns one string, and an
+    /// island's `mount` inserts the returned node. An `async` component returns a
+    /// promise, and its `await` copied into a non-async `function render()` would
+    /// be a syntax error. [`validate_route_component`] refuses it.
+    pub is_async: bool,
+    /// Whether the function is a generator (`function*`).
+    ///
+    /// Refused for the same reason as [`is_async`](Self::is_async): `yield` copied
+    /// into a `function render()` that is not a generator is a syntax error, and a
+    /// generator's return value is an iterator rather than markup. Recorded as its
+    /// own field rather than folded into `is_async`, because the two are separate
+    /// modifiers and a function can be both.
+    pub is_generator: bool,
 }
 
 impl<'a> ComponentInfo<'a> {
@@ -647,6 +663,9 @@ fn not_a_component<'a>(name: &'a str, span: oxc_span::Span) -> ComponentInfo<'a>
         returns_jsx: false,
         // `check_props` stops at `NotAFunction`; `RA011` owns this repair.
         is_default_export: true,
+        // No function at all, so neither modifier exists.
+        is_async: false,
+        is_generator: false,
     }
 }
 
@@ -693,6 +712,10 @@ fn component_from_arrow<'a>(
         // Marked by `mark_default_export` or `find_components`, which are the
         // only places that know whether this declaration is the default export.
         is_default_export: false,
+        // An arrow function cannot be a generator, and only `async` is written
+        // before its parameter list.
+        is_async: arrow.r#async,
+        is_generator: false,
     }
 }
 
@@ -746,6 +769,8 @@ fn component_from_function<'a>(
         // Marked by `mark_default_export` or `find_components`, which are the only
         // places that know whether this declaration is the default export.
         is_default_export: false,
+        is_async: function.r#async,
+        is_generator: function.generator,
     }
 }
 
@@ -863,10 +888,56 @@ pub fn validate_route_component(info: Option<&ComponentInfo>) -> Vec<Diagnostic>
         Some(info) if info.kind == ComponentKind::NotAFunction => {
             vec![existing_export_is_not_a_component(info)]
         }
+        // An `async` or generator route component is refused before the shape
+        // checks, because both are shape defects the emitters cannot write
+        // around: a `render()` that returns one string cannot `await`, and a
+        // `function render()` that is not a generator cannot `yield`. The rule is
+        // the same in both modes — an island's `mount` calls the component
+        // synchronously too.
+        Some(info) if info.is_async || info.is_generator => vec![not_synchronous(info)],
         Some(info) if info.is_route_component() => Vec::new(),
         Some(info) if info.params > 1 => vec![too_many_params(info)],
         Some(info) => vec![does_not_return_jsx(info)],
     }
+}
+
+/// `RA014`: the route component is `async` or a generator, so it is not a
+/// function either emitter can call.
+///
+/// The code is `RA014`, not `RA011`: the file parses, and the component *is* a
+/// function that returns JSX — it is the modifier that the emitted module cannot
+/// reproduce. `RA011`'s repair ("give it one annotated parameter and return JSX")
+/// would leave the modifier in place and the next run would report the same row,
+/// which is the repair loop this diagnostic exists to avoid.
+fn not_synchronous(info: &ComponentInfo) -> Diagnostic {
+    // Name the modifier the agent actually wrote, so the edit is unambiguous.
+    let modifier = if info.is_generator && info.is_async {
+        "`async` and a generator (`async function*`)"
+    } else if info.is_generator {
+        "a generator (`function*`)"
+    } else {
+        "`async`"
+    };
+    // The text to delete: `async` for an async function, `*` for a generator, and
+    // both for the combination, so applying it leaves a plain function.
+    let remove = match (info.is_async, info.is_generator) {
+        (true, true) => "`async` and the `*`",
+        (false, true) => "the `*`",
+        (true, false) => "`async`",
+        (false, false) => "",
+    };
+    Diagnostic::new(
+        Code::RA014,
+        info.body_span,
+        format!(
+            "route component `{name}` is {modifier}, but both render modes call the component \
+             synchronously and use its return value: a `\"use static\"` route's `render()` returns \
+             one string, and an island mounts the returned node. A promise or an iterator is \
+             neither, and `await` or `yield` copied into `function render()` is a syntax error. \
+             Remove {remove} and make the component return its markup directly.",
+            name = info.display_name(),
+        ),
+    )
 }
 
 /// `RA011_BAD_ROUTE_EXPORT`: the file has no default export.
@@ -1326,19 +1397,65 @@ mod tests {
         assert_eq!(codes, vec![Code::RA006]);
     }
 
-    /// An async route is an ordinary function shape: the modifier changes nothing
-    /// about its params, body, or whether it returns JSX.
+    /// An `async` route component is refused: both emitters call the component
+    /// synchronously and use its return value. A `"use static"` route's
+    /// `render()` returns one string; `await` copied out of the body into a
+    /// non-async `function render()` is a syntax error, and a promise with no
+    /// mount point is not markup. One rule for both modes, so it is `RA014` —
+    /// the file parses, and the compiler declines the shape.
     #[test]
-    fn async_component_is_analyzed_the_same_way() {
+    fn an_async_route_component_is_ra014() {
         let alloc = Allocator::default();
-        let src = "export default async function Page(props: Props) { return <p/> }\n";
+        let src = "\"use island\"\nexport default async function P(props: Record<never, never>) { return <p>hi</p> }\n";
         let (info, codes) = analyze(&alloc, src);
-        let info = info.unwrap();
-        assert_eq!(info.name, "Page");
-        assert_eq!(info.params, 1);
-        assert!(info.has_props_type);
-        assert!(info.returns_jsx);
-        assert!(codes.is_empty());
+        assert_eq!(codes, vec![Code::RA014], "{codes:?}");
+        assert!(
+            info.unwrap().is_async,
+            "the summary must record the modifier"
+        );
+
+        let program = parse_tsx(&alloc, src).unwrap();
+        let diagnostic = &validate_route_component(find_route_component(program).as_ref())[0];
+        assert!(
+            diagnostic.message.contains("synchronously"),
+            "the message says both modes call the component synchronously: {:?}",
+            diagnostic.message
+        );
+    }
+
+    /// A generator route component is refused for the same reason: `yield` copied
+    /// into a `function render()` that is not a generator is a syntax error.
+    #[test]
+    fn a_generator_route_component_is_ra014() {
+        let alloc = Allocator::default();
+        let src = "\"use island\"\nexport default function* P(props: Record<never, never>) { yield 1; return <p>hi</p> }\n";
+        let (info, codes) = analyze(&alloc, src);
+        assert_eq!(codes, vec![Code::RA014], "{codes:?}");
+        assert!(
+            info.unwrap().is_generator,
+            "the summary must record the `*`"
+        );
+
+        let program = parse_tsx(&alloc, src).unwrap();
+        let diagnostic = &validate_route_component(find_route_component(program).as_ref())[0];
+        assert!(
+            diagnostic.message.contains("synchronously"),
+            "the message says both modes call the component synchronously: {:?}",
+            diagnostic.message
+        );
+    }
+
+    /// An `async` *arrow* route is the same shape in a different node: the modifier
+    /// must be recorded there too, or the rule would accept
+    /// `export default async (props: P) => <p/>` while refusing the function form.
+    #[test]
+    fn an_async_arrow_route_component_is_ra014() {
+        let alloc = Allocator::default();
+        let src =
+            "\"use island\"\nexport default async (props: Record<never, never>) => <p>hi</p>\n";
+        let (info, codes) = analyze(&alloc, src);
+        assert_eq!(codes, vec![Code::RA014], "{codes:?}");
+        assert!(info.unwrap().is_async);
     }
 
     /// A fragment body is JSX too.

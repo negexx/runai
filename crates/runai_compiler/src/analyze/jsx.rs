@@ -88,14 +88,15 @@
 
 use oxc_ast::ast::{
     ArrowFunctionBody, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
-    Expression, Function, FunctionBody, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement,
-    JSXElementName, JSXExpression, JSXExpressionContainer, JSXFragment, Program, ReturnStatement,
-    Statement,
+    Expression, Function, FunctionBody, JSXAttributeItem, JSXAttributeName, JSXAttributeValue,
+    JSXChild, JSXElement, JSXElementName, JSXExpression, JSXExpressionContainer, JSXFragment,
+    Program, ReturnStatement, Statement,
 };
 use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
 use crate::diagnostic::{Code, Diagnostic};
+use crate::ir::VOID_ELEMENTS;
 use crate::source::{has_line_break, raw_text};
 
 /// The tags the runtime itself provides, each with the repair its refusal carries.
@@ -246,6 +247,20 @@ impl JsxChecker<'_> {
         if let Some(span) = jsx_in_body_statements(body, return_span, &returned) {
             self.diagnostics.push(body_jsx(span));
         }
+
+        // Every `return` before the root is refused, JSX or not: `render()`
+        // returns one string, so an early exit could only return another value —
+        // and lowering copies the statement verbatim into a function whose job is
+        // to return one template literal.
+        if let Some(span) = early_return(body, return_span) {
+            self.diagnostics.push(unsupported(
+                span,
+                "an early `return` before the route's JSX return",
+                "`render()` returns one string, so the component body cannot exit early. Replace \
+                 the early return with a value computed by a conditional expression, or move the \
+                 conditional into the returned markup.",
+            ));
+        }
     }
 
     /// The fragment-root rule and the "root is not JSX" invariant.
@@ -273,7 +288,9 @@ impl JsxChecker<'_> {
 impl<'a> Visit<'a> for JsxChecker<'_> {
     fn visit_jsx_element(&mut self, element: &JSXElement<'a>) {
         self.element_name(element);
+        self.void_with_children(element);
         self.attributes(element);
+        self.duplicate_attributes(element);
         self.children(&element.children);
         oxc_ast_visit::walk::walk_jsx_element(self, element);
     }
@@ -330,6 +347,70 @@ impl JsxChecker<'_> {
                 refusal.construct,
                 &refusal.repair,
             ));
+        }
+    }
+
+    /// `RA014` for a void element that has children.
+    ///
+    /// A void element (`br`, `img`, `input`, …) has no closing tag in HTML, so the
+    /// parser closes it at the first `>`. `<br>x</br>` therefore renders `x`
+    /// **after** the `br`, as a sibling — while an island's DOM build would put it
+    /// inside. The two modes would render different pages from one source, and the
+    /// only honest answer is to refuse it. The list is [`VOID_ELEMENTS`], the same
+    /// one the emitter uses, so the two cannot disagree about which tags are void.
+    fn void_with_children(&mut self, element: &JSXElement<'_>) {
+        if !element.children.is_empty()
+            && let JSXElementName::Identifier(identifier) = &element.opening_element.name
+            && VOID_ELEMENTS.contains(&identifier.name.as_str())
+        {
+            self.diagnostics.push(unsupported(
+                element.span,
+                "children inside a void element",
+                format!(
+                    "`<{tag}>` has no closing tag in HTML, so the browser closes it at the \
+                     first `>` and these children become its siblings. Move them out of \
+                     `<{tag}>`, or use an element that accepts children.",
+                    tag = identifier.name.as_str(),
+                )
+                .as_str(),
+            ));
+        }
+    }
+
+    /// `RA014` for an attribute written twice on one element.
+    ///
+    /// A static template keeps the *first* (`<div class="a" class="b">` writes both
+    /// and the browser takes the first), while an island's `_setAttr` applies the
+    /// *last*. One source would render `class="a"` in a prerendered page and
+    /// `class="b"` in a hydrated one. The names are compared **as written**, so
+    /// `class` beside `className` is not a duplicate — they are different
+    /// attributes to this milestone.
+    fn duplicate_attributes(&mut self, element: &JSXElement<'_>) {
+        let mut seen: Vec<&str> = Vec::new();
+        for attribute in &element.opening_element.attributes {
+            let JSXAttributeItem::Attribute(attribute) = attribute else {
+                continue;
+            };
+            let name = match &attribute.name {
+                JSXAttributeName::Identifier(identifier) => identifier.name.as_str(),
+                JSXAttributeName::NamespacedName(_) => {
+                    // A namespaced name cannot be compared to an identifier
+                    // without borrowing temporary text, and two spellings of one
+                    // namespace are rare enough that skipping them here is
+                    // honest: this rule's job is the ordinary duplicate.
+                    continue;
+                }
+            };
+            if seen.contains(&name) {
+                self.diagnostics.push(unsupported(
+                    attribute.span,
+                    &format!("a duplicate attribute (`{name}`)"),
+                    "the prerendered template keeps the first value and a hydrated island keeps \
+                     the last, so the two modes would render different attributes. Keep one.",
+                ));
+            } else {
+                seen.push(name);
+            }
         }
     }
 
@@ -748,6 +829,64 @@ pub(crate) fn jsx_in_body_statements<'a>(
     })
     .into_iter()
     .find(|span| !excluded.contains(span))
+}
+
+/// The span of the first `return` in the body **before** `return_span` that
+/// returns something other than JSX, or `None`.
+///
+/// Every such return is an early exit: the route's own `return` is the one at
+/// `return_span`, and anything before it runs first. `render()` in the emitted
+/// module returns one template literal, so an early `return null` or
+/// `return 42` would be copied verbatim into a function that must return a string.
+/// Nested blocks are descended into — an `if (on) return null` is exactly the
+/// shape — but nested *functions* are not: their returns belong to another
+/// component.
+///
+/// A return whose argument **is** JSX is not this rule's: it is the "second JSX
+/// return" construct, which already has its own diagnostic and its own repair
+/// (move that markup into the returned tree). Reporting it here as well would put
+/// two rows on one return, which is the duplication this project refuses.
+fn early_return<'a>(body: &'a FunctionBody<'a>, return_span: Span) -> Option<Span> {
+    let mut finder = EarlyReturns::default();
+    for statement in body
+        .statements
+        .iter()
+        .filter(|statement| statement.span().end <= return_span.start)
+    {
+        finder.visit_statement(statement);
+    }
+    finder
+        .returns
+        .into_iter()
+        .find(|(_, returns_jsx)| !returns_jsx)
+        .map(|(span, _)| span)
+}
+
+/// Collects every `return` statement before the root, with whether it returns
+/// JSX, skipping nested functions.
+#[derive(Default)]
+struct EarlyReturns {
+    returns: Vec<(Span, bool)>,
+}
+
+impl<'a> Visit<'a> for EarlyReturns {
+    fn visit_return_statement(&mut self, returned: &ReturnStatement<'a>) {
+        let jsx = returned
+            .argument
+            .as_ref()
+            .is_some_and(|argument| jsx_expression(argument).is_some());
+        self.returns.push((returned.span, jsx));
+        oxc_ast_visit::walk::walk_return_statement(self, returned);
+    }
+
+    // A nested function has its own render, so its `return`s are not this body's.
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {}
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        _arrow: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
 }
 
 /// The span of the first JSX node outside the route's own render, or `None`.
@@ -1407,5 +1546,66 @@ mod tests {
         ] {
             assert!(codes(src).is_empty(), "{src}: {:?}", check(src));
         }
+    }
+
+    // --- The emit-time refusals (Task 10) ------------------------------------
+
+    /// A void element cannot have children: the HTML parser closes it at the
+    /// first `>`, so the children land *outside* it. A static template would
+    /// therefore render `<br>` and then the children as siblings, while an
+    /// island's `_setAttr`-built DOM would put them inside. Refusing it is the
+    /// only honest answer, and it is `RA014` because the file parses.
+    #[test]
+    fn a_void_element_with_children_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p><br>x</br></p> }\n";
+        let d = check_jsx(
+            crate::source::parse_tsx(&oxc_allocator::Allocator::default(), src).unwrap(),
+            src,
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(d[0].message.contains("void"), "{}", d[0].message);
+    }
+
+    /// `<div class="a" class="b">` is a duplicate attribute. A static template
+    /// keeps the first (it writes both, and the browser takes the first), while
+    /// an island's `_setAttr` applies the last — so the same source renders two
+    /// different attributes in the two modes. Refused rather than guessed at, and
+    /// the message names the duplicated attribute so the agent can find it.
+    #[test]
+    fn a_duplicate_attribute_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div class=\"a\" class=\"b\">x</div> }\n";
+        let d = check_jsx(
+            crate::source::parse_tsx(&oxc_allocator::Allocator::default(), src).unwrap(),
+            src,
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`class`"),
+            "the message names the duplicated attribute: {}",
+            d[0].message
+        );
+    }
+
+    /// `render()` returns one string, so an early `return` before the root JSX
+    /// return returns something else. Lowering copies every body statement before
+    /// the root return verbatim — including `if (on) return null` — into a
+    /// function whose job is to return one template literal. Every `return`
+    /// before the root is refused, JSX or not.
+    #[test]
+    fn an_early_non_jsx_return_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { const on = false; if (on) return null; return <p>hi</p> }\n";
+        let d = check_jsx(
+            crate::source::parse_tsx(&oxc_allocator::Allocator::default(), src).unwrap(),
+            src,
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("one string"),
+            "the message says render() returns one string: {}",
+            d[0].message
+        );
     }
 }

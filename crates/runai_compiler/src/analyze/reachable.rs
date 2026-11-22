@@ -408,11 +408,35 @@ impl EmittedScope<'_, '_> {
 
 /// One identifier reference in the returned markup, a component-body statement,
 /// or a module-level statement.
-struct Reference {
-    name: String,
-    span: (u32, u32),
+pub(crate) struct Reference {
+    pub(crate) name: String,
+    pub(crate) span: (u32, u32),
     /// `None` for an unresolved name, i.e. a built-in such as `Math`.
-    symbol: Option<SymbolId>,
+    pub(crate) symbol: Option<SymbolId>,
+}
+
+/// Every value identifier reference `walk` reaches, with type-only references
+/// filtered out.
+///
+/// The one reference walk in the crate: [`check_reachable_expressions`] judges
+/// these against the emitted module's bindings, and
+/// [`crate::analyze::emitted_names`] judges a subset of them against the names
+/// the emitter declares. Sharing it means "a type-only reference is not a value"
+/// has one definition, so the two rules cannot disagree about whether `("a" as
+/// Kind)` mentions `Kind`.
+///
+/// `walk` decides the region — the returned root, one body statement, one module
+/// statement — so a caller cannot accidentally walk a region the emitters omit.
+pub(crate) fn references(
+    scoping: &Scoping,
+    walk: impl FnOnce(&mut References<'_>),
+) -> Vec<Reference> {
+    let mut visitor = References {
+        scoping,
+        references: Vec::new(),
+    };
+    walk(&mut visitor);
+    visitor.references
 }
 
 /// Collects every **value** identifier reference under whatever node the caller
@@ -436,7 +460,7 @@ struct Reference {
 /// semantic pass considers a type" has one definition in the crate.
 ///
 /// [`ReferenceFlags::is_type_only`]: oxc_syntax::reference::ReferenceFlags::is_type_only
-struct References<'s> {
+pub(crate) struct References<'s> {
     scoping: &'s Scoping,
     references: Vec<Reference>,
 }

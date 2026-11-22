@@ -114,6 +114,32 @@ pub enum IrNode {
     Expr(String),
 }
 
+/// The element names that have no closing tag, per the HTML standard.
+///
+/// One list, two consumers: [`crate::codegen::prerender`] omits the closing tag
+/// for these, and [`crate::analyze::jsx::check_jsx`] refuses one that has
+/// children (a void element cannot hold them, and the static template and an
+/// island's DOM would disagree about what happens to them). It lives here rather
+/// than in `codegen` so `analyze` can reach it without depending on the emitter.
+pub(crate) const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
+    "wbr",
+];
+
+/// The names a `"use static"` route's emitted module declares for itself.
+///
+/// The prerender module is one `_esc` helper, one `_attr` helper, and
+/// `export function render()`, so a route file that declares or references one of
+/// these names would shadow a helper the template calls — or export `render`
+/// twice. [`crate::analyze::emitted_names`] refuses them from this one list, and
+/// `codegen::prerender`'s test asserts the emitter defines exactly these names, so
+/// a helper added without a rule (or a rule for a helper that no longer exists)
+/// fails there rather than shipping a shadowing hole.
+///
+/// Task 11 adds the island module's own names to the same list, so the rule is
+/// written once and gains data rather than a second walk.
+pub const PRERENDER_NAMES: &[&str] = &["_esc", "_attr", "render"];
+
 /// A lowered route file: its rendering mode, its component name, the
 /// component's own statements, the file's module-level statements, and its
 /// markup.

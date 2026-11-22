@@ -56,7 +56,17 @@ pub fn strip_types(source: &str) -> Result<String, Vec<Diagnostic>> {
     // The transformer expects scoping that was built for its own tree, so the
     // semantic pass is not optional: without it, symbol-heavy transforms such as
     // the TypeScript one would have nothing to update.
+    //
+    // `with_enum_eval(true)` is load-bearing for a TypeScript `enum`. The
+    // TypeScript transform **evaluates** enum member values and reads them from
+    // `Scoping`, so without this flag it panics
+    // (`Transformer requires Scoping produced with
+    // SemanticBuilder::with_enum_eval(true)`) instead of returning a diagnostic.
+    // A panic inside `strip_types` breaks its `Result<_, Vec<Diagnostic>>`
+    // contract: `analyze` reports nothing for the file, so `runai check` says
+    // clean and the emitter aborts the process.
     let scoping = SemanticBuilder::new()
+        .with_enum_eval(true)
         .with_excess_capacity(2.0)
         .build(&program)
         .semantic
@@ -170,6 +180,23 @@ mod tests {
         let errs = strip_types("\"use static\"\nexport default function P() { return <div> }\n")
             .unwrap_err();
         assert_eq!(errs[0].code, Code::RA007);
+    }
+
+    /// A TypeScript `enum` must be **erased**, not transformed by a transformer
+    /// that was not given the scoping it needs. `oxc_transformer` 0.159 panics
+    /// (`Transformer requires Scoping produced with
+    /// SemanticBuilder::with_enum_eval(true)`) rather than returning a diagnostic,
+    /// and `analyze` reports nothing for the file — so `runai check` would say
+    /// clean and the emitter would abort the process. `strip_types`'s contract is
+    /// `Result<_, Vec<Diagnostic>>`, and a panic breaks it.
+    #[test]
+    fn an_enum_is_stripped_instead_of_panicking() {
+        let stripped = strip_types(
+            "\"use island\"\nenum E { A }\nexport default function P() { return <p>{E.A}</p> }\n",
+        )
+        .unwrap();
+        assert!(!stripped.contains("enum E"), "{stripped}");
+        assert!(stripped.contains("E.A"), "{stripped}");
     }
 
     /// `import type` is a type-only import and disappears; a value import that
