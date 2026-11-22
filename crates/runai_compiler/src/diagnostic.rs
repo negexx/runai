@@ -176,13 +176,15 @@ impl Code {
                  syntax error. It covers three families. A JSX construct this milestone cannot \
                  lower (a component tag, a spread, a fragment root, and so on), where lowering \
                  reports the construct instead of dropping it, because markup emitted without \
-                 part of a node is wrong in a way nothing reports. An `import` of any module \
-                 other than `\"runai\"`, because this milestone has no bundler: each route is \
-                 emitted from its own file, so a second module cannot be resolved or inlined. \
-                 And a value the generated module cannot see — a module-level declaration, or a \
-                 `\"runai\"` import used in a `\"use static\"` route's markup — because only the \
-                 component body's own statements are copied into the emitted module, so a \
-                 reference to anything else names a symbol that module never declares."
+                 part of a node is wrong in a way nothing reports. An `import` the emitted \
+                 module cannot write: a module other than `\"runai\"` has no bundler to resolve \
+                 it, and a default or namespace import of `\"runai\"` is not a form the client \
+                 module emits — each route is emitted from its own file, so a second module \
+                 cannot be resolved or inlined. And a value the generated module cannot see — a \
+                 `\"runai\"` name in a `\"use static\"` route's markup, whose prerender module has \
+                 no imports, or the route's own parameter there, which the prerender call \
+                 supplies with nothing. A module-level declaration is *not* in this family: \
+                 module-scope statements are emitted above the component."
             }
         }
     }
@@ -238,13 +240,16 @@ impl Code {
                  are both accepted; escapes such as \"use\\x20static\" are not."
             }
             Code::RA014 => {
-                "Do what the message names for this construct: in JSX, write the spread out, move \
+                "For an import, inline the value or import it from `\"runai\"`; a default or \
+                 namespace `\"runai\"` import is not a form the emitted module writes, so rewrite \
+                 it as named imports. For a value the generated module cannot see — a `\"runai\"` \
+                 name in a `\"use static\"` route's markup, or the route's own parameter in a \
+                 `\"use static\"` route — do what the message names: change line 1 to \
+                 `\"use island\"` for the first, and remove the reference or write the value in the \
+                 component body for the second. For a JSX construct, write the spread out, move \
                  the JSX into the children or the returned tree, give the attribute or prop a \
                  value, wrap a root fragment in one parent element, render a runtime primitive's \
-                 markup directly, or keep exactly one JSX return. For an import, inline the value \
-                 or import it from `\"runai\"`. For a value the generated module cannot see, move \
-                 it into the component body or inline it; a `\"runai\"` value in a `\"use static\"` \
-                 route needs the directive changed to `\"use island\"`."
+                 markup directly, or keep exactly one JSX return."
             }
         }
     }

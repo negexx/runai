@@ -53,8 +53,10 @@
 //!   emitted `.mjs` verbatim, where JSX is a syntax error;
 //! - JSX outside the route's returned tree (a module-level `const header =
 //!   <h1/>`, a module-level helper that returns JSX) — module-level statements
-//!   are not emitted at all, so the markup is dropped while the returned tree
-//!   still references the symbol it was assigned to.
+//!   *are* emitted now ([`RouteIr::module_statements`]), so the defect is no
+//!   longer "dropped": it is that the emitted `.mjs` would contain JSX, which is
+//!   a syntax error there exactly as it is in a body statement. JSX cannot be
+//!   held in a plain JavaScript const.
 //!
 //! Both of the last two are the same defect at two scopes: JSX the build cannot
 //! turn into JavaScript. They are refused only in a file where a route component
@@ -63,6 +65,7 @@
 //! that module.
 //!
 //! [`RouteIr::statements`]: crate::ir::RouteIr::statements
+//! [`RouteIr::module_statements`]: crate::ir::RouteIr::module_statements
 //!
 //! `RA014_NOT_SUPPORTED_YET` is the right code, not `RA007`: the parser accepted
 //! the file, and `RA007` means "the parser rejected this file" everywhere else.
@@ -916,18 +919,20 @@ fn body_jsx(span: Span) -> Diagnostic {
 
 /// The `RA014` for JSX in a module-level statement of a route file.
 ///
-/// A route file's module-level declarations are **not** copied into the generated
-/// module: only the route component's own body statements are. The returned tree
-/// still refers to whatever the declaration bound, so the reference is to a
-/// symbol the build never emitted — a `ReferenceError`, or a module that does not
-/// parse. Shared with [`crate::ir::lower_route`], like the body-statement pair.
+/// A route file's module-level declarations *are* copied into the generated
+/// module now ([`crate::ir::RouteIr::module_statements`]), so the defect is no
+/// longer that the markup is dropped: it is that the emitted `.mjs` would carry
+/// JSX, where it is a syntax error exactly as it would be in a body statement.
+/// A module-level JSX value cannot be expressed in plain JavaScript.
+/// Shared with [`crate::ir::lower_route`], like the body-statement pair.
 pub(crate) const MODULE_JSX_CONSTRUCT: &str = "JSX outside the route's returned tree";
-pub(crate) const MODULE_JSX_REPAIR: &str = "module-level declarations of a route file are not \
-                                            copied into the generated module, so this markup \
-                                            would be dropped while the returned tree still \
-                                            refers to it. Write the markup inline in the returned \
-                                            tree, or move the helper into a component module (a \
-                                            `.tsx` file with no default export).";
+pub(crate) const MODULE_JSX_REPAIR: &str = "module-level statements of a route file are copied \
+                                            into the generated module, where JSX is a syntax \
+                                            error exactly as it is in a route body statement, so \
+                                            a module-level value cannot hold markup. Write the \
+                                            markup inline in the returned tree, or move the helper \
+                                            into a component module (a `.tsx` file with no default \
+                                            export).";
 
 fn module_jsx(span: Span) -> Diagnostic {
     unsupported(span, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR)
@@ -1346,12 +1351,12 @@ mod tests {
     /// A module-level statement with no JSX is ordinary: an import, a constant, a
     /// helper. Refusing those would reject every real page.
     ///
-    /// This is a statement about **this walk only**, and the first fixture is
-    /// deliberately the shape `analyze::reachable` refuses for a page: `check_jsx`
-    /// has no business with a constant, and the reference to it is a different
-    /// question with its own code and message. Keeping that fixture here is what
-    /// stops a future reader from moving the reachability rule into this walk,
-    /// where it would refuse a component module's legal module-level value.
+    /// This is a statement about **this walk only**: `check_jsx` has no business
+    /// with a constant, and whether the markup may *name* it is a different
+    /// question answered by `analyze::reachable` (which now accepts it, because
+    /// `RouteIr::module_statements` emits it). The first fixture is kept here so
+    /// a future reader does not move that rule into this walk, where it would
+    /// refuse a component module's legal module-level value.
     #[test]
     fn module_level_statements_without_jsx_are_clean() {
         for src in [

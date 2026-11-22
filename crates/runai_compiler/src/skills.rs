@@ -75,19 +75,26 @@ fn why(code: Code) -> &'static str {
              module, and a helper there may legitimately hold module-level JSX. The plan's later \
              milestones lift these one slice at a time. \
              \
-             An import of any module other than `\"runai\"` is refused because there is no \
-             bundler yet: each route is emitted from its own file's text, so a second module \
-             cannot be resolved or inlined, and the emitted module would not load. This lifts when \
-             bundling lands. `import type` — and the inline `import { type X }` form — is exempt, \
-             because types are stripped and leave no runtime import behind. \
+             An import the emitted module cannot write is refused for one of two reasons. A \
+             module other than `\"runai\"` has no bundler yet: each route is emitted from its own \
+             file's text, so a second module cannot be resolved or inlined, and the emitted module \
+             would not load. This lifts when bundling lands. A default (`import runai from \
+             \"runai\"`) or namespace (`import * as runai from \"runai\"`) import of `\"runai\"` is \
+             refused because the island emitter writes exactly one import, merging the route's \
+             named specifiers only; the repair is to rewrite the declaration as named imports. \
+             `import type` — and the inline `import { type X }` form — is exempt, because types are \
+             stripped and leave no runtime import behind. \
              \
-             The third family is a value the generated module cannot see; it is accept-then-reject \
-             in its most expensive form. Only the component body's own statements are copied into \
-             the emitted module, so a module-level declaration is never emitted, and a reference \
-             to one names a symbol that module never declares — `runai check` would report \
-             nothing and `runai build` would fail. The same is true of a `\"runai\"` import used in \
-             a `\"use static\"` route's markup, because the prerender module contains no imports at \
-             all. \
+             The third family is a value the generated module genuinely cannot see, and it has \
+             two members only. A `\"runai\"` import used in a `\"use static\"` route's markup is \
+             refused because the prerender module contains no imports at all, so the repair is the \
+             directive, `\"use island\"`. The route's own parameter in a `\"use static\"` route is \
+             refused because `render()` takes no arguments, so `{props}` would be `undefined` at \
+             build time. A module-level declaration is deliberately **not** in this family: \
+             module-scope statements are copied into the emitted module above the component (design \
+             §7.6 expects module-level state — \"module-scope signals are per-island too, since \
+             each island is its own module instance\"), so a module-level `const` the markup names \
+             is reachable. \
              \
              An attribute with an empty expression (`name={}`) is deliberately **not** on this \
              list: that is a parse error, reported as `RA007`, not valid syntax waiting for a later \
@@ -271,38 +278,56 @@ mod tests {
         );
     }
 
-    /// `entry.rs` reports `RA014` for `import x from "./data"`, and `reachable`
-    /// reports it for a module-level constant. The skill and the fix are what an
-    /// agent reads first, so both must describe those cases and give a repair that
-    /// is legal when applied verbatim: inlining the value, importing from
-    /// `"runai"`, moving the value into the body, or changing the directive.
+    /// `entry.rs` reports `RA014` for `import x from "./data"` and for a default
+    /// or namespace `"runai"` import, and `reachable` reports it for a `"runai"`
+    /// name in a static route and for the route's parameter. The skill and the
+    /// fix are what an agent reads first, so both must describe those cases and
+    /// give a repair that is legal when applied verbatim.
+    ///
+    /// The module-level-value case used to be on this list and is deliberately
+    /// gone: module statements are emitted now, so a skill still claiming "move
+    /// it into the body" would prescribe a rewrite for a file that already works.
     #[test]
     fn ra014_explains_the_import_and_unreachable_value_cases() {
         let body = skill_body(Code::RA014);
         for phrase in [
-            "An import of any module other than",
+            "An import the emitted module cannot write",
             "no bundler yet",
             "`import { type X }`",
-            "a value the generated module cannot see",
-            "module-level declaration",
+            "namespace (`import * as runai from \"runai\"`)",
+            "rewrite the declaration as named imports",
+            "a value the generated module genuinely cannot see",
             "no imports at all",
+            "route's own parameter",
         ] {
             assert!(
                 body.contains(phrase),
                 "the import/value families are missing `{phrase}`: {body}"
             );
         }
+        // The reversal, stated where an agent reads it: a module-level value is
+        // reachable, so the skill must not send one into the component body.
+        assert!(
+            body.contains("A module-level declaration is deliberately **not** in this family"),
+            "the skill must say a module-level value is reachable: {body}"
+        );
 
         let fix = Code::RA014.fix_template();
         for repair in [
             "inline the value",
             "import it from `\"runai\"`",
-            "move it into the component body",
-            "`\"use static\"`",
+            "rewrite it as named imports",
             "`\"use island\"`",
+            "write the value in the component body",
         ] {
             assert!(fix.contains(repair), "missing repair `{repair}`: {fix}");
         }
+        // The import clause comes first: an agent reading only `fix` on an import
+        // diagnostic must not be led to the JSX repairs.
+        assert!(
+            fix.find("For an import").unwrap() < fix.find("For a JSX construct").unwrap(),
+            "the import repair must precede the JSX repairs: {fix}"
+        );
 
         // The explain carries all three families, so `runai check` on an import
         // diagnostic does not explain a JSX construct the file does not contain.

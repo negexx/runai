@@ -10,8 +10,10 @@
 //!    the import rule, and [`check_signal_rules`];
 //! 4. for a `"use static"` page: [`check_static_mode`];
 //! 5. for a page whose mode is known: [`check_reachable_expressions`], so every
-//!    plain expression the markup evaluates names a binding the generated module
-//!    actually declares.
+//!    plain expression the markup evaluates names something the generated module
+//!    actually has — a `"runai"` import in a static route or the route's own
+//!    parameter in a static route are the two refusals; a module-level value is
+//!    emitted by `RouteIr::module_statements` and is therefore reachable.
 //!
 //! A file whose name starts with `_` is **never** a page. `_shell.tsx` is a
 //! component module: it owes the props, JSX, import, and signal checks, but no
@@ -111,8 +113,8 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     diagnostics.extend(check_jsx(program, source));
     diagnostics.extend(check_imports(program, source));
 
-    // One semantic build for both the signal rules and the static rules. Building
-    // it twice per file would pay twice for the expensive half of analysis.
+    // One semantic build for the signal rules. A page with a known mode pays one
+    // more later, in stage 5, and only when it has a route component to check.
     let bindings = find_signal_bindings(program);
     diagnostics.extend(check_signal_rules(program, &bindings));
 
@@ -150,12 +152,25 @@ fn is_page(path: &str) -> bool {
     !name.starts_with('_') && name.ends_with(".page.tsx")
 }
 
-/// `RA014` for every import of a module other than `"runai"`.
+/// `RA014` for every import this milestone cannot emit.
 ///
 /// This milestone has no bundler: it emits one module per route from the route
 /// file's own text, so a second module cannot be resolved or inlined. Reporting
 /// the import is the only honest answer — emitting the file would produce a
 /// module that cannot load.
+///
+/// **Two shapes are refused for two different reasons**, and the repair differs
+/// because the legal rewrite differs:
+///
+/// - **a module other than `"runai"`** — nothing can resolve it (the bundler
+///   family below);
+/// - **a default or namespace import of `"runai"`** — `import runai from
+///   "runai"` / `import * as runai from "runai"`. The island emitter writes
+///   exactly one import merging the route's **named** specifiers, so there is no
+///   form it can write for these. The repair is to rewrite the declaration as
+///   named imports; "move it into the component body" would be a syntax error,
+///   which is why this declaration is refused here rather than left to the
+///   reference rule.
 ///
 /// **A type-only import is exempt, in both spellings TypeScript allows.** Types
 /// are stripped before anything is emitted, so there is no runtime import left to
@@ -179,14 +194,19 @@ fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
             let Statement::ImportDeclaration(declaration) = statement else {
                 return None;
             };
-            let module = raw_text(source, declaration.source.span)
-                .unwrap_or_else(|| declaration.source.value.as_str().unwrap_or(""));
-            if declaration.source.value.as_str() == Some(PRIMITIVE_SOURCE) {
-                return None;
-            }
             if is_type_only_import(declaration) {
                 return None;
             }
+            if declaration.source.value.as_str() == Some(PRIMITIVE_SOURCE) {
+                // Named value specifiers are the one form the island emitter
+                // can write. A default or namespace binding is a `"runai"`
+                // import this milestone cannot emit, and the repair has to name
+                // the declaration to rewrite rather than point at each use.
+                return unwritable_runai_import(declaration);
+            }
+
+            let module = raw_text(source, declaration.source.span)
+                .unwrap_or_else(|| declaration.source.value.as_str().unwrap_or(""));
             Some(Diagnostic::new(
                 Code::RA014,
                 (declaration.source.span.start, declaration.source.span.end),
@@ -198,6 +218,46 @@ fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
             ))
         })
         .collect()
+}
+
+/// `RA014` for a `"runai"` import whose binding form the client emitter cannot
+/// write, or `None` for a named-only value import.
+///
+/// The emitted island module has exactly one import, built from the route's
+/// named specifiers. `import runai from "runai"` and `import * as runai from
+/// "runai"` have no named specifier to merge, and rewriting a member access
+/// (`runai.owner`) into a named binding needs knowledge of the runtime's export
+/// list this compiler does not carry. So the declaration is refused once, at the
+/// specifier, with the rewrite that works.
+fn unwritable_runai_import(
+    declaration: &oxc_ast::ast::ImportDeclaration<'_>,
+) -> Option<Diagnostic> {
+    let specifiers = declaration.specifiers.as_ref()?;
+    for specifier in specifiers {
+        let (local, form) = match specifier {
+            // The writable form: a value named specifier, aliases included.
+            // A `type` specifier binds nothing at runtime either, so it is not
+            // an unwritable *value* import.
+            ImportDeclarationSpecifier::ImportSpecifier(_) => continue,
+            ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
+                (&specifier.local, "a default import")
+            }
+            ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
+                (&specifier.local, "a namespace import")
+            }
+        };
+        let name = local.name.as_str();
+        return Some(Diagnostic::new(
+            Code::RA014,
+            (local.span.start, local.span.end),
+            format!(
+                "`{name}` is {form} of `\"{PRIMITIVE_SOURCE}\"`, and the generated module writes \
+                 only its named imports. Write the names you use as named imports instead, e.g. \
+                 `import {{ owner }} from \"{PRIMITIVE_SOURCE}\"`, and refer to `owner` directly."
+            ),
+        ));
+    }
+    None
 }
 
 /// Whether `declaration` binds nothing at runtime.
@@ -283,41 +343,222 @@ mod tests {
         assert!(analyze(&src, "src/routes/about.page.tsx").is_empty());
     }
 
-    /// Finding A, end to end. The canonical file from the brief: a module-level
-    /// constant referenced from the returned tree. `lower_route` accepts it and
-    /// its `statements` are empty — the module-level `const` is not emitted — so
-    /// the prerender module would reference a symbol it never declares.
+    /// A module-level constant is **legal** as of round 3: `RouteIr` carries
+    /// `module_statements`, so the emitters write it above the component and the
+    /// markup's reference resolves. This test replaces
+    /// `a_module_level_constant_referenced_by_the_tree_is_ra014`, which pinned
+    /// the round-2 refusal the plan ruling reversed.
     ///
-    /// `analyze` runs first and must refuse it; that is what makes the two gates
-    /// agree. The test also asserts the mechanism, so a later reader sees *why*
-    /// the rule exists rather than trusting a comment.
+    /// Both halves are asserted, because the old defect was the pair disagreeing:
+    /// `analyze` is clean **and** lowering now carries the declaration the tree
+    /// names.
     #[test]
-    fn a_module_level_constant_referenced_by_the_tree_is_ra014() {
+    fn a_module_level_constant_is_emitted_so_the_tree_can_name_it() {
         let src = "\"use static\"\nconst title = \"About\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n";
         let d = analyze(src, "src/routes/about.page.tsx");
-        assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].code, Code::RA014);
-        assert_eq!(d[0].line, 3, "the reference, not the declaration: {d:?}");
-        assert!(d[0].message.contains("`title`"), "{d:?}");
-        assert!(
-            d[0].message
-                .contains("Move `title` into the component body, or inline its value"),
-            "{d:?}"
-        );
+        assert!(d.is_empty(), "{d:?}");
 
-        // Lowering still succeeds: it is body-only and does not resolve names.
-        // This is exactly why the refusal has to happen in `analyze`.
-        let route = lower_route(src).expect("lowering does not resolve names");
+        let route = lower_route(src).expect("a module-level constant lowers");
+        assert!(
+            route.module_statements.contains("const title = \"About\""),
+            "the module level must carry the declaration the tree names: {:?}",
+            route.module_statements
+        );
         assert_eq!(
             route.statements, "",
-            "the module-level const is not emitted"
+            "the component body is still empty; the declaration is module scope"
         );
         assert!(
             matches!(&route.tree, IrNode::Element { children, .. }
                 if matches!(children.as_slice(), [IrNode::Expr(expr)] if expr == "title")),
-            "the tree still names `title`: {:?}",
+            "the tree still names `title`, which is now declared: {:?}",
             route.tree
         );
+    }
+
+    /// A module-level **signal** is per-island state (design §7.6: "module-scope
+    /// signals are per-island too, since each island is its own module
+    /// instance"), so an island is clean. A static route still has no runtime, so
+    /// the same file is `RA010` — that is the static rule, not this task's.
+    #[test]
+    fn a_module_level_signal_is_island_state_and_still_ra010_when_static() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nimport {{ signal }} from \"runai\"\nconst n = signal(0)\nexport default function P(props: Record<never, never>) {{ return <h1>{{n()}}</h1> }}\n"
+            )
+        };
+
+        assert!(
+            analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "module-scope signals are per-island state"
+        );
+        assert_eq!(
+            codes(&analyze(
+                &src("\"use static\""),
+                "src/routes/index.page.tsx"
+            )),
+            vec![Code::RA010],
+            "a static route has no runtime, so the primitive is still refused"
+        );
+    }
+
+    /// The `runtime_import` branch, end to end: a named `"runai"` import used in
+    /// a static route's markup must get the **directive** repair, not "move it
+    /// into the body". The same file as an island is clean.
+    #[test]
+    fn a_runai_value_in_a_static_route_gets_the_directive_repair() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nimport {{ owner }} from \"runai\"\nexport default function P(props: Record<never, never>) {{ return <p>{{owner}}</p> }}\n"
+            )
+        };
+
+        let d = analyze(&src("\"use static\""), "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert!(
+            d[0].message.contains("Change line 1 to \"use island\""),
+            "the repair is the directive: {d:?}"
+        );
+        assert!(
+            !d[0]
+                .message
+                .contains("Move `owner` into the component body"),
+            "moving an import into a body is not a repair: {d:?}"
+        );
+
+        assert!(
+            analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "an island imports the name the client module writes"
+        );
+    }
+
+    /// The `route_parameter` branch, end to end, in both modes: `render()` takes
+    /// no arguments, so a static route's `{props}` is `undefined` at build time;
+    /// an island declares `function <Name>(props)`.
+    #[test]
+    fn a_route_parameter_is_refused_when_static_and_clean_when_island() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nexport default function P(props: Record<never, never>) {{ return <p>{{props}}</p> }}\n"
+            )
+        };
+
+        let d = analyze(&src("\"use static\""), "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert!(
+            d[0].message.contains("route's parameter"),
+            "the message must name the parameter, not a module value: {d:?}"
+        );
+
+        assert!(
+            analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "an island declares the parameter"
+        );
+    }
+
+    /// N1, end to end. These three are **type positions**: `strip_types` erases
+    /// them before anything is emitted, and the program compiles and runs today.
+    /// Round 2 refused all three through `analyze` and the review proved it by
+    /// execution — `check` reported `RA014` while `build` succeeded. The walk now
+    /// skips type-only references, and each fixture must be clean in **both**
+    /// modes.
+    #[test]
+    fn a_type_position_is_clean_end_to_end() {
+        // The body of each fixture, without its directive: the type position is
+        // mode-independent, so both modes are asserted for every one.
+        for body in [
+            // A type alias in a type assertion, inside the body.
+            "type Kind = \"a\" | \"b\"\nexport default function P(props: Record<never, never>) { return <p>{\"a\" as Kind}</p> }\n",
+            // A type alias annotating an arrow parameter inside the markup.
+            "type Entry = { name: string }\nexport default function P(props: Record<never, never>) { return <p>{[{ name: \"x\" }].map((v: Entry) => v.name)}</p> }\n",
+            // A named generic argument.
+            "type Kind = \"a\"\nexport default function P(props: Record<never, never>) { return <p>{[1].map<Kind>(() => \"a\")}</p> }\n",
+        ] {
+            for directive in ["\"use static\"", "\"use island\""] {
+                let src = format!("{directive}\n{body}");
+                let d = analyze(&src, "src/routes/index.page.tsx");
+                assert!(
+                    d.is_empty(),
+                    "a type position must never be refused: {d:?}\n{src}"
+                );
+                assert!(
+                    lower_route(&src).is_ok(),
+                    "the file compiles and runs today: {src}"
+                );
+            }
+        }
+
+        // `import { type X } from "runai"` used as a type is the same fact: the
+        // specifier is marked type, so nothing survives stripping to import.
+        let typed_runai = "\"use island\"\nimport { type Accessor } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{1 as Accessor<number>}</p> }\n";
+        assert!(
+            analyze(typed_runai, "src/routes/index.page.tsx").is_empty(),
+            "{:?}",
+            analyze(typed_runai, "src/routes/index.page.tsx")
+        );
+    }
+
+    /// A module-level JSX const is `check_jsx`'s construct, and its repair is the
+    /// legal one (write the markup inline). This rule must not add a second row
+    /// telling the agent to move it into the body, which the *body*-JSX refusal
+    /// forbids — one root cause, one diagnostic.
+    #[test]
+    fn a_module_level_jsx_const_produces_exactly_one_ra014() {
+        let src = "\"use static\"\nconst header = <h1>x</h1>\nexport default function P(props: Record<never, never>) { return <p>{header}</p> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d.len(), 1, "one root cause, one row: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message
+                .contains("JSX outside the route's returned tree"),
+            "check_jsx owns this construct: {d:?}"
+        );
+        assert!(
+            !d[0]
+                .message
+                .contains("Move `header` into the component body"),
+            "the contradictory repair must be gone: {d:?}"
+        );
+    }
+
+    /// A default or namespace `"runai"` import is a form neither emitter writes,
+    /// so the *import rule* refuses it — once, at the declaration — in both
+    /// modes. The repair has to be one an agent can apply: rewriting the
+    /// declaration as named imports, never moving an `import` into a function
+    /// body, which is a syntax error.
+    #[test]
+    fn an_unwritable_runai_import_form_is_one_ra014_in_both_modes() {
+        for declaration in [
+            "import * as runai from \"runai\"",
+            "import runai from \"runai\"",
+        ] {
+            for directive in ["\"use static\"", "\"use island\""] {
+                let src = format!(
+                    "{directive}\n{declaration}\nexport default function P(props: Record<never, never>) {{ return <p>{{String(runai.owner)}}</p> }}\n"
+                );
+                let d = analyze(&src, "src/routes/index.page.tsx");
+                assert_eq!(
+                    d.len(),
+                    1,
+                    "{declaration} ({directive}): one row at the declaration: {d:?}"
+                );
+                assert_eq!(d[0].code, Code::RA014);
+                assert_eq!(
+                    d[0].line, 2,
+                    "{declaration}: the declaration is the site to edit: {d:?}"
+                );
+                assert!(
+                    d[0].message.contains("as named imports"),
+                    "{declaration}: the repair must be legal: {d:?}"
+                );
+                assert!(
+                    !d[0]
+                        .message
+                        .contains("Move `runai` into the component body"),
+                    "{declaration}: moving an import into a body is a syntax error: {d:?}"
+                );
+            }
+        }
     }
 
     #[test]

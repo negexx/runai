@@ -48,8 +48,8 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Expression, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild, JSXElement,
-    JSXExpression,
+    Declaration, Expression, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild,
+    JSXElement, JSXExpression, Program, Statement,
 };
 use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
@@ -58,7 +58,7 @@ use crate::analyze::jsx::{
     BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR, dom_tag,
     jsx_in_body_statements, jsx_outside_route_render, jsx_returns, jsx_spans, route_render,
 };
-use crate::analyze::{find_route_component, validate_route_component};
+use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
 use crate::diagnostic::{Code, Diagnostic};
 use crate::source::{Mode, detect_mode, has_line_break, lines, parse_tsx, raw_text};
 use crate::strip::strip_types;
@@ -115,7 +115,8 @@ pub enum IrNode {
 }
 
 /// A lowered route file: its rendering mode, its component name, the
-/// component's own statements, and its markup.
+/// component's own statements, the file's module-level statements, and its
+/// markup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteIr {
     pub mode: Mode,
@@ -132,6 +133,37 @@ pub struct RouteIr {
     /// a `.mjs`. A concise arrow body (`(props) => <p/>`) has no statements and
     /// this is empty.
     pub statements: String,
+    /// Every statement at **module scope** in the route file, as stripped
+    /// JavaScript, statements separated by newlines and kept in source order.
+    ///
+    /// Design §7.6 expects module-level state — "module-scope signals are
+    /// per-island too, since each island is its own module instance" — so the
+    /// emitters write this above the component rather than dropping it. A
+    /// module-level `const title = "About"` referenced from the markup is
+    /// therefore emittable, and [`crate::analyze::reachable`] treats it as
+    /// reachable.
+    ///
+    /// Three things are **not** here, each for a reason the emitters own:
+    ///
+    /// - the route component itself (its own declaration, and the `export
+    ///   default …`/`export { … as default }` statement that names it) — the
+    ///   emitters declare the component from `name` and `statements`;
+    /// - `import` declarations — the island emitter writes exactly one import,
+    ///   from the runtime URL, and the prerender module writes none at all;
+    /// - type declarations, which [`strip_types`] already erased.
+    ///
+    /// It is guaranteed **JSX-free**: [`crate::analyze::jsx::check_jsx`] refuses
+    /// module-level JSX in a route file before lowering runs, and
+    /// [`lower_route`] repeats the refusal as an invariant. JSX here would be a
+    /// syntax error in the emitted `.mjs` exactly as it would be in `statements`.
+    ///
+    /// **Ordering note for the emitters:** a module-level statement may read an
+    /// earlier one (`const raw = …; const items = raw.split(…)`), so these must
+    /// keep their relative order. Writing them above the component is the natural
+    /// placement; a module-level statement that *names the route component* is
+    /// only safe then if the route is a function declaration, which is hoisted —
+    /// no test pins that edge yet, and refusing it is Task 10/11's call.
+    pub module_statements: String,
     pub tree: IrNode,
 }
 
@@ -186,10 +218,11 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
         }
     }
 
-    // Module-level declarations are never emitted, so JSX there is dropped while
-    // the returned tree still refers to the symbol it was bound to. Same invariant
-    // as above, one scope out; the range and the reason are shared with the
-    // analysis, so the two lists cannot drift.
+    // A module-level statement's JSX would land in `module_statements`, which is
+    // copied into the emitted `.mjs`, where it is a syntax error — the same
+    // hazard as a body statement, one scope out. `check_jsx` refuses it on the
+    // original source; this is the invariant that keeps the two lists equal, and
+    // the construct and repair are shared so they cannot be described two ways.
     if let Some(span) = jsx_outside_route_render(program, &render) {
         return Err(vec![unsupported(
             span,
@@ -204,6 +237,7 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
         mode,
         name: info.display_name().to_string(),
         statements: statements(&stripped, render.body, render.return_span),
+        module_statements: module_statements(&stripped, program, &info),
         tree,
     })
 }
@@ -237,6 +271,129 @@ fn statements(
         text.trim_end_matches(|c: char| c.is_whitespace())
             .to_string()
     })
+}
+
+/// Every module-scope statement of the route file that the emitters should
+/// write, as stripped JavaScript, in source order.
+///
+/// Design §7.6 expects module-level state ("module-scope signals are per-island
+/// too"), so the emitters need the file's module level, not just the component
+/// body. Three kinds of statement are **not** included, each because an emitter
+/// owns it:
+///
+/// - `import` declarations — the island emitter writes exactly one import from
+///   the runtime URL and the prerender module writes none, so an import here
+///   would be a duplicate or an unresolvable module;
+/// - the route component's own declaration, and the `export default …` /
+///   `export { … as default }` statement that names it — the emitters declare
+///   the component from [`RouteIr::name`] and [`RouteIr::statements`], so
+///   keeping the original statement would declare it twice;
+/// - type declarations, which [`strip_types`] already erased, so they never
+///   appear in this source.
+///
+/// Slicing each statement's own span keeps multi-line declarations exactly as
+/// written, and keeps source order, which matters for a module-level `const` a
+/// later one reads.
+fn module_statements(source: &str, program: &Program<'_>, route: &ComponentInfo<'_>) -> String {
+    let route_start = route.signature_span.0;
+
+    let mut parts: Vec<String> = Vec::new();
+    for statement in &program.body {
+        if !is_emittable_module_statement(statement, route_start) {
+            // One statement can declare both the route and an ordinary value
+            // (`const title = "A", Page = (props) => <h1>{title}</h1>`). Dropping
+            // the whole statement would lose `title` while the tree still names
+            // it, so whatever declarators are *not* the route are rebuilt here.
+            if let Some(rebuilt) = rebuilt_declaration(source, statement, route) {
+                parts.push(rebuilt);
+            }
+            continue;
+        }
+        let span = statement.span();
+        if let Some(text) = raw_text(source, span) {
+            parts.push(
+                text.trim_end_matches(|c: char| c.is_whitespace())
+                    .to_string(),
+            );
+        }
+    }
+    parts.join("\n")
+}
+
+/// The part of a `const`/`let`/`var` statement that is **not** the route, or
+/// `None` when there is nothing left to emit.
+///
+/// Only a multi-declarator statement that also declares the route can produce
+/// this: `const a = 1, Page = …` keeps `const a = 1`, with the same declaration
+/// kind and the same `export` modifier. A single-declarator statement that *is*
+/// the route is dropped entirely, which is the ordinary shape.
+fn rebuilt_declaration(
+    source: &str,
+    statement: &Statement<'_>,
+    route: &ComponentInfo<'_>,
+) -> Option<String> {
+    let (declaration, exported) = match statement {
+        Statement::VariableDeclaration(declaration) => (declaration.as_ref(), false),
+        Statement::ExportDeclaration(named) => match &named.declaration {
+            Declaration::VariableDeclaration(declaration) => (declaration.as_ref(), true),
+            // `export function Page(…)` and `export default …` are the route's
+            // own declaration: there is nothing to rebuild.
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let mut kept: Vec<&str> = Vec::new();
+    for declarator in &declaration.declarations {
+        let id_span = declarator.id.span();
+        let is_route = id_span.start <= route.name_span.0 && route.name_span.0 < id_span.end;
+        if is_route {
+            continue;
+        }
+        kept.push(raw_text(source, declarator.span())?.trim());
+    }
+    if kept.is_empty() {
+        return None;
+    }
+
+    let kind = match declaration.kind {
+        oxc_ast::ast::VariableDeclarationKind::Const => "const",
+        oxc_ast::ast::VariableDeclarationKind::Let => "let",
+        oxc_ast::ast::VariableDeclarationKind::Var => "var",
+        oxc_ast::ast::VariableDeclarationKind::Using => "using",
+        oxc_ast::ast::VariableDeclarationKind::AwaitUsing => "await using",
+    };
+    let export = if exported { "export " } else { "" };
+    Some(format!("{export}{kind} {};", kept.join(", ")))
+}
+
+/// Whether one top-level statement belongs in [`RouteIr::module_statements`].
+///
+/// `route_start` is the start of the route component's own declaration, so the
+/// statement that declares it is excluded wherever it sits — including a
+/// `const Page = …`/`function Page(…)` that only a `export default Page` names.
+fn is_emittable_module_statement(statement: &Statement<'_>, route_start: u32) -> bool {
+    match statement {
+        Statement::ImportDeclaration(_) => false,
+        Statement::ExportDefaultDeclaration(_) => false,
+        // `export { Page as default }` is the route's export, not a module
+        // statement: the emitters write their own. Any other specifier
+        // (`export { helper }`) re-exports a real module value and stays.
+        Statement::ExportNamedDeclaration(declaration)
+            if declaration
+                .specifiers
+                .iter()
+                .any(|specifier| specifier.exported.name().as_str() == "default") =>
+        {
+            false
+        }
+        _ => !contains_start(statement.span(), route_start),
+    }
+}
+
+/// Whether `start` falls inside `span`.
+fn contains_start(span: Span, start: u32) -> bool {
+    span.start <= start && start < span.end
 }
 
 /// The tree walk. Holds the **stripped** source `program` was parsed from,
@@ -1473,10 +1630,10 @@ mod tests {
     /// returned.
     ///
     /// Separately, and for a different reason, a page whose markup names a
-    /// module-level value is refused by `analyze::reachable` while lowering still
-    /// accepts it. That is not a divergence to fix here: `statements` is body-only
-    /// by design, the reachability rule exists precisely because lowering cannot
-    /// see the difference, and `finding_a` below pins the pair.
+    /// module-level value is emitted by both: `analyze::reachable` treats it as
+    /// reachable and `module_statements` carries the declaration. Round 2 refused
+    /// it in `analyze` while lowering accepted it; the plan ruling reversed that,
+    /// and `finding_a_module_values_are_emitted_and_reachable` pins the pair.
     #[test]
     fn lowering_agrees_with_the_route_analyzer() {
         use crate::analyze::find_route_component;
@@ -1524,27 +1681,30 @@ mod tests {
         }
     }
 
-    /// The accept-then-reject contract, stated where it is cheapest to verify:
-    /// when a page's markup names a module-level value, `analyze` refuses it and
-    /// `lower_route` still succeeds with empty `statements`. Both halves are
-    /// asserted, because either one alone is the bug — deleting the rule brings
-    /// back `check` clean / `build` broken, and making lowering refuse it would be
-    /// a Task 10/11 contract change rather than this one.
+    /// The module-level constant from the brief, now legal. Round 2 refused it;
+    /// the plan ruling removed that refusal because the emitters carry
+    /// `module_statements`. Both halves are asserted, because the old defect was
+    /// `analyze` and `lower_route` disagreeing: lowering's `statements` stays
+    /// body-only **and** `module_statements` now declares what the tree names.
     ///
-    /// The body-local mirror is the control: the same expression, declared inside
-    /// the body, is emitted by `statements` and accepted by `analyze`, so this test
-    /// fails if the rule simply refuses every identifier reference.
+    /// The body-local mirror is the control: the same expression declared inside
+    /// the body lands in `statements`, not `module_statements`.
     #[test]
-    fn finding_a_module_values_are_refused_by_analysis_and_invisible_to_lowering() {
+    fn finding_a_module_values_are_emitted_and_reachable() {
         let module_level = "\"use static\"\nconst title = \"About\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n";
-        let analysis = crate::analyze::analyze(module_level, "src/routes/about.page.tsx");
-        assert_eq!(analysis.len(), 1, "{analysis:?}");
-        assert_eq!(analysis[0].code, Code::RA014);
+        assert!(
+            crate::analyze::analyze(module_level, "src/routes/about.page.tsx").is_empty(),
+            "a module-level value is emitted, so the tree may name it"
+        );
 
-        let route = crate::ir::lower_route(module_level).expect("lowering is body-only");
+        let route = crate::ir::lower_route(module_level).expect("a module-level value lowers");
         assert_eq!(
             route.statements, "",
-            "a module-level const is never emitted"
+            "the component body's own statements are still body-only"
+        );
+        assert_eq!(
+            route.module_statements, "const title = \"About\";",
+            "the module level carries exactly the declaration the tree names"
         );
         assert!(
             matches!(&route.tree, IrNode::Element { children, .. }
@@ -1556,14 +1716,156 @@ mod tests {
         let body_local = "\"use static\"\nexport default function Page(props: Record<never, never>) { const title = \"About\"; return <h1>{title}</h1> }\n";
         assert!(
             crate::analyze::analyze(body_local, "src/routes/about.page.tsx").is_empty(),
-            "a body local is the case the brief requires to stay legal"
+            "a body local is legal too"
         );
         let route = crate::ir::lower_route(body_local).expect("a body local lowers");
         assert!(
             route.statements.contains("const title = \"About\""),
-            "the declaration must be emitted when it is in the body: {:?}",
+            "a body declaration is emitted inside the component: {:?}",
             route.statements
         );
+        assert_eq!(
+            route.module_statements, "",
+            "a body declaration is not module scope: {:?}",
+            route.module_statements
+        );
+    }
+
+    // --- `module_statements`: the file's module level, emitted ---------------
+
+    /// The `const title` fixture, with its exact `module_statements` content so
+    /// Task 10 and Task 11 can be written against it. The `;` is Oxc's codegen,
+    /// not the source's.
+    #[test]
+    fn module_statements_carry_a_module_level_constant() {
+        let src = "\"use static\"\nconst title = \"About\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        assert_eq!(r.module_statements, "const title = \"About\";");
+        assert_eq!(r.statements, "", "the body is empty");
+    }
+
+    /// Source order, and every module-level declaration shape: a const, a
+    /// function, a class, and a module-level signal. A later declaration may read
+    /// an earlier one, so order is part of the contract.
+    #[test]
+    fn module_statements_keep_source_order() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nconst a = 1\nfunction twice(x) { return x * 2 }\nclass Store {}\nconst n = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{a}{twice(1)}{n()}</p> }\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        for (earlier, later) in [
+            ("const a = 1", "function twice"),
+            ("function twice", "class Store"),
+            ("class Store", "const n = signal(0)"),
+        ] {
+            let earlier_at = r
+                .module_statements
+                .find(earlier)
+                .unwrap_or_else(|| panic!("{earlier} missing: {:?}", r.module_statements));
+            let later_at = r
+                .module_statements
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} missing: {:?}", r.module_statements));
+            assert!(
+                earlier_at < later_at,
+                "module statements must keep source order: {:?}",
+                r.module_statements
+            );
+        }
+    }
+
+    /// Three kinds of statement are the emitters' own and must not appear:
+    /// imports (the island emitter writes one, the prerender module none), the
+    /// route component's declaration (the emitters rebuild it from `name` and
+    /// `statements`), and its `export default`/`export { … as default }`.
+    ///
+    /// Written for every route shape the analyzer accepts, because the excluded
+    /// statement's span differs per shape — an inline export, a named declaration
+    /// under `export`, and a `const` the default export refers to.
+    ///
+    /// The last fixture is the one that makes the import clause load-bearing:
+    /// `strip_types` drops an **unused** import, so the earlier fixtures would
+    /// pass with the exclusion deleted. Here `signal` is called in the body, the
+    /// stripped source keeps the import, and it must still not appear.
+    #[test]
+    fn module_statements_exclude_imports_and_the_route_itself() {
+        for src in [
+            "\"use static\"\nimport { signal } from \"runai\"\nconst title = \"A\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n",
+            "\"use static\"\nconst title = \"A\"\nexport function Page(props: Record<never, never>) { return <h1>{title}</h1> }\nexport default Page\n",
+            "\"use static\"\nconst title = \"A\"\nconst Page = (props: Record<never, never>) => <h1>{title}</h1>\nexport default Page\n",
+            "\"use static\"\nconst title = \"A\"\nconst Page = (props: Record<never, never>) => <h1>{title}</h1>\nexport { Page as default }\n",
+            // A surviving import: used in the body, so stripping keeps it.
+            "\"use island\"\nimport { signal } from \"runai\"\nconst title = \"A\"\nexport default function Page(props: Record<never, never>) { const n = signal(0); return <h1>{title}{n()}</h1> }\n",
+        ] {
+            let r = crate::ir::lower_route(src).unwrap();
+            assert!(
+                r.module_statements.contains("const title"),
+                "the module level must keep a non-route declaration: {:?}",
+                r.module_statements
+            );
+            assert!(
+                !r.module_statements.contains("import"),
+                "imports are the emitter's: {:?}",
+                r.module_statements
+            );
+            assert!(
+                !r.module_statements.contains("function Page")
+                    && !r.module_statements.contains("const Page")
+                    && !r.module_statements.contains("export"),
+                "the route's own declaration is the emitter's: {:?}",
+                r.module_statements
+            );
+        }
+    }
+
+    /// One statement can declare both the route and an ordinary value. Dropping
+    /// the whole statement would lose the value while the tree still names it —
+    /// the exact accept-then-reject shape this change removes, one level down. So
+    /// the non-route declarators are rebuilt with the same kind and `export`.
+    #[test]
+    fn module_statements_keep_a_value_declared_beside_the_route() {
+        let src = "\"use static\"\nconst title = \"A\", Page = (props: Record<never, never>) => <h1>{title}</h1>\nexport default Page\n";
+        let r = crate::ir::lower_route(src).unwrap();
+        assert_eq!(r.module_statements, "const title = \"A\";");
+        assert!(
+            crate::analyze::analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "the tree names `title`, which is emitted"
+        );
+
+        // An exported multi-declarator keeps the `export`, because a reader of the
+        // emitted module may import the value.
+        let exported = "\"use static\"\nexport const title = \"A\", Page = (props: Record<never, never>) => <h1>{title}</h1>\nexport default Page\n";
+        assert_eq!(
+            crate::ir::lower_route(exported).unwrap().module_statements,
+            "export const title = \"A\";"
+        );
+    }
+
+    /// A file with nothing at module scope has empty `module_statements`, and the
+    /// route-only file is the control that `""` is not simply always returned.
+    #[test]
+    fn module_statements_are_empty_when_there_is_nothing_to_emit() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        assert_eq!(crate::ir::lower_route(src).unwrap().module_statements, "");
+
+        let with_value = "\"use island\"\nconst n = 1\nexport default function P(props: Record<never, never>) { return <p>{n}</p> }\n";
+        assert_eq!(
+            crate::ir::lower_route(with_value)
+                .unwrap()
+                .module_statements,
+            "const n = 1;"
+        );
+    }
+
+    /// Module-level JSX is still refused, and now for the reason that stays true
+    /// after this change: `module_statements` is copied into the emitted `.mjs`,
+    /// where JSX is a syntax error. It is **one** diagnostic, owned by
+    /// `check_jsx`; lowering repeats it as an invariant.
+    #[test]
+    fn module_level_jsx_is_refused_and_never_reaches_module_statements() {
+        let src = "\"use static\"\nconst header = <h1>x</h1>\nexport default function P(props: Record<never, never>) { return <p>{header}</p> }\n";
+        let errs = crate::ir::lower_route(src).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].code, Code::RA014);
+        assert!(errs[0].message.contains(MODULE_JSX_CONSTRUCT), "{errs:?}");
     }
 
     /// Lowering's own refusals are invariants — analysis reports them first — but

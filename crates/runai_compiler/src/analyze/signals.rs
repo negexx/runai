@@ -415,20 +415,37 @@ fn import_symbols(program: &Program<'_>) -> Vec<(SymbolId, Primitive)> {
     symbols
 }
 
-/// The symbols of every **value** named import from `"runai"`, primitive or not.
+/// A value binding a `"runai"` import declares.
+///
+/// The island emitter writes exactly **one** import, merging the route's own
+/// `"runai"` *named* specifiers. A default (`import runai from "runai"`) or
+/// namespace (`import * as runai from "runai"`) binding is not a form it can
+/// write, because rewriting it would mean re-deriving every member access as a
+/// named import. So the two kinds are distinguished here rather than filtered,
+/// and each caller decides what to do with the un-writable half:
+/// [`crate::analyze::entry`] refuses it as an import that cannot be emitted, and
+/// [`crate::analyze::reachable`] leaves that refusal to the import rule instead
+/// of repeating it at every reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunaiImport {
+    pub symbol: SymbolId,
+    /// Whether the client emitter can write this binding: `true` only for a
+    /// plain value named specifier, aliases included (`{ owner as who }`).
+    pub named: bool,
+}
+
+/// Every **value** binding a `"runai"` import declares, named or not.
 ///
 /// [`import_symbols`] answers "which of these is a reactive primitive". This
-/// answers the broader question [`crate::analyze::reachable`] needs: "which
-/// `"runai"` names does this file bind at all", so a reference to `owner`,
-/// `template`, or `mount` — the runtime's other exports — is recognized as a
-/// `"runai"` import rather than reported as a module-level value.
+/// answers the broader question the reachability rule needs: "which `"runai"`
+/// names does this file bind at all", so a reference to `owner`, `template`, or
+/// `mount` — the runtime's other exports — is recognized as a `"runai"` import
+/// rather than reported as a module-level value.
 ///
-/// The bounds are exactly the client emitter's: a *named* value import. A
-/// default import (`import runai from "runai"`) and a namespace import
-/// (`import * as runai`) are not specifiers Task 11 writes, so they are not
-/// listed; on an island they are refused like any other unreachable name.
-pub(crate) fn runai_import_symbols(program: &Program<'_>) -> Vec<SymbolId> {
-    let mut symbols = Vec::new();
+/// `import type { X } from "runai"` and `import { type X } from "runai"` declare
+/// nothing at runtime — types are stripped — so they contribute no binding.
+pub(crate) fn runai_imports(program: &Program<'_>) -> Vec<RunaiImport> {
+    let mut imports = Vec::new();
     for statement in &program.body {
         let Statement::ImportDeclaration(declaration) = statement else {
             continue;
@@ -443,18 +460,26 @@ pub(crate) fn runai_import_symbols(program: &Program<'_>) -> Vec<SymbolId> {
             continue;
         };
         for specifier in specifiers {
-            let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier else {
-                continue;
+            let (local, named) = match specifier {
+                ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                    if specifier.import_kind == ImportOrExportKind::Type {
+                        continue;
+                    }
+                    (&specifier.local, true)
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
+                    (&specifier.local, false)
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
+                    (&specifier.local, false)
+                }
             };
-            if specifier.import_kind == ImportOrExportKind::Type {
-                continue;
-            }
-            if let Some(symbol) = specifier.local.symbol_id.get() {
-                symbols.push(symbol);
+            if let Some(symbol) = local.symbol_id.get() {
+                imports.push(RunaiImport { symbol, named });
             }
         }
     }
-    symbols
+    imports
 }
 
 /// The symbol `call`'s callee identifier resolves to, or `None`.
