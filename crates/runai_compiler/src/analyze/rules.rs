@@ -149,6 +149,12 @@ pub fn check_signal_rules(
 /// needs no runtime: it is evaluated once, at build time, and becomes text in the
 /// prerendered HTML. Only constructs that require code to run are refused.
 ///
+/// "Local" is load-bearing, and it is [`crate::analyze::reachable`]'s question
+/// rather than this rule's: `{title}` is allowed here whatever `title` binds to,
+/// because no runtime construct is involved either way. Whether the prerender
+/// module can *see* that binding — a body local yes, a module-level `const` no —
+/// is a separate refusal with its own message and its own repair.
+///
 /// [`SignalBindings::primitive_calls`]: crate::analyze::signals::SignalBindings::primitive_calls
 pub fn check_static_mode(
     mode: Mode,

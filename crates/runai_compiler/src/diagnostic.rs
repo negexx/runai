@@ -173,8 +173,16 @@ impl Code {
             }
             Code::RA014 => {
                 "The parser accepted this file: this is a limitation of the compiler, not a \
-                 syntax error. Lowering reports the construct instead of dropping it, because \
-                 markup emitted without part of a node is wrong in a way nothing reports."
+                 syntax error. It covers three families. A JSX construct this milestone cannot \
+                 lower (a component tag, a spread, a fragment root, and so on), where lowering \
+                 reports the construct instead of dropping it, because markup emitted without \
+                 part of a node is wrong in a way nothing reports. An `import` of any module \
+                 other than `\"runai\"`, because this milestone has no bundler: each route is \
+                 emitted from its own file, so a second module cannot be resolved or inlined. \
+                 And a value the generated module cannot see — a module-level declaration, or a \
+                 `\"runai\"` import used in a `\"use static\"` route's markup — because only the \
+                 component body's own statements are copied into the emitted module, so a \
+                 reference to anything else names a symbol that module never declares."
             }
         }
     }
@@ -230,10 +238,13 @@ impl Code {
                  are both accepted; escapes such as \"use\\x20static\" are not."
             }
             Code::RA014 => {
-                "Do what the message names for this construct: write the spread out, move the JSX \
-                 into the children or the returned tree, give the attribute or prop a value, wrap \
-                 a root fragment in one parent element, render a runtime primitive's markup \
-                 directly, or keep exactly one JSX return."
+                "Do what the message names for this construct: in JSX, write the spread out, move \
+                 the JSX into the children or the returned tree, give the attribute or prop a \
+                 value, wrap a root fragment in one parent element, render a runtime primitive's \
+                 markup directly, or keep exactly one JSX return. For an import, inline the value \
+                 or import it from `\"runai\"`. For a value the generated module cannot see, move \
+                 it into the component body or inline it; a `\"runai\"` value in a `\"use static\"` \
+                 route needs the directive changed to `\"use island\"`."
             }
         }
     }

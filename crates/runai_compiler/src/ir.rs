@@ -1471,6 +1471,12 @@ mod tests {
     /// lowering walk matched only a plain declaration, so a legal route got
     /// `RA011` telling it to return JSX from the default export it had already
     /// returned.
+    ///
+    /// Separately, and for a different reason, a page whose markup names a
+    /// module-level value is refused by `analyze::reachable` while lowering still
+    /// accepts it. That is not a divergence to fix here: `statements` is body-only
+    /// by design, the reachability rule exists precisely because lowering cannot
+    /// see the difference, and `finding_a` below pins the pair.
     #[test]
     fn lowering_agrees_with_the_route_analyzer() {
         use crate::analyze::find_route_component;
@@ -1516,6 +1522,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The accept-then-reject contract, stated where it is cheapest to verify:
+    /// when a page's markup names a module-level value, `analyze` refuses it and
+    /// `lower_route` still succeeds with empty `statements`. Both halves are
+    /// asserted, because either one alone is the bug — deleting the rule brings
+    /// back `check` clean / `build` broken, and making lowering refuse it would be
+    /// a Task 10/11 contract change rather than this one.
+    ///
+    /// The body-local mirror is the control: the same expression, declared inside
+    /// the body, is emitted by `statements` and accepted by `analyze`, so this test
+    /// fails if the rule simply refuses every identifier reference.
+    #[test]
+    fn finding_a_module_values_are_refused_by_analysis_and_invisible_to_lowering() {
+        let module_level = "\"use static\"\nconst title = \"About\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n";
+        let analysis = crate::analyze::analyze(module_level, "src/routes/about.page.tsx");
+        assert_eq!(analysis.len(), 1, "{analysis:?}");
+        assert_eq!(analysis[0].code, Code::RA014);
+
+        let route = crate::ir::lower_route(module_level).expect("lowering is body-only");
+        assert_eq!(
+            route.statements, "",
+            "a module-level const is never emitted"
+        );
+        assert!(
+            matches!(&route.tree, IrNode::Element { children, .. }
+                if matches!(children.as_slice(), [IrNode::Expr(expr)] if expr == "title")),
+            "{:?}",
+            route.tree
+        );
+
+        let body_local = "\"use static\"\nexport default function Page(props: Record<never, never>) { const title = \"About\"; return <h1>{title}</h1> }\n";
+        assert!(
+            crate::analyze::analyze(body_local, "src/routes/about.page.tsx").is_empty(),
+            "a body local is the case the brief requires to stay legal"
+        );
+        let route = crate::ir::lower_route(body_local).expect("a body local lowers");
+        assert!(
+            route.statements.contains("const title = \"About\""),
+            "the declaration must be emitted when it is in the body: {:?}",
+            route.statements
+        );
     }
 
     /// Lowering's own refusals are invariants — analysis reports them first — but

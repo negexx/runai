@@ -11,6 +11,7 @@ pub mod component;
 pub mod entry;
 pub mod jsx;
 pub mod props;
+pub mod reachable;
 pub mod rules;
 pub mod signals;
 
@@ -20,5 +21,6 @@ pub use component::{
 pub use entry::analyze;
 pub use jsx::check_jsx;
 pub use props::check_props;
+pub use reachable::check_reachable_expressions;
 pub use rules::{check_signal_rules, check_static_mode};
 pub use signals::{AccessorCall, SignalBindings, find_signal_bindings};

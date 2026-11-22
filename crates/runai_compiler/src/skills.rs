@@ -61,20 +61,37 @@ fn why(code: Code) -> &'static str {
              decision that controls the 0 KB guarantee."
         }
         Code::RA014 => {
-            "The constructs it refuses are a capitalized tag or member-expression tag (component \
-             inlining comes with a later plan), the runtime's own `<For>`/`<Show>`/`<When>` \
-             primitives (their lowering comes with a later plan and is not component inlining), \
-             a namespaced tag, a `<this>` tag, JSX inside a `{…}` expression, a JSX-valued \
-             attribute, a spread attribute or child, a fragment as the returned root, a second \
-             JSX return, JSX in any other route body statement, and JSX in a module-level \
-             statement of a route file. Each would either drop part of a node or copy JSX into a \
-             JavaScript module where it cannot parse; emitting without it is wrong in a way \
-             nothing reports. Module-level JSX is refused only in a file that has a route: a \
-             `.tsx` file with no default export is a component module, and a helper there may \
-             legitimately hold module-level JSX. The plan's later milestones lift these one \
-             slice at a time. An attribute with an empty expression (`name={}`) is deliberately \
-             **not** on this list: that is a parse error, reported as `RA007`, not valid syntax \
-             waiting for a later milestone."
+            "The code covers three families, and each would be wrong silently rather than loudly. \
+             \
+             The JSX constructs it refuses are a capitalized tag or member-expression tag \
+             (component inlining comes with a later plan), the runtime's own \
+             `<For>`/`<Show>`/`<When>` primitives (their lowering comes with a later plan and is \
+             not component inlining), a namespaced tag, a `<this>` tag, JSX inside a `{…}` \
+             expression, a JSX-valued attribute, a spread attribute or child, a fragment as the \
+             returned root, a second JSX return, JSX in any other route body statement, and JSX in \
+             a module-level statement of a route file. Each would either drop part of a node or \
+             copy JSX into a JavaScript module where it cannot parse. Module-level JSX is refused \
+             only in a file that has a route: a `.tsx` file with no default export is a component \
+             module, and a helper there may legitimately hold module-level JSX. The plan's later \
+             milestones lift these one slice at a time. \
+             \
+             An import of any module other than `\"runai\"` is refused because there is no \
+             bundler yet: each route is emitted from its own file's text, so a second module \
+             cannot be resolved or inlined, and the emitted module would not load. This lifts when \
+             bundling lands. `import type` — and the inline `import { type X }` form — is exempt, \
+             because types are stripped and leave no runtime import behind. \
+             \
+             The third family is a value the generated module cannot see; it is accept-then-reject \
+             in its most expensive form. Only the component body's own statements are copied into \
+             the emitted module, so a module-level declaration is never emitted, and a reference \
+             to one names a symbol that module never declares — `runai check` would report \
+             nothing and `runai build` would fail. The same is true of a `\"runai\"` import used in \
+             a `\"use static\"` route's markup, because the prerender module contains no imports at \
+             all. \
+             \
+             An attribute with an empty expression (`name={}`) is deliberately **not** on this \
+             list: that is a parse error, reported as `RA007`, not valid syntax waiting for a later \
+             milestone."
         }
     }
 }
@@ -208,6 +225,12 @@ mod tests {
     /// them one cold run at a time. Every construct `analyze::jsx::check_jsx`
     /// emits must appear here, and the empty-attribute case must be described as
     /// a parse error rather than listed as valid syntax.
+    ///
+    /// The import and unreachable-value families came second, and each needs its
+    /// own sentence: an agent that reads "a capitalized tag" for an import
+    /// diagnostic is told about a construct it did not write. The repair text for
+    /// each family is asserted too, because a skill whose fix does not apply is
+    /// the worst kind of defect in this repository.
     #[test]
     fn ra014_explains_that_the_syntax_is_valid() {
         let body = skill_body(Code::RA014);
@@ -246,5 +269,50 @@ mod tests {
             body.contains("that is a parse error, reported as `RA007`"),
             "the empty-attribute case must be described as a parse error: {body}"
         );
+    }
+
+    /// `entry.rs` reports `RA014` for `import x from "./data"`, and `reachable`
+    /// reports it for a module-level constant. The skill and the fix are what an
+    /// agent reads first, so both must describe those cases and give a repair that
+    /// is legal when applied verbatim: inlining the value, importing from
+    /// `"runai"`, moving the value into the body, or changing the directive.
+    #[test]
+    fn ra014_explains_the_import_and_unreachable_value_cases() {
+        let body = skill_body(Code::RA014);
+        for phrase in [
+            "An import of any module other than",
+            "no bundler yet",
+            "`import { type X }`",
+            "a value the generated module cannot see",
+            "module-level declaration",
+            "no imports at all",
+        ] {
+            assert!(
+                body.contains(phrase),
+                "the import/value families are missing `{phrase}`: {body}"
+            );
+        }
+
+        let fix = Code::RA014.fix_template();
+        for repair in [
+            "inline the value",
+            "import it from `\"runai\"`",
+            "move it into the component body",
+            "`\"use static\"`",
+            "`\"use island\"`",
+        ] {
+            assert!(fix.contains(repair), "missing repair `{repair}`: {fix}");
+        }
+
+        // The explain carries all three families, so `runai check` on an import
+        // diagnostic does not explain a JSX construct the file does not contain.
+        let explain = Code::RA014.explain();
+        for family in [
+            "JSX construct",
+            "An `import`",
+            "a value the generated module",
+        ] {
+            assert!(explain.contains(family), "missing `{family}`: {explain}");
+        }
     }
 }

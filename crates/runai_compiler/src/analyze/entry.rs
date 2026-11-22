@@ -8,7 +8,10 @@
 //! 2. for a page file: [`detect_mode`] and [`validate_route_component`];
 //! 3. for every `.tsx` file: `check_props` on every component, [`check_jsx`],
 //!    the import rule, and [`check_signal_rules`];
-//! 4. for a `"use static"` page: [`check_static_mode`].
+//! 4. for a `"use static"` page: [`check_static_mode`];
+//! 5. for a page whose mode is known: [`check_reachable_expressions`], so every
+//!    plain expression the markup evaluates names a binding the generated module
+//!    actually declares.
 //!
 //! A file whose name starts with `_` is **never** a page. `_shell.tsx` is a
 //! component module: it owes the props, JSX, import, and signal checks, but no
@@ -28,11 +31,12 @@
 //! `runai check` should see each problem once.
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{ImportOrExportKind, Program, Statement};
+use oxc_ast::ast::{ImportDeclarationSpecifier, ImportOrExportKind, Program, Statement};
 
 use crate::analyze::component::{find_components, find_route_component, validate_route_component};
 use crate::analyze::jsx::check_jsx;
 use crate::analyze::props::check_props;
+use crate::analyze::reachable::check_reachable_expressions;
 use crate::analyze::rules::{check_signal_rules, check_static_mode};
 use crate::analyze::signals::{PRIMITIVE_SOURCE, find_signal_bindings};
 use crate::diagnostic::{Code, Diagnostic};
@@ -117,6 +121,21 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
         diagnostics.extend(check_static_mode(Mode::Static, program, &bindings));
     }
 
+    // (5) A page whose mode is known: every value its markup names must exist in
+    // the module the build emits. Without a mode the build stops at `RA012`, and
+    // which module would be emitted — and therefore what is reachable — is
+    // undecided, so the rule would be guessing.
+    //
+    // This is the one second semantic build in the pipeline, and it is deliberate:
+    // `SignalBindings` records accessor calls, not arbitrary identifier
+    // references, and widening it would make the signal pass pay for a question it
+    // never asks. The rule returns immediately for a file with no route component,
+    // so a component module pays nothing here, and a page pays one extra build —
+    // not one per rule.
+    if let Some(mode) = mode {
+        diagnostics.extend(check_reachable_expressions(mode, program, &bindings));
+    }
+
     diagnostics
 }
 
@@ -138,10 +157,20 @@ fn is_page(path: &str) -> bool {
 /// the import is the only honest answer — emitting the file would produce a
 /// module that cannot load.
 ///
-/// `import type` is exempt, because types are stripped before anything is
-/// emitted: there is no runtime import left to resolve. Every other form
-/// (`import x from`, `import "./x"`, `import { x } from`, `import * as x from`)
-/// is a value import and is reported.
+/// **A type-only import is exempt, in both spellings TypeScript allows.** Types
+/// are stripped before anything is emitted, so there is no runtime import left to
+/// resolve:
+///
+/// - `import type { Data } from "./data"` — the whole declaration is a type
+///   import ([`ImportOrExportKind::Type`] on the declaration);
+/// - `import { type Data } from "./data"` — the *module* is a value import, but
+///   the only specifier in it is marked `Type` on the specifier, so nothing
+///   survives stripping. `signals::import_symbols` reads the same field for the
+///   same reason.
+///
+/// Every other form (`import x from`, `import "./x"`, `import {} from`,
+/// `import { x } from`, `import * as x from`, and a mixed `import { type T, x }`)
+/// keeps at least one runtime binding and is reported.
 fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
     program
         .body
@@ -150,12 +179,12 @@ fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
             let Statement::ImportDeclaration(declaration) = statement else {
                 return None;
             };
-            if declaration.import_kind == ImportOrExportKind::Type {
-                return None;
-            }
             let module = raw_text(source, declaration.source.span)
                 .unwrap_or_else(|| declaration.source.value.as_str().unwrap_or(""));
             if declaration.source.value.as_str() == Some(PRIMITIVE_SOURCE) {
+                return None;
+            }
+            if is_type_only_import(declaration) {
                 return None;
             }
             Some(Diagnostic::new(
@@ -171,13 +200,45 @@ fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Whether `declaration` binds nothing at runtime.
+///
+/// Two spellings, one fact. `import type { X } from "./x"` marks the declaration;
+/// `import { type X } from "./x"` marks each specifier instead, so the declaration
+/// looks like a value import to a check that reads only `import_kind`. The second
+/// form is what an agent gets from an editor's auto-import, and reporting it would
+/// demand a rewrite that fixes nothing.
+///
+/// An import with **no** specifiers (`import "./x.css"`) is not type-only: it is
+/// the side-effect form, and the module would still have to load.
+fn is_type_only_import(declaration: &oxc_ast::ast::ImportDeclaration<'_>) -> bool {
+    if declaration.import_kind == ImportOrExportKind::Type {
+        return true;
+    }
+    let Some(specifiers) = &declaration.specifiers else {
+        return false;
+    };
+    !specifiers.is_empty()
+        && specifiers.iter().all(|specifier| {
+            matches!(
+                specifier,
+                ImportDeclarationSpecifier::ImportSpecifier(specifier)
+                    if specifier.import_kind == ImportOrExportKind::Type
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::diagnostic::Code;
+    use crate::ir::{IrNode, lower_route};
 
     const P: &str = "export default function P(props: Record<never, never>)";
+
+    fn codes(d: &[Diagnostic]) -> Vec<Code> {
+        d.iter().map(|diagnostic| diagnostic.code).collect()
+    }
 
     #[test]
     fn static_route_with_handler_is_ra010() {
@@ -190,13 +251,23 @@ mod tests {
         assert_eq!(d[0].line, 2);
     }
 
+    /// The primitive is `RA010`; the read of the accessor it declared is **not**.
+    /// An exact count and span, so a rule that also flagged reads (a deleted
+    /// `.filter(|call| call.write)`) is visible rather than merely not-fatal.
     #[test]
     fn static_route_with_signal_is_ra010() {
         let src = format!(
             "\"use static\"\nimport {{ signal }} from \"runai\"\n{P} {{ const n = signal(0); return <p>{{n()}}</p> }}\n"
         );
         let d = analyze(&src, "src/routes/index.page.tsx");
-        assert!(d.iter().any(|x| x.code == Code::RA010), "{d:?}");
+        let ra010: Vec<_> = d.iter().filter(|x| x.code == Code::RA010).collect();
+        assert_eq!(ra010.len(), 1, "the primitive only, never the read: {d:?}");
+        assert_eq!(
+            &src[ra010[0].span.0 as usize..ra010[0].span.1 as usize],
+            "signal(0)",
+            "the span is the primitive call: {d:?}"
+        );
+        assert_eq!(codes(&d), vec![Code::RA010], "nothing else either: {d:?}");
     }
 
     #[test]
@@ -212,17 +283,58 @@ mod tests {
         assert!(analyze(&src, "src/routes/about.page.tsx").is_empty());
     }
 
+    /// Finding A, end to end. The canonical file from the brief: a module-level
+    /// constant referenced from the returned tree. `lower_route` accepts it and
+    /// its `statements` are empty — the module-level `const` is not emitted — so
+    /// the prerender module would reference a symbol it never declares.
+    ///
+    /// `analyze` runs first and must refuse it; that is what makes the two gates
+    /// agree. The test also asserts the mechanism, so a later reader sees *why*
+    /// the rule exists rather than trusting a comment.
+    #[test]
+    fn a_module_level_constant_referenced_by_the_tree_is_ra014() {
+        let src = "\"use static\"\nconst title = \"About\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n";
+        let d = analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert_eq!(d[0].line, 3, "the reference, not the declaration: {d:?}");
+        assert!(d[0].message.contains("`title`"), "{d:?}");
+        assert!(
+            d[0].message
+                .contains("Move `title` into the component body, or inline its value"),
+            "{d:?}"
+        );
+
+        // Lowering still succeeds: it is body-only and does not resolve names.
+        // This is exactly why the refusal has to happen in `analyze`.
+        let route = lower_route(src).expect("lowering does not resolve names");
+        assert_eq!(
+            route.statements, "",
+            "the module-level const is not emitted"
+        );
+        assert!(
+            matches!(&route.tree, IrNode::Element { children, .. }
+                if matches!(children.as_slice(), [IrNode::Expr(expr)] if expr == "title")),
+            "the tree still names `title`: {:?}",
+            route.tree
+        );
+    }
+
     #[test]
     fn shell_file_needs_no_directive() {
         let src = "export default function Shell(props: { children: JSX.Element }) { return <main>{props.children}</main> }\n";
         assert!(analyze(src, "src/routes/_shell.tsx").is_empty());
     }
 
+    /// The import rule's first branch, pinned by an **exact** code set. Every
+    /// other `"runai"` fixture asserts `.any(RA010)` or a length floor, so an
+    /// extra `RA014` — the exemption deleted — would have passed them all.
     #[test]
     fn foreign_import_is_ra014() {
         let src = format!("\"use static\"\nimport x from \"./data\"\n{P} {{ return <p>hi</p> }}\n");
         let d = analyze(&src, "src/routes/about.page.tsx");
-        assert_eq!(d[0].code, Code::RA014, "{d:?}");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert_eq!(d[0].line, 2, "the module specifier: {d:?}");
     }
 
     #[test]
@@ -234,6 +346,155 @@ mod tests {
     }
 
     // --- The rest is what the brief names but does not pin ---------------------
+
+    /// The `"runai"` exemption, pinned by an exact list in both modes. The island
+    /// fixture tolerates **no** code at all, so any spurious `RA014` is visible;
+    /// the static fixture asserts the primitive is the only code, so the import is
+    /// not a second one.
+    #[test]
+    fn a_runai_import_is_never_ra014() {
+        let island = format!(
+            "\"use island\"\nimport {{ signal }} from \"runai\"\n{P} {{ const n = signal(0); return <p>{{n()}}</p> }}\n"
+        );
+        assert_eq!(
+            codes(&analyze(&island, "src/routes/index.page.tsx")),
+            Vec::<Code>::new(),
+            "an island primitive is clean, and its import is not a second code"
+        );
+
+        let statik = format!(
+            "\"use static\"\nimport {{ signal }} from \"runai\"\n{P} {{ const n = signal(0); return <p>{{n()}}</p> }}\n"
+        );
+        assert_eq!(
+            codes(&analyze(&statik, "src/routes/index.page.tsx")),
+            vec![Code::RA010],
+            "the static route's only code is the primitive: {statik}"
+        );
+    }
+
+    /// `validate_route_component`, reached through `analyze`. Every other page
+    /// fixture has a valid default export, so deleting the call site would not
+    /// have failed any of them.
+    #[test]
+    fn a_page_with_no_default_export_is_ra011_through_analyze() {
+        let src = "\"use static\"\nexport function Page(props: Record<never, never>) { return <p>hi</p> }\n";
+        let d = analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA011], "{d:?}");
+        assert!(
+            d[0].message.contains("no default-exported component"),
+            "{d:?}"
+        );
+    }
+
+    /// `RA012`, emitted. Both `_shell` tests assert its *absence*; without this
+    /// fixture no page in the suite is a page without a directive, so the emission
+    /// could be deleted silently.
+    #[test]
+    fn a_page_with_no_directive_is_ra012() {
+        let src = "export default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let d = analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA012], "{d:?}");
+        assert_eq!(
+            (d[0].line, d[0].col),
+            (1, 1),
+            "the directive goes at the top"
+        );
+    }
+
+    /// One exact line per diagnostic family, so a span that quietly regresses to
+    /// `(1, 1)` is caught for every code — not only for the handler. `RA011` and
+    /// `RA012` genuinely point at `1:1`; every other family points at a real
+    /// construct, and the line differs from 1.
+    #[test]
+    fn every_diagnostic_family_is_located_on_its_own_line() {
+        let fixtures: [(Code, &str, u32); 9] = [
+            (
+                Code::RA001,
+                "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); const x = n(); return <p/> }\n",
+                3,
+            ),
+            (
+                Code::RA002,
+                "\"use island\"\nimport { signal, effect } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); effect(() => { n(1) }); return <p/> }\n",
+                3,
+            ),
+            (
+                Code::RA006,
+                "export default function Shell(props) { return <main>x</main> }\n",
+                1,
+            ),
+            (
+                Code::RA007,
+                "\"use static\"\nexport default function P(props: Record<never, never>) { return <div> }\n",
+                2,
+            ),
+            (
+                Code::RA009,
+                "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); n(1); return <p/> }\n",
+                3,
+            ),
+            (
+                Code::RA010,
+                "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onClick={() => {}}>x</button> }\n",
+                2,
+            ),
+            (
+                Code::RA011,
+                "\"use static\"\nexport function Page(props: Record<never, never>) { return <p>hi</p> }\n",
+                1,
+            ),
+            (
+                Code::RA012,
+                "export default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                1,
+            ),
+            (
+                Code::RA014,
+                "\"use static\"\nimport x from \"./data\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                2,
+            ),
+        ];
+
+        for (code, src, line) in fixtures {
+            let path = if code == Code::RA006 {
+                "src/routes/_shell.tsx"
+            } else {
+                "src/routes/index.page.tsx"
+            };
+            let d = analyze(src, path);
+            let diagnostic = d
+                .iter()
+                .find(|diagnostic| diagnostic.code == code)
+                .unwrap_or_else(|| panic!("{} was not reported: {d:?}", code.as_str()));
+            assert_eq!(
+                diagnostic.line,
+                line,
+                "{} is on the wrong line: {diagnostic:?}",
+                code.as_str()
+            );
+            assert_eq!(diagnostic.file, path, "{diagnostic:?}");
+        }
+    }
+
+    /// `check_props` runs once per component, never a second time for the route.
+    /// The route is the component most likely to be validated twice — it is both
+    /// "the default export" and "a component in the file" — so an untyped one must
+    /// still produce **one** `RA006`, not two.
+    ///
+    /// The other page fixtures use a *typed* `P`, so they cannot prove this: a
+    /// duplicate `RA006` needs an untyped route to exist. This is the fixture that
+    /// does, and its exact length is the assertion.
+    #[test]
+    fn an_untyped_route_produces_one_ra006_not_two() {
+        let src = "\"use static\"\nexport default function P(props) { return <p>hi</p> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA006], "{d:?}");
+
+        // The same route in a component module: still one, with no directive owed.
+        let module = "export default function P(props) { return <p>hi</p> }\n";
+        let d = analyze(module, "src/routes/_shell.tsx");
+        assert_eq!(codes(&d), vec![Code::RA006], "{d:?}");
+    }
 
     /// `_shell.tsx` is not a page, so it owes no directive — but it is still a
     /// component module, so its components owe a written props type. Both halves
@@ -253,13 +514,32 @@ mod tests {
 
     /// The import rule, both halves: a foreign module is `RA014`, and a type-only
     /// import is exempt because types are stripped before anything is emitted.
+    ///
+    /// Both spellings TypeScript allows are exempt. `import { type Data }` is the
+    /// one an editor's auto-import produces, and it leaves the declaration a
+    /// *value* import while marking the specifier — so a check reading only
+    /// `import_kind` would report a type it must not.
     #[test]
     fn a_type_only_import_is_not_ra014() {
-        let src = format!(
-            "\"use static\"\nimport type {{ Data }} from \"./data\"\n{P} {{ return <p>hi</p> }}\n"
+        for declaration in [
+            "import type { Data } from \"./data\"",
+            "import { type Data } from \"./data\"",
+            "import { type A, type B } from \"./data\"",
+        ] {
+            let src = format!("\"use static\"\n{declaration}\n{P} {{ return <p>hi</p> }}\n");
+            let d = analyze(&src, "src/routes/about.page.tsx");
+            assert!(d.is_empty(), "{declaration}: {d:?}");
+        }
+
+        // One value specifier beside a type one is still a runtime import.
+        let mixed = format!(
+            "\"use static\"\nimport {{ type Data, x }} from \"./data\"\n{P} {{ return <p>hi</p> }}\n"
         );
-        let d = analyze(&src, "src/routes/about.page.tsx");
-        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(
+            codes(&analyze(&mixed, "src/routes/about.page.tsx")),
+            vec![Code::RA014],
+            "{mixed}"
+        );
     }
 
     /// `import type` is exempt, but a *value* import is not, whichever its shape.
@@ -273,8 +553,7 @@ mod tests {
         ] {
             let src = format!("\"use static\"\n{declaration}\n{P} {{ return <p>hi</p> }}\n");
             let d = analyze(&src, "src/routes/about.page.tsx");
-            assert_eq!(d.len(), 1, "{declaration}: {d:?}");
-            assert_eq!(d[0].code, Code::RA014, "{declaration}");
+            assert_eq!(codes(&d), vec![Code::RA014], "{declaration}: {d:?}");
             assert!(
                 d[0].message.contains("\"./data\""),
                 "{declaration}: the message must name the module: {d:?}"

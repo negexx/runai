@@ -1345,6 +1345,13 @@ mod tests {
 
     /// A module-level statement with no JSX is ordinary: an import, a constant, a
     /// helper. Refusing those would reject every real page.
+    ///
+    /// This is a statement about **this walk only**, and the first fixture is
+    /// deliberately the shape `analyze::reachable` refuses for a page: `check_jsx`
+    /// has no business with a constant, and the reference to it is a different
+    /// question with its own code and message. Keeping that fixture here is what
+    /// stops a future reader from moving the reachability rule into this walk,
+    /// where it would refuse a component module's legal module-level value.
     #[test]
     fn module_level_statements_without_jsx_are_clean() {
         for src in [

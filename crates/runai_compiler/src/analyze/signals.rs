@@ -415,6 +415,48 @@ fn import_symbols(program: &Program<'_>) -> Vec<(SymbolId, Primitive)> {
     symbols
 }
 
+/// The symbols of every **value** named import from `"runai"`, primitive or not.
+///
+/// [`import_symbols`] answers "which of these is a reactive primitive". This
+/// answers the broader question [`crate::analyze::reachable`] needs: "which
+/// `"runai"` names does this file bind at all", so a reference to `owner`,
+/// `template`, or `mount` — the runtime's other exports — is recognized as a
+/// `"runai"` import rather than reported as a module-level value.
+///
+/// The bounds are exactly the client emitter's: a *named* value import. A
+/// default import (`import runai from "runai"`) and a namespace import
+/// (`import * as runai`) are not specifiers Task 11 writes, so they are not
+/// listed; on an island they are refused like any other unreachable name.
+pub(crate) fn runai_import_symbols(program: &Program<'_>) -> Vec<SymbolId> {
+    let mut symbols = Vec::new();
+    for statement in &program.body {
+        let Statement::ImportDeclaration(declaration) = statement else {
+            continue;
+        };
+        if declaration.source.value.as_str() != Some(PRIMITIVE_SOURCE) {
+            continue;
+        }
+        if declaration.import_kind == ImportOrExportKind::Type {
+            continue;
+        }
+        let Some(specifiers) = &declaration.specifiers else {
+            continue;
+        };
+        for specifier in specifiers {
+            let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier else {
+                continue;
+            };
+            if specifier.import_kind == ImportOrExportKind::Type {
+                continue;
+            }
+            if let Some(symbol) = specifier.local.symbol_id.get() {
+                symbols.push(symbol);
+            }
+        }
+    }
+    symbols
+}
+
 /// The symbol `call`'s callee identifier resolves to, or `None`.
 ///
 /// Only a plain identifier callee can be a primitive or an accessor: `runai.signal(0)`
