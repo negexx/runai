@@ -75,19 +75,25 @@ fn why(code: Code) -> &'static str {
              module, and a helper there may legitimately hold module-level JSX. The plan's later \
              milestones lift these one slice at a time. \
              \
-             An import the emitted module cannot write is refused for one of two reasons. A \
-             module other than `\"runai\"` has no bundler yet: each route is emitted from its own \
-             file's text, so a second module cannot be resolved or inlined, and the emitted module \
-             would not load. This lifts when bundling lands. A default (`import runai from \
-             \"runai\"`) or namespace (`import * as runai from \"runai\"`) import of `\"runai\"` is \
-             refused because the island emitter writes exactly one import, merging the route's \
-             named specifiers only; the repair is to rewrite the declaration as named imports. \
-             `import type` — and the inline `import { type X }` form — is exempt, because types are \
-             stripped and leave no runtime import behind. \
+             An import or re-export the emitted module cannot resolve or write is refused for one \
+             of three reasons. A module other than `\"runai\"` has no bundler yet: each route is \
+             emitted from its own file's text, so a second module can be neither resolved nor \
+             inlined, and the emitted module would not load. The same holds for a re-export \
+             (`export … from \"./x\"`, `export * from \"./x\"`): the emitted file writes one \
+             import or none, so the statement names a module nothing resolves. This lifts when \
+             bundling lands. A default (`import runai from \"runai\"`) or namespace (`import * as \
+             runai from \"runai\"`) import of `\"runai\"` is refused because the island emitter \
+             writes exactly one import, merging the route's named specifiers only; the repair is \
+             to rewrite the declaration as named imports. And the CommonJS spellings TypeScript \
+             allows — `import x = require(\"./x\")` and `export = x` — are refused because type \
+             stripping rewrites them to `require(…)` and `module.exports = …`, which an ES module \
+             does not have. `import type` — and the inline `import { type X }` form — is exempt, \
+             because types are stripped and leave no runtime import behind. \
              \
              The third family is a value the generated module genuinely cannot see, and it has \
-             two members only. A `\"runai\"` import used in a `\"use static\"` route's markup is \
-             refused because the prerender module contains no imports at all, so the repair is the \
+             two members only. A `\"runai\"` name, or the route component's own name, used at \
+             module scope or in a `\"use static\"` route's markup is refused because the prerender \
+             module contains no imports and does not declare the component, so the repair is the \
              directive, `\"use island\"`. The route's own parameter in a `\"use static\"` route is \
              refused because `render()` takes no arguments, so `{props}` would be `undefined` at \
              build time. A module-level declaration is deliberately **not** in this family: \
@@ -291,13 +297,17 @@ mod tests {
     fn ra014_explains_the_import_and_unreachable_value_cases() {
         let body = skill_body(Code::RA014);
         for phrase in [
-            "An import the emitted module cannot write",
+            "An import or re-export the emitted module cannot resolve or write",
             "no bundler yet",
             "`import { type X }`",
             "namespace (`import * as runai from \"runai\"`)",
             "rewrite the declaration as named imports",
+            "`export … from \"./x\"`",
+            "`import x = require(\"./x\")`",
+            "`export = x`",
             "a value the generated module genuinely cannot see",
-            "no imports at all",
+            "no imports and does not declare the component",
+            "route component's own name",
             "route's own parameter",
         ] {
             assert!(
@@ -319,13 +329,15 @@ mod tests {
             "rewrite it as named imports",
             "`\"use island\"`",
             "write the value in the component body",
+            "`export =` as `export default`",
         ] {
             assert!(fix.contains(repair), "missing repair `{repair}`: {fix}");
         }
         // The import clause comes first: an agent reading only `fix` on an import
         // diagnostic must not be led to the JSX repairs.
         assert!(
-            fix.find("For an import").unwrap() < fix.find("For a JSX construct").unwrap(),
+            fix.find("For an import or re-export").unwrap()
+                < fix.find("For a JSX construct").unwrap(),
             "the import repair must precede the JSX repairs: {fix}"
         );
 
@@ -334,8 +346,9 @@ mod tests {
         let explain = Code::RA014.explain();
         for family in [
             "JSX construct",
-            "An `import`",
+            "an `import` or re-export",
             "a value the generated module",
+            "`import x = require(…)`",
         ] {
             assert!(explain.contains(family), "missing `{family}`: {explain}");
         }

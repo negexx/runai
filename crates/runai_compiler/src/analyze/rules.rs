@@ -152,8 +152,9 @@ pub fn check_signal_rules(
 /// "Local" is load-bearing, and it is [`crate::analyze::reachable`]'s question
 /// rather than this rule's: `{title}` is allowed here whatever `title` binds to,
 /// because no runtime construct is involved either way. Whether the prerender
-/// module can *see* that binding — a body local yes, a module-level `const` no —
-/// is a separate refusal with its own message and its own repair.
+/// module can *see* that binding — a body local or a module-level `const` yes, a
+/// `"runai"` import or the route's own component no — is that rule's question,
+/// not a separate refusal here.
 ///
 /// [`SignalBindings::primitive_calls`]: crate::analyze::signals::SignalBindings::primitive_calls
 pub fn check_static_mode(

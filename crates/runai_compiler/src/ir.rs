@@ -143,13 +143,17 @@ pub struct RouteIr {
     /// therefore emittable, and [`crate::analyze::reachable`] treats it as
     /// reachable.
     ///
-    /// Three things are **not** here, each for a reason the emitters own:
+    /// Four things are **not** here, each for a reason the emitters own:
     ///
     /// - the route component itself (its own declaration, and the `export
     ///   default …`/`export { … as default }` statement that names it) — the
     ///   emitters declare the component from `name` and `statements`;
     /// - `import` declarations — the island emitter writes exactly one import,
     ///   from the runtime URL, and the prerender module writes none at all;
+    /// - a re-export (`export … from "./x"`, `export * from "./x"`) — it points
+    ///   at another module, and the emitted module either has one import (an
+    ///   island's, from the runtime URL) or none. `check_imports` refuses it for
+    ///   the same reason, so this is the invariant, not the agent's first signal;
     /// - type declarations, which [`strip_types`] already erased.
     ///
     /// It is guaranteed **JSX-free**: [`crate::analyze::jsx::check_jsx`] refuses
@@ -295,29 +299,110 @@ fn statements(
 /// written, and keeps source order, which matters for a module-level `const` a
 /// later one reads.
 fn module_statements(source: &str, program: &Program<'_>, route: &ComponentInfo<'_>) -> String {
-    let route_start = route.signature_span.0;
-
     let mut parts: Vec<String> = Vec::new();
-    for statement in &program.body {
-        if !is_emittable_module_statement(statement, route_start) {
-            // One statement can declare both the route and an ordinary value
-            // (`const title = "A", Page = (props) => <h1>{title}</h1>`). Dropping
-            // the whole statement would lose `title` while the tree still names
-            // it, so whatever declarators are *not* the route are rebuilt here.
-            if let Some(rebuilt) = rebuilt_declaration(source, statement, route) {
-                parts.push(rebuilt);
+    for part in emitted_module_parts(program, route) {
+        match part {
+            EmittedModulePart::Statement(statement) => {
+                if let Some(text) = raw_text(source, statement.span()) {
+                    parts.push(
+                        text.trim_end_matches(|c: char| c.is_whitespace())
+                            .to_string(),
+                    );
+                }
             }
-            continue;
-        }
-        let span = statement.span();
-        if let Some(text) = raw_text(source, span) {
-            parts.push(
-                text.trim_end_matches(|c: char| c.is_whitespace())
-                    .to_string(),
-            );
+            EmittedModulePart::Declarators {
+                kind,
+                exported,
+                declarators,
+            } => {
+                let kind = match kind {
+                    oxc_ast::ast::VariableDeclarationKind::Const => "const",
+                    oxc_ast::ast::VariableDeclarationKind::Let => "let",
+                    oxc_ast::ast::VariableDeclarationKind::Var => "var",
+                    oxc_ast::ast::VariableDeclarationKind::Using => "using",
+                    oxc_ast::ast::VariableDeclarationKind::AwaitUsing => "await using",
+                };
+                let mut kept: Vec<&str> = Vec::new();
+                for declarator in declarators {
+                    match raw_text(source, declarator.span()) {
+                        Some(text) => kept.push(text.trim()),
+                        None => return String::new(),
+                    }
+                }
+                let export = if exported { "export " } else { "" };
+                parts.push(format!("{export}{kind} {};", kept.join(", ")));
+            }
         }
     }
     parts.join("\n")
+}
+
+/// The part of the file's module level that one emitter writes.
+///
+/// [`module_statements`] renders these to text and
+/// [`crate::analyze::reachable`] walks them for references. Two consumers, one
+/// definition of "emitted", so a statement cannot be carried into the module
+/// without its names being checked, or checked while never being written.
+pub(crate) enum EmittedModulePart<'a, 'b> {
+    /// One whole statement, sliced from its own span and emitted verbatim.
+    Statement(&'b Statement<'a>),
+    /// The non-route declarators of a statement that also declares the route.
+    /// Rebuilt with the same declaration kind and `export` modifier.
+    Declarators {
+        kind: oxc_ast::ast::VariableDeclarationKind,
+        exported: bool,
+        declarators: Vec<&'b oxc_ast::ast::VariableDeclarator<'a>>,
+    },
+}
+
+impl<'a, 'b> EmittedModulePart<'a, 'b> {
+    /// Visit exactly the nodes the emitted module carries for this part.
+    ///
+    /// A declarator's own binding id is a `BindingIdentifier`, not an
+    /// `IdentifierReference`, so a visitor that records references does not see
+    /// the name being *declared* — only the names it *reads*.
+    pub(crate) fn visit(&self, visitor: &mut impl Visit<'a>) {
+        match self {
+            EmittedModulePart::Statement(statement) => visitor.visit_statement(statement),
+            EmittedModulePart::Declarators { declarators, .. } => {
+                for declarator in declarators {
+                    visitor.visit_variable_declarator(declarator);
+                }
+            }
+        }
+    }
+}
+
+/// Every module-level part the emitters write, in source order.
+///
+/// Three kinds of statement are **not** here, each because an emitter owns it:
+/// an `import` ([`is_emitter_owned_statement`]); the route component's own
+/// declaration and its `export … default` (the emitters rebuild the component
+/// from [`RouteIr::name`] and [`RouteIr::statements`]); and a re-export, which
+/// names a second module the emitted file does not import.
+pub(crate) fn emitted_module_parts<'a, 'b>(
+    program: &'b Program<'a>,
+    route: &ComponentInfo<'a>,
+) -> Vec<EmittedModulePart<'a, 'b>> {
+    let mut parts = Vec::new();
+    for statement in &program.body {
+        if is_emitter_owned_statement(statement) {
+            continue;
+        }
+        // A declaration that *is* the route is the emitters' own. One statement
+        // can declare both the route and an ordinary value
+        // (`const title = "A", Page = …`), and only the route declarator is
+        // dropped: dropping the whole statement would lose `title` while the
+        // tree still names it.
+        if !contains_start(statement.span(), route.signature_span.0) {
+            parts.push(EmittedModulePart::Statement(statement));
+            continue;
+        }
+        if let Some(part) = rebuilt_declaration(statement, route) {
+            parts.push(part);
+        }
+    }
+    parts
 }
 
 /// The part of a `const`/`let`/`var` statement that is **not** the route, or
@@ -327,11 +412,10 @@ fn module_statements(source: &str, program: &Program<'_>, route: &ComponentInfo<
 /// this: `const a = 1, Page = …` keeps `const a = 1`, with the same declaration
 /// kind and the same `export` modifier. A single-declarator statement that *is*
 /// the route is dropped entirely, which is the ordinary shape.
-fn rebuilt_declaration(
-    source: &str,
-    statement: &Statement<'_>,
-    route: &ComponentInfo<'_>,
-) -> Option<String> {
+fn rebuilt_declaration<'a, 'b>(
+    statement: &'b Statement<'a>,
+    route: &ComponentInfo<'a>,
+) -> Option<EmittedModulePart<'a, 'b>> {
     let (declaration, exported) = match statement {
         Statement::VariableDeclaration(declaration) => (declaration.as_ref(), false),
         Statement::ExportDeclaration(named) => match &named.declaration {
@@ -343,52 +427,64 @@ fn rebuilt_declaration(
         _ => return None,
     };
 
-    let mut kept: Vec<&str> = Vec::new();
-    for declarator in &declaration.declarations {
-        let id_span = declarator.id.span();
-        let is_route = id_span.start <= route.name_span.0 && route.name_span.0 < id_span.end;
-        if is_route {
-            continue;
-        }
-        kept.push(raw_text(source, declarator.span())?.trim());
-    }
-    if kept.is_empty() {
+    let declarators: Vec<&'b oxc_ast::ast::VariableDeclarator<'a>> = declaration
+        .declarations
+        .iter()
+        .filter(|declarator| !is_route_declarator(declarator, route.name_span))
+        .collect();
+    if declarators.is_empty() {
         return None;
     }
 
-    let kind = match declaration.kind {
-        oxc_ast::ast::VariableDeclarationKind::Const => "const",
-        oxc_ast::ast::VariableDeclarationKind::Let => "let",
-        oxc_ast::ast::VariableDeclarationKind::Var => "var",
-        oxc_ast::ast::VariableDeclarationKind::Using => "using",
-        oxc_ast::ast::VariableDeclarationKind::AwaitUsing => "await using",
-    };
-    let export = if exported { "export " } else { "" };
-    Some(format!("{export}{kind} {};", kept.join(", ")))
+    Some(EmittedModulePart::Declarators {
+        kind: declaration.kind,
+        exported,
+        declarators,
+    })
 }
 
-/// Whether one top-level statement belongs in [`RouteIr::module_statements`].
+/// Whether `statement` is one the emitters own outright, so
+/// [`RouteIr::module_statements`] never contains it.
 ///
-/// `route_start` is the start of the route component's own declaration, so the
-/// statement that declares it is excluded wherever it sits — including a
-/// `const Page = …`/`function Page(…)` that only a `export default Page` names.
-fn is_emittable_module_statement(statement: &Statement<'_>, route_start: u32) -> bool {
+/// - an `import`: the island emitter writes exactly one, from the runtime URL,
+///   and the prerender module writes none;
+/// - `export default …` and `export { … as default }`: the route's export, which
+///   the emitters rebuild from [`RouteIr::name`] and [`RouteIr::statements`];
+/// - `export … from "./x"` and `export * from "./x"`: a re-export names another
+///   module, and the emitted module imports nothing from it. A route file has
+///   nothing legitimate to re-export in this milestone, and `check_imports`
+///   refuses the statement first, so this is the invariant rather than the
+///   agent's first signal. `export { helper }` for a *local* binding is a
+///   different statement and stays.
+fn is_emitter_owned_statement(statement: &Statement<'_>) -> bool {
     match statement {
-        Statement::ImportDeclaration(_) => false,
-        Statement::ExportDefaultDeclaration(_) => false,
-        // `export { Page as default }` is the route's export, not a module
-        // statement: the emitters write their own. Any other specifier
-        // (`export { helper }`) re-exports a real module value and stays.
+        Statement::ImportDeclaration(_) => true,
+        Statement::ExportDefaultDeclaration(_) => true,
+        Statement::ExportAllDeclaration(_) | Statement::ExportFromDeclaration(_) => true,
         Statement::ExportNamedDeclaration(declaration)
             if declaration
                 .specifiers
                 .iter()
                 .any(|specifier| specifier.exported.name().as_str() == "default") =>
         {
-            false
+            true
         }
-        _ => !contains_start(statement.span(), route_start),
+        _ => false,
     }
+}
+
+/// Whether a `const`/`let`/`var` declarator declares the route component.
+///
+/// One statement can declare both the route and an ordinary value
+/// (`const title = "A", Page = (props) => …`), and only the route declarator is
+/// the emitters' own: [`emitted_module_parts`] drops just that one, and
+/// [`crate::analyze::reachable`] walks just the others.
+pub(crate) fn is_route_declarator(
+    declarator: &oxc_ast::ast::VariableDeclarator<'_>,
+    route_name: (u32, u32),
+) -> bool {
+    let id_span = declarator.id.span();
+    id_span.start <= route_name.0 && route_name.0 < id_span.end
 }
 
 /// Whether `start` falls inside `span`.
@@ -1744,6 +1840,59 @@ mod tests {
         assert_eq!(r.statements, "", "the body is empty");
     }
 
+    /// `emitted_module_parts` is the one definition of "emitted" that both
+    /// consumers share: [`module_statements`] renders it, and
+    /// `crate::analyze::reachable` walks it for references. Pinned here so the
+    /// pair cannot drift into "carried but unchecked" or "checked but never
+    /// written": the parts list is compared against the text it renders.
+    #[test]
+    fn emitted_module_parts_and_rendered_statements_agree() {
+        use oxc_allocator::Allocator;
+
+        for src in [
+            // A plain declaration.
+            "\"use static\"\nconst title = \"A\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n",
+            // One statement declaring both the route and a value.
+            "\"use static\"\nconst title = \"A\", Page = (props: Record<never, never>) => <h1>{title}</h1>\nexport default Page\n",
+            // An import and a re-export that must be excluded.
+            "\"use static\"\nimport { owner } from \"runai\"\nexport * from \"./data\"\nconst title = owner\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n",
+            // Nothing at module scope at all.
+            "\"use static\"\nexport default function Page(props: Record<never, never>) { return <p>hi</p> }\n",
+        ] {
+            let alloc = Allocator::default();
+            let stripped = crate::strip::strip_types(src).unwrap();
+            let program = crate::source::parse_tsx(&alloc, &stripped).unwrap();
+            let route = crate::analyze::find_route_component(program).unwrap();
+            let parts = emitted_module_parts(program, &route);
+            let rendered = module_statements(&stripped, program, &route);
+
+            // A parts list and its rendering carry the same statements: the
+            // declarator form renders to one `kind …;` line per part, and an
+            // empty list renders to `""`. Mismatches would mean the walk and the
+            // text disagree about what the emitted module holds.
+            if parts.is_empty() {
+                assert_eq!(rendered, "", "{src}");
+            } else {
+                assert!(!rendered.is_empty(), "{src}: the parts list is not empty");
+            }
+
+            // The excluded statements never render: an `import`, the route's own
+            // declaration, and a re-export.
+            for forbidden in [
+                "import ",
+                "function Page",
+                "const Page",
+                "export *",
+                "from \"./data\"",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "{forbidden} leaked into the emitted text: {rendered:?}"
+                );
+            }
+        }
+    }
+
     /// Source order, and every module-level declaration shape: a const, a
     /// function, a class, and a module-level signal. A later declaration may read
     /// an earlier one, so order is part of the contract.
@@ -1814,6 +1963,49 @@ mod tests {
                 r.module_statements
             );
         }
+    }
+
+    /// A re-export is never emitted. `export … from` and `export * from` name a
+    /// second module, and the emitted file writes one import (the island's, from
+    /// the runtime URL) or none, so the statement would re-export from a module
+    /// nothing resolves. This is the `module_statements` half of Finding 2; the
+    /// `analyze` half is pinned in `entry::tests::a_reexport_…`.
+    ///
+    /// The control is the `export { helper }` local re-export: a different
+    /// statement, naming this file's own binding, which *is* emitted.
+    #[test]
+    fn module_statements_exclude_a_reexport() {
+        for statement in [
+            "export * from \"./data\"",
+            "export { team } from \"./data\"",
+        ] {
+            let src = format!(
+                "\"use static\"\n{statement}\nexport default function Page(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            let route = crate::ir::lower_route(&src).unwrap();
+            assert_eq!(
+                route.module_statements, "",
+                "{statement} must not be emitted: {:?}",
+                route.module_statements
+            );
+        }
+
+        // `export * from "runai"` is the same statement shape: nothing is
+        // re-exported, even though the import rule does not refuse the source.
+        let runai = "\"use static\"\nexport * from \"runai\"\nexport default function Page(props: Record<never, never>) { return <p>hi</p> }\n";
+        assert_eq!(
+            crate::ir::lower_route(runai).unwrap().module_statements,
+            "",
+            "a re-export is never emitted, whatever its source"
+        );
+
+        let local = "\"use static\"\nconst helper = 1\nexport { helper }\nexport default function Page(props: Record<never, never>) { return <p>{helper}</p> }\n";
+        let route = crate::ir::lower_route(local).unwrap();
+        assert!(
+            route.module_statements.contains("export { helper }"),
+            "a local re-export names this file's binding and is emitted: {:?}",
+            route.module_statements
+        );
     }
 
     /// One statement can declare both the route and an ordinary value. Dropping

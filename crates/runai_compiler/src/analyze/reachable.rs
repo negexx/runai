@@ -15,27 +15,43 @@
 //! `<h1>{title}</h1>` is **legal**, and round 3 of this task removed the earlier
 //! refusal that called it unreachable.
 //!
-//! Exactly three things stay refused:
+//! Two scopes are walked, because the emitters write two: the returned markup
+//! and the file's **module level**. A module statement is emitted above the
+//! component, so a name it references has to exist in the emitted module too —
+//! and the prerender module has no imports and does not declare the component at
+//! all.
 //!
-//! 1. **a `"runai"` name in a `"use static"` route.** The prerender module
-//!    contains no imports at all, so the name is not evaluable there. The
-//!    repair is the directive, `"use island"` — the same escape hatch `RA010`
-//!    points at, because the page genuinely needs a runtime. A reference that
-//!    *is* a primitive call is left to `RA010`, so one expression never gets two
-//!    diagnostics.
+//! Exactly four things stay refused:
+//!
+//! 1. **a `"runai"` name in a `"use static"` route**, whether the markup or a
+//!    module-level statement names it. The prerender module contains no imports
+//!    at all, so the name is not evaluable there. The repair is the directive,
+//!    `"use island"` — the same escape hatch `RA010` points at, because the page
+//!    genuinely needs a runtime. A reference that *is* a primitive call is left
+//!    to `RA010`, so one expression never gets two diagnostics.
 //! 2. **the route's own parameter in a `"use static"` route.** `render()` takes
 //!    no arguments, so `{props}` would be `undefined` at build time. The repair
 //!    is not "move it": there is no props value to move.
-//! 3. **a type-only reference.** Never reported, in fact: `strip_types` erases
+//! 3. **the route component's own name in a `"use static"` route.** The
+//!    prerender module contains `render()` and nothing else — the component is
+//!    not declared there — so `const x = Page` or `{Page}` is a `ReferenceError`
+//!    at build time. The repair is the directive again: an island module declares
+//!    the component.
+//! 4. **a type-only reference.** Never reported, in fact: `strip_types` erases
 //!    it before anything is emitted, so `("a" as Kind)` where `Kind` is a type
 //!    alias is legal TypeScript that compiles and runs today. Oxc's visitor
 //!    funnels `as`/type-annotation/generic-argument references into the same
 //!    `visit_identifier_reference` as value references, so the walk has to ask
-//!    the semantic pass which ones are types. See [`TreeReferences`].
+//!    the semantic pass which ones are types. See [`References`].
 //!
 //! An island module imports its `"runai"` names and declares `function
-//! <Name>(props)`, so both are reachable there — that is the mode-dependent half
-//! of this rule.
+//! <Name>(props)`, so all of those are reachable there — that is the
+//! mode-dependent half of this rule.
+//!
+//! Everything else at module scope is emitted by [`RouteIr::module_statements`]
+//! and is therefore reachable, which is the round-3 ruling this module follows.
+//!
+//! [`RouteIr::module_statements`]: crate::ir::RouteIr::module_statements
 //!
 //! # Scope: only a page, and only one that has a mode
 //!
@@ -57,14 +73,15 @@ use oxc_ast_visit::Visit;
 use oxc_semantic::{Scoping, SemanticBuilder, SymbolId};
 use oxc_span::GetSpan;
 
-use crate::analyze::component::find_route_component;
+use crate::analyze::component::{ComponentInfo, find_route_component};
 use crate::analyze::jsx::route_render;
 use crate::analyze::signals::{RunaiImport, SignalBindings, runai_imports};
 use crate::diagnostic::{Code, Diagnostic};
+use crate::ir::emitted_module_parts;
 use crate::source::Mode;
 
-/// `RA014` for every value in the route's markup the generated module cannot
-/// name.
+/// `RA014` for every value the generated module cannot name: one walk of the
+/// returned markup, and a second of the file's module level.
 ///
 /// `bindings` is [`crate::analyze::signals::find_signal_bindings`]'s answer for
 /// the same program; only its [`SignalBindings::primitive_calls`] spans are read
@@ -81,19 +98,11 @@ pub fn check_reachable_expressions(
     let Some(render) = route_render(program) else {
         return Vec::new();
     };
-
-    // The one region whose declarations are copied into the component: the route
-    // body's own statements. A concise arrow body (`(props) => <p/>`) has no
-    // statements, so the returned expression itself is that region — a parameter
-    // of an arrow nested in the markup is declared inside the emitted template.
-    let root = {
-        let span = render.root.span();
-        (span.start, span.end)
+    let Some(route) = find_route_component(program) else {
+        // `route_render` found a render, so there is a route, but a defensive
+        // early return is cheaper than an `unwrap` in a diagnostic pass.
+        return Vec::new();
     };
-    let body = render
-        .body
-        .map_or(root, |body| (body.span.start, body.span.end));
-    let params = find_route_component(program).map(|route| route.params_span);
 
     // A second semantic build, for a page only: the reference resolution this
     // rule needs is not part of `SignalBindings`. Files without a route never
@@ -101,45 +110,122 @@ pub fn check_reachable_expressions(
     let semantic = SemanticBuilder::new().build(program).semantic;
     let scoping = semantic.scoping();
 
-    let mut walk = TreeReferences {
-        scoping,
-        references: Vec::new(),
-    };
-    walk.visit_expression(render.root);
-
     // Every value binding a `"runai"` import declares. `named` is what the
     // client emitter can write; a default or namespace binding is refused by the
-    // import rule in `entry.rs` on an island, and by the reference rule below on
-    // a static route.
+    // import rule in `entry.rs` in *every* mode, so this rule stays silent about
+    // it — one root cause is one row.
     let runai = runai_imports(program);
 
     let mut diagnostics = Vec::new();
-    for reference in walk.references {
+    let emitter = EmittedScope {
+        scoping,
+        route: &route,
+        runai: &runai,
+        bindings,
+    };
+
+    // (1) The returned markup. Anything declared inside the component body, or
+    // inside an arrow parameter in the markup, is copied into the emitted
+    // function; an island also declares the route parameter and imports the
+    // `"runai"` names the tree uses.
+    let body = render
+        .body
+        .map_or((render.root.span().start, render.root.span().end), |body| {
+            (body.span.start, body.span.end)
+        });
+    let mut markup = References {
+        scoping,
+        references: Vec::new(),
+    };
+    markup.visit_expression(render.root);
+    for reference in markup.references {
+        emitter.judge(
+            mode,
+            &reference,
+            // `declaration` is the span of the identifier that declares the
+            // symbol, so a body local and an arrow parameter are both "inside".
+            |declaration| contains(body, declaration),
+            &mut diagnostics,
+        );
+    }
+
+    // (2) The module level. Every statement `RouteIr::module_statements` will
+    // carry is evaluated in the emitted module, so a name it uses has the same
+    // reachability question as the markup's.
+    //
+    // The pieces walked are exactly the pieces the emitters slice:
+    // [`crate::ir::emitted_module_parts`] is the one function that decides
+    // "emitted", so this walk cannot check a statement the module omits, nor
+    // skip one it carries.
+    for part in emitted_module_parts(program, &route) {
+        let mut module = References {
+            scoping,
+            references: Vec::new(),
+        };
+        part.visit(&mut module);
+        for reference in module.references {
+            // A module statement cannot declare the route body's locals, so
+            // nothing here is one; the declarations that *are* reachable are the
+            // other emitted module statements, which is the fall-through.
+            emitter.judge(mode, &reference, |_| false, &mut diagnostics);
+        }
+    }
+
+    diagnostics.sort_by_key(|diagnostic| diagnostic.span.0);
+    diagnostics
+}
+
+/// The context both walks judge a reference against: resolution, the route's own
+/// spans, the `"runai"` bindings, and the primitive calls already reported.
+struct EmittedScope<'s, 'a> {
+    scoping: &'s Scoping,
+    route: &'s ComponentInfo<'a>,
+    runai: &'s [RunaiImport],
+    bindings: &'s SignalBindings,
+}
+
+impl EmittedScope<'_, '_> {
+    /// Append `RA014` when `reference` names something the emitted module does
+    /// not have.
+    ///
+    /// `inside_emitted_function` answers "is this declaration copied into the
+    /// emitted component?" — the markup walk passes the route body's span, the
+    /// module walk answers `false` because no module statement declares it.
+    fn judge(
+        &self,
+        mode: Mode,
+        reference: &Reference,
+        inside_emitted_function: impl Fn((u32, u32)) -> bool,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
         // Unresolved: a language built-in, which every module has.
         let Some(symbol) = reference.symbol else {
-            continue;
+            return;
         };
-        let declaration = declaration_of(scoping, symbol);
+        let declaration = declaration_of(self.scoping, symbol);
 
-        // (1) A body-local: its statement is copied into the component.
-        if contains(body, declaration) {
-            continue;
+        // (1) A body local: its statement is copied into the component.
+        if inside_emitted_function(declaration) {
+            return;
         }
 
         // (2) An island module imports these names and declares the parameter.
+        // It also declares the component, so the route's own name is reachable.
         if mode == Mode::Island
-            && (is_named_runai(&runai, symbol) || params.is_some_and(|p| contains(p, declaration)))
+            && (is_named_runai(self.runai, symbol)
+                || contains(self.route.params_span, declaration)
+                || self.route.name_span == declaration)
         {
-            continue;
+            return;
         }
 
         // A primitive call in a static route is already `RA010` at this span; a
         // second diagnostic at the callee would describe one expression twice.
-        if is_primitive_callee(reference.span, bindings) {
-            continue;
+        if is_primitive_callee(reference.span, self.bindings) {
+            return;
         }
 
-        if is_runai(&runai, symbol) {
+        if is_runai(self.runai, symbol) {
             // A **named** `"runai"` binding on a static route is unreachable:
             // the prerender module has no imports at all, so the repair is the
             // directive.
@@ -149,25 +235,29 @@ pub fn check_reachable_expressions(
             // form. Reporting it at each use here would put one root cause on the
             // page several times — the same duplication the module-JSX const used
             // to produce.
-            if mode == Mode::Static && is_named_runai(&runai, symbol) {
+            if mode == Mode::Static && is_named_runai(self.runai, symbol) {
                 diagnostics.push(runtime_import(reference.span, &reference.name));
             }
-            continue;
+            return;
         }
-        if params.is_some_and(|p| contains(p, declaration)) {
+        if contains(self.route.params_span, declaration) {
             diagnostics.push(route_parameter(reference.span, &reference.name));
-            continue;
+            return;
+        }
+        if self.route.name_span == declaration {
+            // The prerender module declares `render()` and nothing else, so the
+            // component is not a name there. An island module declares it.
+            if mode == Mode::Static {
+                diagnostics.push(route_component(reference.span, &reference.name));
+            }
         }
 
         // Everything else — a module-level value, a class, an enum, a function —
         // is emitted by `RouteIr::module_statements`, so it is reachable.
     }
-
-    diagnostics.sort_by_key(|diagnostic| diagnostic.span.0);
-    diagnostics
 }
 
-/// One identifier reference in the returned markup.
+/// One identifier reference in the returned markup or a module-level statement.
 struct Reference {
     name: String,
     span: (u32, u32),
@@ -175,11 +265,9 @@ struct Reference {
     symbol: Option<SymbolId>,
 }
 
-/// Collect every **value** identifier reference in the route's returned markup.
-///
-/// The walk starts at the returned root, not the program, so a module-level
-/// helper that happens to name the same binding is not part of this question:
-/// only what the emitted template evaluates matters.
+/// Collects every **value** identifier reference under whatever node the caller
+/// visits: the returned root for the markup walk, or one module-level statement
+/// for the module-level walk.
 ///
 /// # Type positions are not references
 ///
@@ -198,12 +286,12 @@ struct Reference {
 /// semantic pass considers a type" has one definition in the crate.
 ///
 /// [`ReferenceFlags::is_type_only`]: oxc_syntax::reference::ReferenceFlags::is_type_only
-struct TreeReferences<'s> {
+struct References<'s> {
     scoping: &'s Scoping,
     references: Vec<Reference>,
 }
 
-impl<'a> Visit<'a> for TreeReferences<'_> {
+impl<'a> Visit<'a> for References<'_> {
     fn visit_identifier_reference(&mut self, reference: &IdentifierReference<'a>) {
         // A reference the semantic pass could not resolve has no id, and is
         // handled below as an unresolved name — never as a type.
@@ -257,7 +345,8 @@ fn is_primitive_callee(span: (u32, u32), bindings: &SignalBindings) -> bool {
         .any(|&(start, end)| span.0 == start && span.1 <= end)
 }
 
-/// `RA014`: a static page's markup names a `"runai"` import.
+/// `RA014`: a static page names a `"runai"` import, in its markup or at module
+/// scope.
 ///
 /// The prerender module contains no imports, so the repair cannot be "move it":
 /// taking the value into the body does not import it. The page needs the
@@ -267,9 +356,9 @@ fn runtime_import(span: (u32, u32), name: &str) -> Diagnostic {
         Code::RA014,
         span,
         format!(
-            "`{name}` is imported from `\"runai\"`, but a `\"use static\"` route's markup is \
-             evaluated in a module with no imports. Change line 1 to \"use island\" to ship the \
-             runtime this value comes from, or remove the reference."
+            "`{name}` is imported from `\"runai\"`, but a `\"use static\"` route is evaluated in \
+             a module with no imports. Change line 1 to \"use island\" to ship the runtime this \
+             value comes from, or remove the reference."
         ),
     )
 }
@@ -286,6 +375,25 @@ fn route_parameter(span: (u32, u32), name: &str) -> Diagnostic {
             "`{name}` is the route's parameter, but a route is given no props and the \
              prerendered module takes no arguments, so `{name}` would be undefined at build \
              time. Remove the reference, and write the value in the component body."
+        ),
+    )
+}
+
+/// `RA014`: a static page names its own component.
+///
+/// The prerender module exports `render()` and declares nothing else — the
+/// component is rebuilt inside that function — so `Page` is not a binding there.
+/// An island module does declare `function <Name>(props)`, so the repair is the
+/// directive, exactly as for a `"runai"` name.
+fn route_component(span: (u32, u32), name: &str) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        span,
+        format!(
+            "`{name}` is the route's own component, but a `\"use static\"` route is emitted as \
+             a `render()` function and the component is not declared in it, so `{name}` would be \
+             undefined at build time. Change line 1 to \"use island\" to keep the component, or \
+             remove the reference."
         ),
     )
 }
@@ -441,8 +549,180 @@ mod tests {
         assert_eq!(codes(param, Mode::Static), vec![Code::RA014]);
     }
 
+    /// The round-2 test that covered the concise shape was replaced with a
+    /// props fixture, so the `<p>{title}</p>` half — a concise arrow naming a
+    /// module-level value — had no fixture of its own left. It is the shape the
+    /// module-level walk must *not* refuse, and the return value is the body when
+    /// there are no statements, so the two scopes are easy to confuse.
+    #[test]
+    fn a_concise_arrow_route_may_name_a_module_level_value() {
+        let src = "\"use static\"\nconst title = \"About\"\nexport default (props: Record<never, never>) => <p>{title}</p>\n";
+        for mode in [Mode::Static, Mode::Island] {
+            assert!(
+                codes(src, mode).is_empty(),
+                "{mode:?}: a module-level value is emitted, so the concise body may name it"
+            );
+        }
+
+        // The control: the same concise shape naming the route's parameter *is*
+        // refused, so the fixture above is not passing because nothing is walked.
+        let param = "\"use static\"\nconst title = \"A\"\nexport default (props: Record<never, never>) => <p>{props}</p>\n";
+        assert_eq!(
+            codes(param, Mode::Static),
+            vec![Code::RA014],
+            "the concise body is walked"
+        );
+    }
+
+    // --- Fix round 3: the module level is walked too -------------------------
+
+    /// A `"runai"` value named at **module scope** in a static route. The
+    /// prerender module has no imports, so the emitted statement is a
+    /// `ReferenceError` at load — the same defect as the markup case, one scope
+    /// out, which is why the rule has to walk both.
+    #[test]
+    fn a_runai_value_at_module_scope_is_refused_when_static() {
+        let src = "\"use static\"\nimport { owner } from \"runai\"\nconst o = owner\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let diagnostics = diagnostics(src, Mode::Static);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Change line 1 to \"use island\""),
+            "the repair is the directive: {diagnostics:?}"
+        );
+
+        // The island module writes the import, so the same statement is fine.
+        assert!(
+            codes(src, Mode::Island).is_empty(),
+            "an island imports the name the module statement reads"
+        );
+    }
+
+    /// The route component's own name at module scope, in a static route: the
+    /// prerender module has `render()` and no component, so `const x = Page` is
+    /// a `ReferenceError`. An island declares `function <Name>(props)`.
+    #[test]
+    fn the_route_component_at_module_scope_is_refused_when_static() {
+        let src = "\"use static\"\nconst x = P\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n";
+        let diagnostics = diagnostics(src, Mode::Static);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("route's own component"),
+            "the message must name the component: {diagnostics:?}"
+        );
+
+        assert!(
+            codes(src, Mode::Island).is_empty(),
+            "an island declares the component"
+        );
+    }
+
+    /// The route's parameter is **not** in scope at module level: `const x =
+    /// props` there resolves to nothing at all, not to the route's parameter. That
+    /// is a different defect from this rule's, and refusing it would mean
+    /// refusing every unresolved module-level name — including `Math` and DOM
+    /// globals — so it is deliberately out of scope. Asserted so the boundary is
+    /// written down rather than inferred.
+    #[test]
+    fn the_route_parameter_is_not_in_scope_at_module_scope() {
+        let src = "\"use static\"\nconst x = props\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n";
+        for mode in [Mode::Static, Mode::Island] {
+            assert!(
+                codes(src, mode).is_empty(),
+                "{mode:?}: module level cannot see the parameter, so it is not this rule's read"
+            );
+        }
+    }
+
+    /// Every other module-level value stays reachable: the ruling, restated at
+    /// the scope the round-3 finding moved the walk into. A module statement that
+    /// names a *body* local is not on this list — that local is declared inside
+    /// the component, so the module cannot see it, which is JavaScript's rule
+    /// rather than this one's.
+    #[test]
+    fn ordinary_module_level_values_are_reachable_in_both_modes() {
+        for src in [
+            // A module-level const read by another module statement.
+            "\"use static\"\nconst a = 1\nconst b = a\nexport default function P(props: Record<never, never>) { return <p>{b}</p> }\n",
+            // A class, and a recursive function that names itself.
+            "\"use static\"\nclass Store {}\nconst s = Store\nexport default function P(props: Record<never, never>) { return <p>{s.name}</p> }\n",
+            "\"use static\"\nconst fact = (n: number): number => (n < 1 ? 1 : n * fact(n - 1))\nexport default function P(props: Record<never, never>) { return <p>{fact(3)}</p> }\n",
+            // A language built-in, which every module has.
+            "\"use static\"\nconst n = Math.max(1, 2)\nexport default function P(props: Record<never, never>) { return <p>{n}</p> }\n",
+            // A nested function's own locals are inside the emitted statement.
+            "\"use static\"\nconst f = () => { const x = 1; return x }\nexport default function P(props: Record<never, never>) { return <p>{f()}</p> }\n",
+        ] {
+            for mode in [Mode::Static, Mode::Island] {
+                assert!(codes(src, mode).is_empty(), "{mode:?}: {src}");
+            }
+        }
+    }
+
+    /// The multi-declarator shape the emitters rebuild: the route is dropped and
+    /// `title` is emitted, so the module-level walk must see `title` and must
+    /// *not* treat the route half as an emitted statement.
+    #[test]
+    fn a_value_declared_beside_the_route_is_reachable() {
+        let src = "\"use static\"\nconst title = \"A\", Page = (props: Record<never, never>) => <h1>{title}</h1>\nexport default Page\n";
+        for mode in [Mode::Static, Mode::Island] {
+            assert!(codes(src, mode).is_empty(), "{mode:?}: {src}");
+        }
+    }
+
+    /// A type-only reference at module scope is not a read: `type T = typeof
+    /// owner` and a type-only `"runai"` specifier both vanish before anything
+    /// is emitted, so neither is a `ReferenceError`.
+    #[test]
+    fn a_type_position_at_module_scope_is_not_a_read() {
+        for src in [
+            "\"use static\"\nimport { owner } from \"runai\"\ntype T = typeof owner\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+            "\"use static\"\nimport { type Accessor } from \"runai\"\nconst x = 1 as Accessor<number>\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n",
+        ] {
+            for mode in [Mode::Static, Mode::Island] {
+                assert!(codes(src, mode).is_empty(), "{mode:?}: {src}");
+            }
+        }
+    }
+
+    /// A primitive call at module scope is `RA010`'s in a static route; this
+    /// rule must not add a second diagnostic at the callee, at module scope any
+    /// more than in the markup.
+    #[test]
+    fn a_module_level_primitive_call_is_left_to_ra010() {
+        let src = "\"use static\"\nimport { signal } from \"runai\"\nconst n = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{n()}</p> }\n";
+        assert!(codes(src, Mode::Static).is_empty(), "{src}");
+    }
+
+    /// The module walk must not refuse a statement the emitted module does not
+    /// carry. An import of a foreign module is `check_imports`' row; reporting
+    /// it here too would put one root cause on the page twice, and the statement
+    /// is never emitted.
+    #[test]
+    fn an_import_is_left_to_the_import_rule() {
+        let src = "\"use static\"\nimport { team } from \"./data\"\nconst x = team\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n";
+        assert!(
+            codes(src, Mode::Static).is_empty(),
+            "the import rule owns the import, and the statement is not emitted"
+        );
+    }
+
+    /// A re-export is not an emitted statement either: `check_imports` refuses
+    /// it, and `module_statements` excludes it, so this walk must be silent.
+    #[test]
+    fn a_reexport_is_left_to_the_import_rule() {
+        for src in [
+            "\"use static\"\nexport * from \"./data\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+            "\"use static\"\nexport { team } from \"./data\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+        ] {
+            assert!(codes(src, Mode::Static).is_empty(), "{src}");
+        }
+    }
+
     /// Every refusal is its own diagnostic, at its own span: each one is an
-    /// edit.
+    /// edit. **Both** spans are asserted, so a walk that collapsed two
+    /// references into one — or reported the second at the first's span — fails
+    /// here rather than merely not-fatal.
     #[test]
     fn each_refusal_is_reported_at_its_own_span() {
         let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{props}{props}</p> }\n";
@@ -452,10 +732,13 @@ mod tests {
             diagnostics[0].span.0 < diagnostics[1].span.0,
             "{diagnostics:?}"
         );
-        assert_eq!(
-            &src[diagnostics[0].span.0 as usize..diagnostics[0].span.1 as usize],
-            "props"
-        );
+        for diagnostic in &diagnostics {
+            assert_eq!(
+                &src[diagnostic.span.0 as usize..diagnostic.span.1 as usize],
+                "props",
+                "each refusal names its own occurrence: {diagnostics:?}"
+            );
+        }
     }
 
     // --- N1: type positions are never references -----------------------------

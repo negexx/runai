@@ -152,36 +152,51 @@ fn is_page(path: &str) -> bool {
     !name.starts_with('_') && name.ends_with(".page.tsx")
 }
 
-/// `RA014` for every import this milestone cannot emit.
+/// `RA014` for every module the emitted file cannot resolve or write.
 ///
 /// This milestone has no bundler: it emits one module per route from the route
-/// file's own text, so a second module cannot be resolved or inlined. Reporting
-/// the import is the only honest answer — emitting the file would produce a
-/// module that cannot load.
+/// file's own text, so a second module can be neither resolved nor inlined.
+/// Reporting the statement is the only honest answer — emitting the file would
+/// produce a module that cannot load.
 ///
-/// **Two shapes are refused for two different reasons**, and the repair differs
-/// because the legal rewrite differs:
+/// **Three shapes are refused**, and the repair differs because the legal rewrite
+/// differs:
 ///
-/// - **a module other than `"runai"`** — nothing can resolve it (the bundler
-///   family below);
+/// - **an import of a module other than `"runai"`** — nothing can resolve it
+///   (the bundler family below);
 /// - **a default or namespace import of `"runai"`** — `import runai from
 ///   "runai"` / `import * as runai from "runai"`. The island emitter writes
 ///   exactly one import merging the route's **named** specifiers, so there is no
 ///   form it can write for these. The repair is to rewrite the declaration as
 ///   named imports; "move it into the component body" would be a syntax error,
 ///   which is why this declaration is refused here rather than left to the
-///   reference rule.
+///   reference rule;
+/// - **a re-export** — `export … from "./x"`, `export * from "./x"`, whose
+///   source is not `"runai"`. The emitted module writes one import (the island's,
+///   from the runtime URL) or none, so the re-export names a module nothing
+///   resolves. A route file has nothing legitimate to re-export in this
+///   milestone: it emits one component, and [`crate::ir::module_statements`]
+///   excludes re-exports for the same reason.
 ///
-/// **A type-only import is exempt, in both spellings TypeScript allows.** Types
-/// are stripped before anything is emitted, so there is no runtime import left to
-/// resolve:
+/// **The two CommonJS spellings TypeScript allows are refused too**, because
+/// [`crate::strip::strip_types`] rewrites them into JavaScript that a `.mjs`
+/// cannot run: `import x = require("./x")` becomes `const x = require("./x")`,
+/// and `export = x` becomes `module.exports = x`. Neither `require` nor `module`
+/// exists in the emitted module. `import x = localName` is *not* refused: it
+/// strips to a plain `var x = localName`, which is valid JavaScript.
+///
+/// **A type-only statement is exempt, in both spellings TypeScript allows.**
+/// Types are stripped before anything is emitted, so there is no runtime import
+/// or re-export left to resolve:
 ///
 /// - `import type { Data } from "./data"` — the whole declaration is a type
 ///   import ([`ImportOrExportKind::Type`] on the declaration);
 /// - `import { type Data } from "./data"` — the *module* is a value import, but
 ///   the only specifier in it is marked `Type` on the specifier, so nothing
 ///   survives stripping. `signals::import_symbols` reads the same field for the
-///   same reason.
+///   same reason;
+/// - `export type { Data } from "./data"` and `export { type Data } from …` are
+///   the re-export forms of the same two spellings.
 ///
 /// Every other form (`import x from`, `import "./x"`, `import {} from`,
 /// `import { x } from`, `import * as x from`, and a mixed `import { type T, x }`)
@@ -190,34 +205,139 @@ fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
     program
         .body
         .iter()
-        .filter_map(|statement| {
-            let Statement::ImportDeclaration(declaration) = statement else {
-                return None;
-            };
-            if is_type_only_import(declaration) {
-                return None;
+        .filter_map(|statement| match statement {
+            Statement::ImportDeclaration(declaration) => check_import(declaration, source),
+            Statement::ExportFromDeclaration(declaration) => {
+                let kinds: Vec<_> = declaration
+                    .specifiers
+                    .iter()
+                    .map(|specifier| specifier.export_kind)
+                    .collect();
+                if is_type_only_reexport(declaration.export_kind, &kinds) {
+                    return None;
+                }
+                check_reexport(&declaration.source, source)
             }
-            if declaration.source.value.as_str() == Some(PRIMITIVE_SOURCE) {
-                // Named value specifiers are the one form the island emitter
-                // can write. A default or namespace binding is a `"runai"`
-                // import this milestone cannot emit, and the repair has to name
-                // the declaration to rewrite rather than point at each use.
-                return unwritable_runai_import(declaration);
+            Statement::ExportAllDeclaration(declaration) => {
+                if declaration.export_kind == ImportOrExportKind::Type {
+                    return None;
+                }
+                check_reexport(&declaration.source, source)
             }
-
-            let module = raw_text(source, declaration.source.span)
-                .unwrap_or_else(|| declaration.source.value.as_str().unwrap_or(""));
-            Some(Diagnostic::new(
-                Code::RA014,
-                (declaration.source.span.start, declaration.source.span.end),
-                format!(
-                    "cannot import {module} yet: this milestone has no bundler to resolve a \
-                     module other than `\"{PRIMITIVE_SOURCE}\"`, and a module-level import is not \
-                     emitted. Inline the value here, or import it from `\"{PRIMITIVE_SOURCE}\"`."
-                ),
-            ))
+            Statement::TSImportEqualsDeclaration(declaration) => {
+                check_import_equals(declaration, source)
+            }
+            Statement::TSExportAssignment(declaration) => Some(export_assignment((
+                declaration.span.start,
+                declaration.span.end,
+            ))),
+            _ => None,
         })
         .collect()
+}
+
+/// `RA014` for one `import`, or `None` when the emitted module can write it.
+fn check_import(
+    declaration: &oxc_ast::ast::ImportDeclaration<'_>,
+    source: &str,
+) -> Option<Diagnostic> {
+    if is_type_only_import(declaration) {
+        return None;
+    }
+    if declaration.source.value.as_str() == Some(PRIMITIVE_SOURCE) {
+        // Named value specifiers are the one form the island emitter can write.
+        // A default or namespace binding is a `"runai"` import this milestone
+        // cannot emit, and the repair has to name the declaration to rewrite
+        // rather than point at each use.
+        return unwritable_runai_import(declaration);
+    }
+
+    let module = raw_text(source, declaration.source.span)
+        .unwrap_or_else(|| declaration.source.value.as_str().unwrap_or(""));
+    Some(Diagnostic::new(
+        Code::RA014,
+        (declaration.source.span.start, declaration.source.span.end),
+        format!(
+            "cannot import {module} yet: this milestone has no bundler to resolve a \
+             module other than `\"{PRIMITIVE_SOURCE}\"`, and a module-level import is not \
+             emitted. Inline the value here, or import it from `\"{PRIMITIVE_SOURCE}\"`."
+        ),
+    ))
+}
+
+/// `RA014` for a re-export of a module other than `"runai"`, or `None`.
+///
+/// The emitted module writes one import (the island's, from the runtime URL) or
+/// none, so a re-export names a module nothing resolves — the same defect the
+/// import rule exists for, one export out. The repair is to inline the value,
+/// not to move the statement: nothing declares it in this file.
+fn check_reexport(module: &oxc_ast::ast::StringLiteral<'_>, source: &str) -> Option<Diagnostic> {
+    if module.value.as_str() == Some(PRIMITIVE_SOURCE) {
+        // The brief's boundary: a `"runai"` re-export is not the bundler family.
+        // It is still excluded from `module_statements` (an emitted module
+        // writes none), so nothing is re-exported; a route file's exports have no
+        // consumer in this milestone, so that is inert rather than a load error.
+        return None;
+    }
+    let written =
+        raw_text(source, module.span).unwrap_or_else(|| module.value.as_str().unwrap_or(""));
+    Some(Diagnostic::new(
+        Code::RA014,
+        (module.span.start, module.span.end),
+        format!(
+            "cannot re-export from {written} yet: this milestone has no bundler, and a route \
+             file is emitted from its own text with no re-export. Write the value in this file, \
+             or import it from `\"{PRIMITIVE_SOURCE}\"` and use it here."
+        ),
+    ))
+}
+
+/// `RA014` for `import x = require("./x")`, or `None`.
+///
+/// Only the `require(…)` form is refused. `import x = localName` strips to
+/// `var x = localName`, which is ordinary JavaScript; the external module
+/// reference strips to a `require(…)` call, and `require` does not exist in the
+/// emitted `.mjs`. A `type` import-equals binds nothing and is exempt.
+fn check_import_equals(
+    declaration: &oxc_ast::ast::TSImportEqualsDeclaration<'_>,
+    source: &str,
+) -> Option<Diagnostic> {
+    if declaration.import_kind == ImportOrExportKind::Type {
+        return None;
+    }
+    let oxc_ast::ast::TSModuleReference::ExternalModuleReference(reference) =
+        &declaration.module_reference
+    else {
+        return None;
+    };
+
+    let module = raw_text(source, reference.expression.span)
+        .unwrap_or_else(|| reference.expression.value.as_str().unwrap_or(""));
+    let name = declaration.id.name.as_str();
+    Some(Diagnostic::new(
+        Code::RA014,
+        (declaration.span.start, declaration.span.end),
+        format!(
+            "cannot use `import {name} = require({module})` yet: it becomes a `require(…)` call, \
+             and the emitted module is an ES module where `require` does not exist. Write it as \
+             an import instead — `import {{ owner }} from \"{PRIMITIVE_SOURCE}\"` for a \
+             `\"{PRIMITIVE_SOURCE}\"` value — or inline the value here."
+        ),
+    ))
+}
+
+/// `RA014` for `export = x`.
+///
+/// [`crate::strip::strip_types`] rewrites it to `module.exports = x`, and a `.mjs`
+/// has no `module`. The repair is the ES module export form.
+fn export_assignment(span: (u32, u32)) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        span,
+        "cannot use `export =` yet: it becomes `module.exports = …`, and the emitted module is \
+         an ES module where `module` does not exist. Write `export default` or a named `export` \
+         instead.",
+    )
 }
 
 /// `RA014` for a `"runai"` import whose binding form the client emitter cannot
@@ -258,6 +378,29 @@ fn unwritable_runai_import(
         ));
     }
     None
+}
+
+/// Whether a re-export binds nothing at runtime.
+///
+/// Two spellings, mirroring [`is_type_only_import`]: `export type { X } from
+/// "./x"` marks the declaration, and `export { type X } from "./x"` marks each
+/// specifier. Both are erased by [`crate::strip::strip_types`], so neither is a
+/// module the emitted file would have to resolve — and reporting the inline form
+/// would demand a rewrite that fixes nothing.
+///
+/// `specifier_kinds` is a closure rather than a slice so the same rule serves the
+/// two node types without either owing the other a conversion.
+fn is_type_only_reexport(
+    declaration_kind: ImportOrExportKind,
+    specifier_kinds: &[ImportOrExportKind],
+) -> bool {
+    if declaration_kind == ImportOrExportKind::Type {
+        return true;
+    }
+    !specifier_kinds.is_empty()
+        && specifier_kinds
+            .iter()
+            .all(|kind| *kind == ImportOrExportKind::Type)
 }
 
 /// Whether `declaration` binds nothing at runtime.
@@ -430,6 +573,212 @@ mod tests {
             analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
             "an island imports the name the client module writes"
         );
+    }
+
+    // --- Fix round 3: the module level, through `analyze` ---------------------
+
+    /// The Finding-1 fixture, run through the entry point an agent actually uses.
+    /// The runai value is at **module scope**, not in the markup, so the round-2
+    /// rule (which walked only the returned tree) passed it. The emitted
+    /// `module_statements` is `const o = owner;` in a module with no imports,
+    /// which is a `ReferenceError` at load — the same accept-then-reject class
+    /// the import rule exists for.
+    ///
+    /// The island half is the control: the client module writes the import, so
+    /// the identical statement is fine and this must stay silent.
+    #[test]
+    fn a_runai_value_at_module_scope_is_ra014_through_analyze() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nimport {{ owner }} from \"runai\"\nconst o = owner\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            )
+        };
+
+        let static_src = src("\"use static\"");
+        let d = analyze(&static_src, "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert_eq!(d[0].line, 3, "the module statement is the site: {d:?}");
+        assert!(
+            d[0].message.contains("Change line 1 to \"use island\""),
+            "the repair is the directive: {d:?}"
+        );
+        // `build` still succeeds — the gate is what refuses, not lowering — but
+        // the statement is in the artifact it would have written, so the refusal
+        // is about the emitted module rather than about lowering's contract.
+        assert!(
+            lower_route(&static_src)
+                .expect("lowering is not the gate")
+                .module_statements
+                .contains("const o = owner"),
+            "the statement the diagnostics names is the statement the module carries"
+        );
+
+        assert!(
+            analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "an island writes the import the module statement reads"
+        );
+    }
+
+    /// The route component's own name at module scope. `Page` is not in the
+    /// prerender module at all — it is rebuilt inside `render()` — so
+    /// `const x = Page` is a `ReferenceError`. An island declares
+    /// `function Page(props)`, so the same file is clean there.
+    #[test]
+    fn the_route_component_at_module_scope_is_ra014_through_analyze() {
+        let src = |directive: &str| {
+            format!(
+                "{directive}\nconst x = P\nexport default function P(props: Record<never, never>) {{ return <p>{{x}}</p> }}\n"
+            )
+        };
+
+        let d = analyze(&src("\"use static\""), "src/routes/index.page.tsx");
+        assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
+        assert!(
+            d[0].message.contains("route's own component"),
+            "the message must name the component: {d:?}"
+        );
+
+        assert!(
+            analyze(&src("\"use island\""), "src/routes/index.page.tsx").is_empty(),
+            "an island declares the component"
+        );
+    }
+
+    /// Finding 2, end to end: neither re-export form is refused *or* excluded
+    /// before this round. Both are `RA014`, and neither appears in
+    /// `module_statements` — the emitted `.mjs` re-exporting a module it cannot
+    /// resolve is exactly what RA014's import family exists to prevent.
+    #[test]
+    fn a_reexport_of_a_foreign_module_is_ra014_and_never_emitted() {
+        for statement in [
+            "export * from \"./data\"",
+            "export { team } from \"./data\"",
+        ] {
+            let src = format!(
+                "\"use static\"\n{statement}\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(codes(&d), vec![Code::RA014], "{statement}: {d:?}");
+            assert_eq!(d[0].line, 2, "{statement}: the statement is the site");
+            assert!(
+                d[0].message.contains("re-export"),
+                "{statement}: the message must name the re-export: {d:?}"
+            );
+
+            let route = lower_route(&src).expect("the analyzer is the gate, not lowering");
+            assert!(
+                route.module_statements.is_empty(),
+                "{statement}: a re-export is not emitted: {:?}",
+                route.module_statements
+            );
+        }
+
+        // The type-only spellings are stripped, so nothing is left to resolve.
+        for statement in [
+            "export type { Data } from \"./data\"",
+            "export { type Data } from \"./data\"",
+            "export type * from \"./data\"",
+        ] {
+            let src = format!(
+                "\"use static\"\n{statement}\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            assert!(
+                analyze(&src, "src/routes/index.page.tsx").is_empty(),
+                "{statement}: a type-only re-export is erased"
+            );
+        }
+
+        // A re-export of a *local* binding is a different statement: it stays.
+        let local = "\"use static\"\nconst helper = 1\nexport { helper }\nexport default function P(props: Record<never, never>) { return <p>{helper}</p> }\n";
+        assert!(
+            analyze(local, "src/routes/index.page.tsx").is_empty(),
+            "`export {{ helper }}` names this file's binding"
+        );
+        assert!(
+            lower_route(local)
+                .unwrap()
+                .module_statements
+                .contains("export { helper }"),
+            "a local re-export is emitted"
+        );
+    }
+
+    /// The CommonJS spellings `strip_types` rewrites into JavaScript a `.mjs`
+    /// cannot run: `import x = require("./x")` becomes `const x = require(…)`,
+    /// and `export = x` becomes `module.exports = x`. Neither `require` nor
+    /// `module` exists in the emitted module.
+    ///
+    /// `import x = localName` strips to `var x = localName`, which is valid
+    /// JavaScript and stays clean — the control that this rule is about `require`
+    /// rather than about `import =`.
+    #[test]
+    fn a_commonjs_import_or_export_is_ra014() {
+        for (statement, line) in [
+            ("import x = require(\"./data\")", 2),
+            ("import x = require(\"runai\")", 2),
+            ("export = foo", 3),
+        ] {
+            let src = if statement.starts_with("export") {
+                format!(
+                    "\"use static\"\nconst foo = 1\n{statement}\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+                )
+            } else {
+                format!(
+                    "\"use static\"\n{statement}\nexport default function P(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+                )
+            };
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(codes(&d), vec![Code::RA014], "{statement}: {d:?}");
+            assert_eq!(d[0].line, line, "{statement}: the statement is the site");
+        }
+
+        // The control: `import x = localName` is not a `require(…)` call.
+        let local = "\"use static\"\nconst y = 1\nimport x = y\nexport default function P(props: Record<never, never>) { return <p>x{1}</p> }\n";
+        assert!(
+            analyze(local, "src/routes/index.page.tsx").is_empty(),
+            "`import x = y` strips to `var x = y`, which is valid JavaScript"
+        );
+
+        // And a type-only import-equals binds nothing at all.
+        let typed = "\"use static\"\nimport type x = require(\"./data\")\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        assert!(
+            analyze(typed, "src/routes/index.page.tsx").is_empty(),
+            "a type-only import-equals is erased"
+        );
+    }
+
+    /// The four nits from the review, as facts rather than comments: a
+    /// `module_statements` that cannot name a `"runai"` value, cannot name the
+    /// route, and does not carry a re-export. The existing
+    /// `!contains("import")` assertion is joined by the two that would catch a
+    /// re-export, because `export … from` carries neither the word `import` nor
+    /// the route's name.
+    #[test]
+    fn module_statements_carry_no_reference_the_module_cannot_resolve() {
+        for (src, emitted) in [
+            (
+                "\"use static\"\nconst title = \"A\"\nexport default function Page(props: Record<never, never>) { return <h1>{title}</h1> }\n",
+                "const title = \"A\";",
+            ),
+            (
+                "\"use static\"\nexport { helper } from \"./data\"\nexport default function Page(props: Record<never, never>) { return <p>hi</p> }\n",
+                "",
+            ),
+            (
+                "\"use static\"\nexport * from \"./data\"\nexport default function Page(props: Record<never, never>) { return <p>hi</p> }\n",
+                "",
+            ),
+        ] {
+            let route = lower_route(src).expect("lowered");
+            assert_eq!(route.module_statements, emitted, "{src}");
+            for forbidden in ["import", "export *", "export {"] {
+                assert!(
+                    !route.module_statements.contains(forbidden),
+                    "`{forbidden}` must never be emitted: {:?}",
+                    route.module_statements
+                );
+            }
+        }
     }
 
     /// The `route_parameter` branch, end to end, in both modes: `render()` takes

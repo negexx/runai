@@ -210,10 +210,11 @@ impl JsxChecker<'_> {
     fn root(&mut self, program: &Program<'_>, render: RouteRender<'_>) {
         self.root_expression(render.root);
 
-        // Module-level declarations are never copied into the emitted module, so
-        // JSX there is dropped while the returned tree still refers to the symbol
-        // it was assigned to — a `ReferenceError`. Same defect as a body
-        // statement, one scope out. This runs for a concise arrow body too
+        // Module-level statements *are* emitted now, into the generated `.mjs`,
+        // so the defect is not that the markup is dropped: it is that the emitted
+        // `.mjs` would contain JSX, where it is a syntax error exactly as it is
+        // in a body statement. Same scope-out defect as a body statement, one
+        // level up. This runs for a concise arrow body too
         // (`(props) => <p>{header}</p>` has no body statements but does have a
         // module-level `header`).
         let root_span = render.root.span();
@@ -738,11 +739,11 @@ pub(crate) fn jsx_in_body_statements<'a>(
 /// The span of the first JSX node outside the route's own render, or `None`.
 ///
 /// A route file emits one artifact: the route component's returned tree, plus (for
-/// an island) its body statements. **Module-level declarations are never
-/// emitted.** JSX there is therefore dropped while the returned tree still refers
-/// to the symbol it was bound to, which is a `ReferenceError` at runtime or a
-/// module that does not parse. This is the same defect as
-/// [`jsx_in_body_statements`], one scope out.
+/// an island) its body statements, plus the module-level statements
+/// [`RouteIr::module_statements`](crate::ir::RouteIr::module_statements) carries.
+/// **JSX cannot be one of them**: the emitted `.mjs` would contain it, where it is
+/// a syntax error, exactly as it would in a body statement. This is the same
+/// defect as [`jsx_in_body_statements`], one scope out.
 ///
 /// The excluded range is the route component's body — or, for a concise arrow
 /// body, the returned JSX itself, since that *is* the body. Everything inside is
@@ -1290,17 +1291,17 @@ mod tests {
         );
     }
 
-    /// A module-level declaration is never copied into the emitted module, so its
-    /// JSX is dropped while the returned tree still refers to the symbol it was
-    /// bound to. The reviewer's exact reproduction: lowering returned a tree with
-    /// `Expr("header")` and `statements: ""`, i.e. a module that names an
-    /// undefined symbol.
+    /// Module-level statements *are* emitted now, into the generated `.mjs`, so
+    /// the defect is that the emitted module would contain JSX — a syntax error
+    /// there, exactly as in a body statement. The reviewer's exact reproduction:
+    /// lowering returned a tree with `Expr("header")` and this diagnostic, i.e. a
+    /// module that could not parse.
     #[test]
     fn module_level_jsx_is_ra014() {
         for src in [
             // The reproduction, verbatim.
             "\"use island\"\nconst header = <h1>hi</h1>\nexport default function P(props: Record<never, never>) { return <p>{header}</p> }\n",
-            // A module-level helper that renders: `Header` is never emitted.
+            // A module-level helper that renders: its body is JSX.
             "\"use island\"\nfunction Header(props: Record<never, never>) { return <h1>x</h1> }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
             // The same, as a const-bound arrow.
             "\"use island\"\nconst Header = (props: Record<never, never>) => <h1>x</h1>\nexport default function P(props: Record<never, never>) { return <p/> }\n",
