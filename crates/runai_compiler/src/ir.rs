@@ -2478,6 +2478,13 @@ mod tests {
             "\"use island\"\nexport default function P() { return <div><h1>a<h3>b</h3></h1></div> }\n",
             "\"use island\"\nexport default function P() { return <select><option>a<option>b</option></option></select> }\n",
             "\"use island\"\nexport default function P() { return <table><tbody><tr><td>a<td>b</td></td></tr></tbody></table> }\n",
+            // The cap-adjudication rows: lowering must refuse each with the same
+            // words the analysis does.
+            "\"use island\"\nexport default function P() { const n = signal(0); return <div><noscript>{n()}</noscript></div> }\n",
+            "\"use island\"\nexport default function P() { return <table><td>x</td></table> }\n",
+            "\"use island\"\nexport default function P() { return <table><tbody><td>x</td></tbody></table> }\n",
+            "\"use island\"\nexport default function P() { return <p>a<menu>x</menu></p> }\n",
+            "\"use island\"\nexport default function P() { return <select><select><option>a</option></select></select> }\n",
         ] {
             let alloc = oxc_allocator::Allocator::default();
             let program = parse_tsx(&alloc, src).unwrap();

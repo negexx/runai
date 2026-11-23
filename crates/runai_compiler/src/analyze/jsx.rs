@@ -86,7 +86,9 @@
 //!   parser produces siblings; `<label>` is deliberately **not** in the set,
 //!   because HTML allows it and the parser keeps the nesting;
 //! - `<table>` containing anything but `caption`/`colgroup`/`thead`/`tbody`/
-//!   `tfoot`/`tr`, or bare text — the parser fosters it out of the table;
+//!   `tfoot`/`tr`, or bare text — a non-cell child is fostered out of the table
+//!   and lands before it, a stray `<td>`/`<th>` gets a `<tbody>`/`<tr>` wrapper
+//!   inserted around it, and bare text is fostered out;
 //! - `<thead>`/`<tbody>`/`<tfoot>` containing anything but `<tr>`, `<tr>`
 //!   anything but `<td>`/`<th>`, `<colgroup>` anything but `<col>`, `<select>`
 //!   anything but `<option>`/`<optgroup>`, `<ul>`/`<ol>`/`<menu>` anything but
@@ -207,12 +209,36 @@ const INLINE_TAGS: &[&str] = &[
 /// a *deny*-list rather than an allow-list — `<p>` may contain any phrasing
 /// element or text — so it lives here as its own constant, not inline in the
 /// rule that reads it.
+///
+/// parse5 8.0.1 reaches this closing through several handlers, so the list is
+/// "every start tag that closes an open `<p>`", not one function's `case`
+/// group: the block tags go through `addressStartTagInBody`, the headings
+/// through `numberedHeaderStartTagInBody`, and `<form>`, `<hr>`, and `<table>`
+/// each through their own handler. `menu`, `search`, `dialog`, `hgroup`,
+/// `dir`, and `center` were missing and each was verified to split the
+/// paragraph:
+///
+/// ```text
+/// <p>a<menu>x</menu></p>       -> (p "a") (menu "x") (p)
+/// <p>a<search>x</search></p>   -> (p "a") (search "x") (p)
+/// <p>a<dialog>x</dialog></p>   -> (p "a") (dialog "x") (p)
+/// <p>a<hgroup>x</hgroup></p>   -> (p "a") (hgroup "x") (p)
+/// <p>a<dir>x</dir></p>         -> (p "a") (dir "x") (p)
+/// <p>a<center>x</center></p>   -> (p "a") (center "x") (p)
+/// ```
+///
+/// `<summary>` closes the paragraph too and is deliberately **not** listed here
+/// (adding it would report the same markup twice): it is refused by
+/// [`required_ancestors`], which already requires a `<details>` parent.
 pub(crate) const BLOCK_IN_P: &[&str] = &[
     "address",
     "article",
     "aside",
     "blockquote",
+    "center",
     "details",
+    "dialog",
+    "dir",
     "div",
     "dl",
     "fieldset",
@@ -227,12 +253,15 @@ pub(crate) const BLOCK_IN_P: &[&str] = &[
     "h5",
     "h6",
     "header",
+    "hgroup",
     "hr",
     "main",
+    "menu",
     "nav",
     "ol",
     "p",
     "pre",
+    "search",
     "section",
     "table",
     "ul",
@@ -316,6 +345,24 @@ fn content_model_admits(parent: &str, child: &str) -> bool {
 /// `_a[k]` ordinal would address the wrong site — or `undefined`. An island
 /// therefore refuses a **binding** inside one of these; a static template may
 /// still hold one, because it interpolates a string and never places a marker.
+///
+/// `noscript` is here for the **scripting-enabled** case, which is the one an
+/// island always runs in: the parser then applies the generic raw-text algorithm
+/// to it, so `<!>` is a text node rather than a comment. parse5 8.0.1, on the
+/// emitter's own two-marker template:
+///
+/// ```text
+/// <div><noscript><!></noscript><span><!></span></div>
+///   { scriptingEnabled: true }  -> (div (noscript "<!>") (span (comment "")))
+///                                  comments = [""]        ONE marker
+///   { scriptingEnabled: false } -> (div (noscript (comment "")) (span (comment "")))
+///                                  comments = ["", ""]    TWO markers
+/// ```
+///
+/// The emitter's binding list has two sites, so under scripting the first
+/// `_setText`/`_setAttr` lands on the `<span>`'s marker and the second is
+/// `undefined`. happy-dom keeps both markers, which is why the bun integration
+/// test never caught it.
 pub(crate) const MARKER_HOSTILE: &[&str] = &[
     "script",
     "style",
@@ -325,6 +372,7 @@ pub(crate) const MARKER_HOSTILE: &[&str] = &[
     "iframe",
     "noembed",
     "noframes",
+    "noscript",
     "plaintext",
     "template",
 ];
@@ -372,11 +420,34 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
     // Each family says what the parser does with a child it does not accept, so
     // the repair is specific rather than a generic "use the right tag".
     let message = match parent {
+        // A non-cell child is fostered out of the table, landing *before* it:
+        // `<table><div>x</div></table>` -> `(div "x") (table)`. A stray `<td>`/
+        // `<th>` is different: parse5 inserts the missing row structure and keeps
+        // the cell inside — `<table><td>x</td></table>` ->
+        // `(table (tbody (tr (td "x"))))` — so "fostered" is false for a cell and
+        // only the inserted wrapper is. Both are refused: the tree gains a row
+        // the author did not write.
+        "table" if matches!(child, "td" | "th") => format!(
+            "`<table>` cannot contain `<{child}>` directly: the HTML parser inserts a `<tbody>` and \
+             a `<tr>` around the cell, so the tree gains a row you did not write and the page \
+             renders a different shape. Put the `<{child}>` inside a `<tr>` inside a `<tbody>`, or \
+             let the markup state the row it belongs to."
+        ),
         "table" => format!(
             "`<table>` cannot contain `<{child}>`: the HTML parser moves a non-table child out of \
              the table, so it is fostered before the `<table>` and the page renders a different \
              shape. Put `<{child}>` outside the `<table>`, and use `<tr>` with `<td>` or `<th>` \
              for rows and cells."
+        ),
+        // Same split as the `table` arm: a stray cell in a section has its `<tr>`
+        // inserted around it (`<table><tbody><td>x</td></tbody></table>` ->
+        // `(table (tbody (tr (td "x"))))`) and stays inside the section; any other
+        // child is *relocated* out of the table
+        // (`<table><tbody><div>x</div></tbody></table>` -> `(div "x") (table (tbody))`).
+        "thead" | "tbody" | "tfoot" if matches!(child, "td" | "th") => format!(
+            "`<{parent}>` cannot contain `<{child}>` directly: the HTML parser inserts a `<tr>` \
+             around the cell, so the tree gains a row you did not write and the page renders a \
+             different shape. Put the `<{child}>` inside a `<tr>`."
         ),
         "thead" | "tbody" | "tfoot" => format!(
             "`<{parent}>` cannot contain `<{child}>`: the HTML parser only accepts `<tr>` inside \
@@ -394,21 +465,31 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
              `<col>` here, and move `<{child}>` outside the `<colgroup>`."
         ),
         "select" => {
-            // Three consequences inside `<select>`, verified against parse5 8.0.1
-            // (`startTagInSelect`): `input`/`keygen`/`textarea`/`select` pop the
-            // open `<select>` and reprocess the tag, so it becomes the select's
-            // **sibling**; every other start tag falls through the `default` arm
-            // and is **discarded** with only its text kept (`<select><p>b</p>` →
-            // `(select "b")`). Saying "moves it out" for the discard class — the
-            // old wording — was false; a `<p>`-inside-`<select>` does not become a
-            // sibling, it is gone.
-            if matches!(child, "input" | "keygen" | "textarea" | "select") {
+            // Two consequences inside `<select>`, verified against parse5 8.0.1
+            // (`startTagInSelect`). `input`/`keygen`/`textarea` pop the open
+            // `<select>` and **reprocess** the token, so each becomes the
+            // select's **sibling** — `<select><textarea>t</textarea></select>` →
+            // `(select) (textarea "t")`. A nested `<select>` takes the *same*
+            // first step but is **not** reprocessed (`if (token.tagID !==
+            // $.SELECT)`), so the inner element never exists:
+            // `<select><select><option>a</option></select></select>` →
+            // `(select) (option "a")`. It is discarded, not a sibling, and the
+            // old wording claimed the sibling. Every other start tag falls
+            // through the `default` arm and is **discarded** with only its text
+            // kept (`<select><p>b</p>` → `(select "b")`).
+            if matches!(child, "input" | "keygen" | "textarea") {
                 format!(
                     "`<select>` cannot contain `<{child}>`: the HTML parser closes the `<select>` at \
                      `<{child}>`, so `<{child}>` becomes a sibling after the `<select>` and the page \
                      renders a different shape. Move `<{child}>` outside the `<select>`, and keep \
                      only `<option>` and `<optgroup>` inside it."
                 )
+            } else if child == "select" {
+                "`<select>` cannot contain `<select>`: the HTML parser closes the outer `<select>` \
+                 at the inner one and then discards the inner `<select>` itself, so the tree is not \
+                 the one you wrote. Use one `<select>`, and keep only `<option>` and `<optgroup>` \
+                 inside it."
+                    .to_string()
             } else {
                 format!(
                     "`<select>` cannot contain `<{child}>`: the HTML parser discards `<{child}>` \
@@ -560,11 +641,12 @@ pub(crate) fn self_closing_refusal_for(tag: &str) -> Option<(&'static [&'static 
 /// own named row with its own parse5 evidence, never quietly here.
 ///
 /// Two absences are deliberate and verified, not oversights: `search` and
-/// `dialog` are **not** in parse5's set. `<search>` is still an *address-like*
-/// block that closes an open `<p>` (parse5's `addressStartTagInBody`, a separate
-/// list — see [`BLOCK_IN_P`]), and `<dialog>` closes an `<li>` through the same
-/// `Scan::Special` walk only when it is itself special; it is not, so
-/// `<ul><li>a<dialog><li>b</li></dialog></li></ul>` does split in parse5
+/// `dialog` are **not** in parse5's set. Both still close an open `<p>` by
+/// parse5's `addressStartTagInBody` (a separate list), so both are in
+/// [`BLOCK_IN_P`]: `<p>a<search>x</search></p>` and `<p>a<dialog>x</dialog></p>`
+/// each parse as `(p "a") (search|dialog "x") (p)`. `<dialog>` closes an `<li>`
+/// through the same `Scan::Special` walk only when it is itself special; it is
+/// not, so `<ul><li>a<dialog><li>b</li></dialog></li></ul>` does split in parse5
 /// (`(ul (li (dialog)) (li))`) and the split is refused by the *li* row, not by
 /// anything `dialog` contributes.
 const SPECIAL: &[&str] = &[
@@ -2032,6 +2114,11 @@ pub(crate) fn marker_hostile_message(tag: &str) -> String {
             "`<title>` and `<textarea>` read their contents as RCDATA, so the `<!>` marker the \
              island needs to address this binding is swallowed as text"
         }
+        "noscript" => {
+            "with scripting enabled — the way an island page runs — the browser reads the contents \
+             of `<noscript>` as raw text, so the `<!>` marker the island needs to address this \
+             binding is swallowed as text"
+        }
         _ => {
             "the browser parses this element's contents into a fragment the island's marker \
              walker does not reach"
@@ -2632,6 +2719,166 @@ mod tests {
         );
     }
 
+    /// Every start tag parse5 closes an open `<p>` for is refused. Six were
+    /// missing from [`BLOCK_IN_P`] and all six were CLEAN; parse5 8.0.1 splits
+    /// the paragraph for each:
+    ///
+    /// ```text
+    /// <p>a<menu>x</menu></p>   -> (p "a") (menu "x") (p)
+    /// <p>a<search>x</search></p> -> (p "a") (search "x") (p)
+    /// <p>a<dialog>x</dialog></p> -> (p "a") (dialog "x") (p)
+    /// <p>a<hgroup>x</hgroup></p> -> (p "a") (hgroup "x") (p)
+    /// <p>a<dir>x</dir></p>     -> (p "a") (dir "x") (p)
+    /// <p>a<center>x</center></p> -> (p "a") (center "x") (p)
+    /// ```
+    ///
+    /// All six reach `addressStartTagInBody` in parse5's `startTagInBody`, and
+    /// each produces a trailing empty `<p>` from the author's `</p>`.
+    #[test]
+    fn every_tag_that_closes_a_paragraph_is_refused() {
+        for tag in ["menu", "search", "dialog", "hgroup", "dir", "center"] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return <p>a<{tag}>x</{tag}></p> }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "`<{tag}>`: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "`<{tag}>`");
+            assert!(
+                d[0].message.contains("`<p>`")
+                    && d[0].message.contains(&format!("`<{tag}>`"))
+                    && d[0].message.contains("paragraph"),
+                "`<{tag}>`: the message names both tags and says the paragraph is closed: {}",
+                d[0].message
+            );
+        }
+
+        // The other two on the reviewer's list are already refused by a rule that
+        // covers them, so neither is added a second time: `<summary>` needs a
+        // `<details>` parent, and `<figcaption>` is in `BLOCK_IN_P` already. Each
+        // yields exactly ONE diagnostic, which is what "not double-added" means.
+        for body in [
+            "<p>a<summary>x</summary></p>",
+            "<p>a<figcaption>x</figcaption></p>",
+        ] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "{body}: one diagnostic, not two: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{body}");
+        }
+    }
+
+    /// A `<td>`/`<th>` written directly in a `<table>` is refused because the
+    /// tree gains a row, but **not** because the parser fosters the cell:
+    /// `<table><td>x</td></table>` parses as `(table (tbody (tr (td "x"))))` —
+    /// the `<tbody>`/`<tr>` wrapper is *inserted* and the cell stays inside the
+    /// table. The message must say that, and nothing about fostering.
+    #[test]
+    fn a_stray_cell_says_the_row_wrapper_is_inserted() {
+        for child in ["td", "th"] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return <table><{child}>x</{child}></table> }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "`<{child}>`: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "`<{child}>`");
+            assert!(
+                d[0].message.contains("inserts")
+                    && d[0].message.contains("`<tr>`")
+                    && d[0].message.contains("`<tbody>`"),
+                "`<{child}>`: the message says the row wrapper is inserted: {}",
+                d[0].message
+            );
+            assert!(
+                !d[0].message.contains("foster"),
+                "`<{child}>`: a cell is not fostered — it stays inside the table: {}",
+                d[0].message
+            );
+        }
+
+        // The same for a cell written directly in a section:
+        // `<table><tbody><td>x</td></tbody></table>` -> `(table (tbody (tr (td "x"))))`,
+        // so nothing is relocated — the `<tr>` is inserted around the cell.
+        for section in ["thead", "tbody", "tfoot"] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return <table><{section}><td>x</td></{section}></table> }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "`<{section}>`: {d:?}");
+            assert!(
+                d[0].message.contains("inserts") || d[0].message.contains("inserted"),
+                "`<{section}>`: the message says the `<tr>` is inserted: {}",
+                d[0].message
+            );
+            assert!(
+                !d[0].message.contains("relocate"),
+                "`<{section}>`: a cell is not relocated — it stays in the section: {}",
+                d[0].message
+            );
+        }
+
+        // The control, unchanged: a non-cell child really is fostered out of the
+        // table, so the refusal there keeps the foster wording.
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <table><div>x</div></table> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("fostered"),
+            "a `<div>` in a `<table>` is fostered before it: {}",
+            d[0].message
+        );
+    }
+
+    /// A nested `<select>` is DISCARDED, not moved beside the outer one:
+    /// `<select><select><option>a</option></select></select>` parses as
+    /// `(select) (option "a")` — parse5's `startTagInSelect` pops the open
+    /// `<select>` and then does **not** reprocess the token
+    /// (`if (token.tagID !== $.SELECT)`), so the inner element never exists. The
+    /// `input`/`textarea` cases in the same arm are true siblings
+    /// (`(select) (textarea "t")`) and stay as they are.
+    #[test]
+    fn a_nested_select_is_discarded_not_moved() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <select><select><option>a</option></select></select> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("discards"),
+            "the inner `<select>` is discarded: {}",
+            d[0].message
+        );
+        assert!(
+            !d[0].message.contains("sibling"),
+            "the inner `<select>` does not become a sibling: {}",
+            d[0].message
+        );
+
+        // The true sibling cases in the same arm keep their wording.
+        for child in ["input", "textarea"] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return <select><{child}></{child}></select> }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "`<{child}>`: {d:?}");
+            assert!(
+                d[0].message.contains("sibling"),
+                "`<{child}>` really does become a sibling: {}",
+                d[0].message
+            );
+        }
+
+        // And the discard class the ruling verified stays a discard.
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <select><div>x</div></select> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("discards") && !d[0].message.contains("sibling"),
+            "a `<div>` in a `<select>` is discarded: {}",
+            d[0].message
+        );
+    }
+
     /// A `<div>` inside `<table>` is fostered out of the table entirely: it lands
     /// *before* the table, not inside it.
     #[test]
@@ -2948,6 +3195,46 @@ mod tests {
         assert!(
             check_jsx(program, static_src).is_empty(),
             "a static template may hold a binding in a text-only element"
+        );
+    }
+
+    /// `<noscript>` is marker-hostile **when scripting is enabled**, which is
+    /// always true for the page an island runs on: the parser applies the generic
+    /// raw-text algorithm to it, so `<!>` becomes a text node. parse5 8.0.1:
+    ///
+    /// ```text
+    /// <div><noscript><!></noscript><span><!></span></div>
+    ///   scriptingEnabled: true  -> (div (noscript "<!>") (span (comment "")))
+    ///                              markers = [""]            ONE
+    ///   scriptingEnabled: false -> (div (noscript (comment "")) (span (comment "")))
+    ///                              markers = ["", ""]        TWO
+    /// ```
+    ///
+    /// The emitter writes two markers, so `_a` would be one entry short and the
+    /// first binding would write against the `<span>`'s marker. happy-dom keeps
+    /// both, which is why the bun integration test never saw it.
+    #[test]
+    fn a_binding_inside_noscript_is_ra014_in_an_island() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <div><noscript>{n()}</noscript></div> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<noscript>`"),
+            "names the element: {}",
+            d[0].message
+        );
+
+        // The control: the same shape in a static route stays clean. A static
+        // template interpolates a string and never places a marker, so the
+        // raw-text treatment cannot break it.
+        let static_src = "\"use static\"\nexport default function P(props: Record<never, never>) { const n = 0; return <div><noscript>{n}</noscript></div> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = crate::source::parse_tsx(&alloc, static_src).unwrap();
+        assert!(
+            check_jsx(program, static_src).is_empty(),
+            "a static route interpolates, it never marks: {:?}",
+            check(static_src)
         );
     }
 
