@@ -28,12 +28,37 @@
 //!    row is enough;
 //! 3. a **reference** to a reserved name, in the markup, the body, or the module
 //!    level — but only when the reserved name is **in scope at the emitted call
-//!    site**: unresolved, declared at module scope, declared in the route
-//!    component's own function scope (the `var` case, including a `var` in a
-//!    nested block, a `for` init, or a `try`/`catch`), or the route component
-//!    itself. A reference to any deeper scope (`items.map((render) => …)`, a
-//!    nested function's local, a block `const`) is legal JavaScript shadowing the
-//!    emitted module preserves.
+//!    site**: unresolved, or declared at module scope. A route component named a
+//!    reserved name is declared at module scope too, so it lands in that same arm;
+//!    the row an agent reads for it is [`crate::analyze::reachable`]'s, which owns
+//!    the "the component is not a binding in the artifact" wording. A reference
+//!    to any deeper scope (`items.map((render) => …)`, a nested function's local,
+//!    a block `const`) is legal JavaScript shadowing the emitted module preserves.
+//!
+//! # The declaration rule, and why the reference walk is not it
+//!
+//! Shapes 1 and 3 both see declarations, but neither is the rule this module is
+//! really enforcing: **a reserved name bound in the route component's own scope
+//! is in scope at the emitted call site**, because the emitter copies the body
+//! into `render()`. Shape 1 walks only the *top level* of the emitted statements,
+//! and shape 3 needs a reference to exist at all — so an unreferenced `var` in a
+//! nested block slipped through both and emitted a module that threw
+//! `TypeError: _esc is not a function` at build time while `check` was clean.
+//!
+//! [`check_scope_bindings`] is the direct statement of that rule: it reads the
+//! route component's own scope out of the semantic pass and refuses every
+//! reserved name bound there. The three shapes above stay, because they own rows
+//! this one cannot produce:
+//!
+//! - **shape 1** names a declaration the agent must rename where it is *written*,
+//!   in a module statement or the body's top level;
+//! - **shape 3** is the only row for a name the file never declares (an undeclared
+//!   `_esc` in the markup silently resolving to the compiler's helper), and it is
+//!   the row that points at the offending *use*.
+//!
+//! So a file that declares and reads a reserved name gets two rows for one
+//! problem — one at each site to edit — which is the same shape the module-scope
+//! arm already had. Deleting either walk would lose a site, not a duplicate.
 //!
 //! # What is deliberately not refused
 //!
@@ -48,7 +73,12 @@
 //!   still reach the module-level helper;
 //! - **a reserved name in a component module** (`_shell.tsx`, or a `.tsx` with no
 //!   route) — nothing is emitted from such a file, so there is no helper to
-//!   shadow. The same boundary [`crate::analyze::reachable`] draws.
+//!   shadow. The same boundary [`crate::analyze::reachable`] draws;
+//! - **a component's own name in a named function expression**
+//!   (`export default (function render(props) {…})`) — its name is bound in the
+//!   component's scope, but the emitter rebuilds the component from `RouteIr`
+//!   rather than writing the expression, so the name never appears in the
+//!   artifact.
 //!
 //! The reference walk is [`crate::analyze::reachable`]'s, shared rather than
 //! reimplemented, so "a type-only reference is not a value" has one definition in
@@ -94,14 +124,32 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
     let scoping = semantic.scoping();
 
     // The one scope the emitted `render()` copy shares with the source: the route
-    // component's own function scope. A reference whose binding lives there is in
-    // scope at every emitted call site, because the emitter copies the body into
-    // `render()` and the template's calls sit at the end of that same function.
-    // This is why `var` is the sharp case: it hoists to this scope from anywhere
-    // in the body — a nested block, a `for` init, a `try`/`catch` — while the
-    // block-scoped `const` beside it stays in its block and does not reach the
-    // call site at all.
-    let route_scope = render.scope_id.get();
+    // component's own function scope. A binding here is in scope at every emitted
+    // call site, because the emitter copies the body into `render()` and the
+    // template's calls sit at the end of that same function. This is why `var` is
+    // the sharp case: it hoists to this scope from anywhere in the body — a nested
+    // block, a `for` init, a `try`/`catch` — while the block-scoped `const` beside
+    // it stays in its block and does not reach the call site at all.
+    //
+    // The cell fails **closed**. `None` means the semantic build never filled the
+    // cell that this rule was added to read, which is a compiler defect, not a
+    // clean file: treating it as "no scope, nothing in scope" would silently
+    // disable the declaration rule below for a whole route shape. Naming the
+    // limitation is the loud failure.
+    let Some(route_scope) = render.scope_id.get() else {
+        debug_assert!(
+            false,
+            "the semantic build must fill the route component's scope cell"
+        );
+        return vec![Diagnostic::new(
+            Code::RA014,
+            route.body_span,
+            "the compiler could not resolve the route component's own scope, so it cannot tell \
+             whether the body declares `_esc`, `_attr`, or `render` — the names the generated \
+             module declares for itself. This is a limitation of the compiler, not of this file: \
+             rerun the build, and report it if it persists.",
+        )];
+    };
 
     let mut diagnostics = Vec::new();
 
@@ -117,7 +165,38 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
         }
     }
 
+    // (1b) **Every** name bound in the route component's own scope, whether or
+    // not the file references it. This is the declaration rule proper, and the
+    // reference walk below was only ever a proxy for it: a `var` hoists into this
+    // scope from a nested block, a `for` init, or a `try`/`catch`, so it is in
+    // scope at the template's call site even when the top level of the body never
+    // mentions it. `check_declaration` above cannot see it — it walks the top
+    // level of the emitted statements — and a reference walk cannot see a name
+    // nothing references. Under `f2b2dea` this exact shape emitted
+    // `return \`<p>${_esc(1 + 1)}</p>\`` under a `var _esc = 1`, and the module
+    // threw `TypeError: _esc is not a function` at build time with `check` clean.
+    //
+    // `get_binding`, not `find_binding`: a binding is in this map only when it is
+    // **declared in this scope**, which is exactly "hoisted into the emitted
+    // function's scope". `find_binding` walks ancestors and would refuse every
+    // module-level name too.
+    check_scope_bindings(
+        scoping,
+        route_scope,
+        &route,
+        &render,
+        reserved,
+        &mut diagnostics,
+    );
+
     // (3) References in the three emitted regions.
+    //
+    // This row is **not** redundant with (1b): a declaration is refused wherever
+    // it is written, but only a reference tells an agent which *use* must change,
+    // and it is the only row for a name the file never declares (an undeclared
+    // `_esc` in the markup, which silently resolves to the compiler's own
+    // helper). (1b) owns "a binding hoisted into `render()`'s scope"; (3) owns
+    // "a use that reaches a shadow at the emitted call site".
     //
     // A reference is refused when the reserved name is **in scope at the emitted
     // call site**, which is the template's `${_esc(…)}` / `${_attr(…)}` and the
@@ -196,7 +275,7 @@ fn reference_collision(
     scoping: &oxc_semantic::Scoping,
     reference: &crate::analyze::reachable::Reference,
     route: &crate::analyze::ComponentInfo<'_>,
-    route_scope: Option<oxc_semantic::ScopeId>,
+    route_scope: oxc_semantic::ScopeId,
     reserved: &[&str],
 ) -> Option<Diagnostic> {
     if !reserved.contains(&reference.name.as_str()) {
@@ -234,7 +313,7 @@ fn reference_collision(
     // `render()`, so a binding here is in scope at the template's call site. A
     // `var` lands here from any depth, which is exactly the defect this arm
     // closes.
-    if Some(declaration_scope) == route_scope {
+    if declaration_scope == route_scope {
         return Some(reference_refusal(
             reference.span,
             &reference.name,
@@ -247,6 +326,88 @@ fn reference_collision(
     // keeps: its nearest enclosing function is not `render()`, so the template's
     // calls still reach the module-level helper.
     None
+}
+
+/// Refuse every reserved name **bound in the route component's own scope**.
+///
+/// This is the declaration rule the reference walk was a proxy for. A name in
+/// this scope's binding table is one the emitted `render()` declares at its own
+/// top level, because the emitter copies the component body into that function —
+/// so it shadows `_esc`, `_attr`, or `render` at the call site inside the
+/// template, whether or not anything in the file references it.
+///
+/// `get_binding` is the right lookup, not `find_binding`: the map holds only the
+/// names **declared in this scope**, which is exactly "hoisted into the emitted
+/// function's scope". `find_binding` walks ancestors and would also refuse every
+/// module-level name — a different rule, and a different row.
+///
+/// What lands here: a `var` from anywhere in the body (a nested block, a `for`
+/// init, a `try`/`catch`, a destructuring pattern), and a top-level `const`,
+/// `let`, `class`, or `function` of the body. What does **not**, because the
+/// binder puts it in a deeper scope: a nested-block `const`/`let`, a block-level
+/// `function` declaration (ESM is strict), a nested function's or arrow's own
+/// locals and parameters, and a `catch` parameter.
+///
+/// Two bindings in this map are not this rule's: a type alias or interface
+/// (erased by `strip_types`, so nothing is emitted under the name), the route
+/// parameter, which [`crate::analyze::reachable`] already refuses when it is
+/// named something other than `props` (refusing it here too would be two rows for
+/// one problem), and a named function expression's own name in the one shape that
+/// binds it here — there is nothing to shadow, because the emitter never writes
+/// the expression.
+fn check_scope_bindings(
+    scoping: &oxc_semantic::Scoping,
+    route_scope: oxc_semantic::ScopeId,
+    route: &crate::analyze::ComponentInfo<'_>,
+    render: &crate::analyze::jsx::RouteRender<'_>,
+    reserved: &[&str],
+    out: &mut Vec<Diagnostic>,
+) {
+    let params = render.params.span;
+    for name in reserved {
+        let Some(symbol) = scoping.get_binding(route_scope, oxc_ast::ast::Ident::from(*name))
+        else {
+            continue;
+        };
+        if scoping.symbol_flags(symbol).is_type() {
+            continue;
+        }
+        let span = scoping.symbol_span(symbol);
+        if span.start >= params.start && span.end <= params.end {
+            continue;
+        }
+        // The component's own name, in the one shape that binds it in the
+        // component's own scope: a named **function expression**
+        // (`export default (function render(props) {…})`), whose name lives in
+        // the function's scope rather than at module level. The emitter rebuilds
+        // the component as `export function render()`, so the inner name is never
+        // written — there is nothing to shadow. `analyze::reachable` owns the case
+        // where the file *references* the component.
+        if (span.start, span.end) == route.name_span {
+            continue;
+        }
+        out.push(scope_binding_refusal((span.start, span.end), name));
+    }
+}
+
+/// `RA014` for a reserved name bound in the route component's own scope.
+///
+/// The repair is the rename the declaration row already gives, and the reason is
+/// the **hoist**: a `var` reaches this scope from a nested block even when the
+/// file never mentions it, so "nothing references it" is not a defence.
+fn scope_binding_refusal(span: (u32, u32), name: &str) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        span,
+        format!(
+            "`{name}` is one of the names the generated module declares for itself (`{names}`). \
+             This binding is declared in the route component's own scope, which the emitter copies \
+             into `render()`, so the template's `{name}(…)` call reaches it instead of the \
+             generated helper. A `var` reaches this scope from any nested block, `for` init, or \
+             `try`/`catch`, even when nothing references it. Rename `{name}`.",
+            names = crate::ir::PRERENDER_NAMES.join("`, `"),
+        ),
+    )
 }
 
 /// The names the module for `mode` declares for itself.
@@ -659,15 +820,19 @@ mod tests {
     fn a_var_in_a_nested_block_that_reaches_the_call_site_is_ra014() {
         let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const on = true; if (on) { var _esc = (v: unknown) => \"hijacked\"; }\n  return <p>{_esc(\"x\")}</p>\n}\n";
         let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        // Two rows for one problem, the same shape the module-scope arm has: the
+        // declaration is where the rename happens, the use is where the agent reads
+        // why. The declaration row is `check_scope_bindings`'s; this one is the
+        // reference walk's.
+        assert!(
+            d.iter()
+                .any(|row| row.code == Code::RA014 && row.message.contains("body declares")),
+            "the reference names the hoisted binding: {d:?}"
+        );
         let row = d
             .iter()
-            .find(|row| row.code == Code::RA014 && row.message.contains("_esc"))
+            .find(|row| row.code == Code::RA014 && row.message.contains("body declares"))
             .unwrap_or_else(|| panic!("a hoisted `var` shadows the escaper: {d:?}"));
-        assert!(
-            row.message.contains("body declares"),
-            "the message names the body binding: {}",
-            row.message
-        );
         assert_eq!(
             &src[row.span.0 as usize..row.span.1 as usize],
             "_esc",
@@ -725,13 +890,227 @@ mod tests {
     /// `render` is legal. The row an agent sees for a reserved-named component is
     /// `reachable`'s, which owns the "the component is not a binding in the
     /// artifact" wording; `emitted_names` must not add a second row for the same
-    /// span.
+    /// problem. Exactly one row, not "at least one": the claim is one problem, one
+    /// row.
     #[test]
     fn a_reserved_named_route_component_is_named_by_the_reachable_rule() {
         let src = "\"use static\"\nexport default function render(props: Record<never, never>) { return <p>{render.name}</p> }\n";
-        assert!(crate::analyze::analyze(src, "src/routes/about.page.tsx")
-            .iter()
-            .any(|row| row.code == Code::RA014 && row.message.contains("route's own component")));
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "one problem, one row: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("route's own component"),
+            "the row is `reachable`'s: {}",
+            d[0].message
+        );
+    }
+
+    /// The declaration rule proper: an **unreferenced** `var` in a nested block
+    /// still hoists into the route component's own scope, which the emitter copies
+    /// into `render()`. Nothing in the file names `_esc`, so the reference walk
+    /// has nothing to say — and `check_declaration` only walks the *top level* of
+    /// the emitted body, so a nested `if` swallowed it. The artifact this emitted
+    /// under `f2b2dea` was `return \`<p>${_esc(1 + 1)}</p>\`` with `var _esc = 1`
+    /// above it, i.e. `TypeError: _esc is not a function` at build time while
+    /// `check` was clean.
+    #[test]
+    fn an_unreferenced_var_in_a_nested_block_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { var _esc = 1 }\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_esc`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    /// The same defect through the dynamic-attribute helper: an unreferenced
+    /// `var _attr` is in scope where `${_attr("class", …)}` runs, so the emitted
+    /// module would throw on the attribute instead of the slot.
+    #[test]
+    fn an_unreferenced_var_for_a_dynamic_attribute_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const cls = \"a\"\n  if (false) { var _attr = 1 }\n  return <p class={cls}>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_attr`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// The scope cell is populated from a different AST node for an arrow route
+    /// (`ArrowFunctionExpression` rather than `Function`), so the declaration rule
+    /// is exercised through that node too. `f2b2dea` judged only a *reference's*
+    /// scope, so this fixture was clean and the artifact threw.
+    #[test]
+    fn an_unreferenced_var_in_an_arrow_route_is_ra014() {
+        let src = "\"use static\"\nconst P = (props: Record<never, never>) => {\n  if (false) { var _esc = 1 }\n  return <p>{1 + 1}</p>\n}\nexport default P\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_esc`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// ESM is strict, so a **block-level function declaration** is scoped to its
+    /// block; it does not hoist out to `render()`. `oxc_semantic`'s binder agrees
+    /// (the block is its own scope), so this is legal and the artifact must still
+    /// be emitted.
+    #[test]
+    fn a_block_level_function_declaration_is_not_hoisted_out_of_its_block() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { function _esc() {} }\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a block-level function declaration stays in its block: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx").is_ok(),
+            "the artifact is still emitted"
+        );
+    }
+
+    /// A block-scoped `const` is declared in the block's own scope, not the
+    /// route component's, so with nothing referencing it there is no collision at
+    /// all.
+    #[test]
+    fn an_unreferenced_nested_block_const_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { const _esc = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "a block `const` stays in its block: {d:?}");
+    }
+
+    /// The declaration rule reads the route component's own scope, and one shape
+    /// binds a name *there* without shadowing anything: a named **function
+    /// expression** route. Its name is the component's, and the emitter rebuilds
+    /// the component from `RouteIr` rather than writing the expression, so the
+    /// name never appears in the artifact. Refusing it would be a false positive
+    /// on a legal page — the same class of mistake the arrow-parameter control
+    /// guards.
+    #[test]
+    fn a_named_function_expression_route_is_clean() {
+        let src = "\"use static\"\nexport default (function render(props: Record<never, never>) { return <p>hi</p> })\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "the component's own name is not a binding in the artifact: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx").is_ok(),
+            "the artifact is still emitted"
+        );
+    }
+
+    /// A nested function expression's own name is declared in *its* scope, not the
+    /// route component's, so it cannot reach the emitted call site.
+    #[test]
+    fn a_named_nested_function_expression_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const f = function _esc() {};\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a nested function expression owns its name: {d:?}"
+        );
+    }
+
+    /// A `var` declared through a destructuring pattern hoists exactly like a
+    /// plain `var`: the pattern binds `_esc` in the component's scope. Nothing
+    /// references it, so only the declaration rule can see it.
+    #[test]
+    fn an_unreferenced_destructured_var_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { var { _esc } = { _esc: 1 } }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a destructured `var` hoists too: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_esc`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// A `try`/`catch` body's `var` hoists out of the `catch` block in the same
+    /// way a nested `if` does, so the same rule catches it.
+    #[test]
+    fn an_unreferenced_var_in_a_catch_block_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  try {} catch (e) { var _esc = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a `catch` block's `var` hoists: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+    }
+
+    /// A `catch` parameter is scoped to the `catch` block, not the route function,
+    /// so it never reaches the emitted call site.
+    #[test]
+    fn a_catch_parameter_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  try {} catch (_esc) {}\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a `catch` parameter stays in its block: {d:?}"
+        );
+    }
+
+    /// A `for (let …)` head is block-scoped to the loop, so it is not the route
+    /// function's binding. The control for the `for (var …)` case.
+    #[test]
+    fn an_unreferenced_for_let_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  for (let _esc = 1; false;) {}\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "a `let` is scoped to its loop: {d:?}");
+    }
+
+    /// A `type` alias or `interface` in the body binds a symbol in the route
+    /// scope's type space, but `strip_types` erases it, so nothing is emitted
+    /// under the name. The declaration rule must not refuse what the binder puts
+    /// there for a type.
+    #[test]
+    fn an_unreferenced_type_alias_in_the_body_is_clean() {
+        for declaration in ["type _esc = 1", "interface _esc { a: 1 }"] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{\n  {declaration};\n  return <p>hi</p>\n}}\n"
+            );
+            let d = crate::analyze::analyze(&src, "src/routes/about.page.tsx");
+            assert!(
+                d.is_empty(),
+                "a type is erased before emission: {declaration}: {d:?}"
+            );
+        }
+    }
+
+    /// N2: the `scope_id` cell fails **closed**, and this pins that it is
+    /// populated for both route shapes — the shape that made the old `None` arm a
+    /// silent no-op. `None` would mean the walk never visited the component, which
+    /// the `debug_assert!` in `check_emitted_names` turns into a refusal rather
+    /// than a quiet pass.
+    #[test]
+    fn the_route_scope_cell_is_populated_for_both_route_shapes() {
+        for src in [
+            "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+            "\"use static\"\nconst P = (props: Record<never, never>) => <p>hi</p>\nexport default P\n",
+        ] {
+            let alloc = oxc_allocator::Allocator::default();
+            let program = crate::source::parse_tsx(&alloc, src).unwrap();
+            let render = crate::analyze::jsx::route_render(program).unwrap();
+            let semantic = oxc_semantic::SemanticBuilder::new().build(program).semantic;
+            assert!(
+                render.scope_id.get().is_some(),
+                "the semantic build fills the route scope cell: {src}"
+            );
+            drop(semantic);
+        }
     }
 
     /// A component module is not emitted by this milestone, so there is no helper

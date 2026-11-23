@@ -273,26 +273,64 @@ mod tests {
     /// "fifth", and the fifth clause came before the third and fourth — a linear
     /// reader met the ordinal out of order, which is the kind of prose an agent
     /// triages on. Both texts now say five and name the fifth last.
+    ///
+    /// The order assertion pins **one anchor phrase per family**, not the ordinal
+    /// words: the loop above already proves "fifth" exists, so checking
+    /// `third < fifth` would still pass if a family paragraph were deleted as long
+    /// as the word "third" survived in a neighbouring clause. Each anchor below is
+    /// a sentence that only that family's paragraph contains, so deleting a
+    /// family removes its anchor and fails the test.
     #[test]
     fn ra014_counts_and_orders_its_five_families() {
-        for (what, text) in [
-            ("explain", Code::RA014.explain().to_string()),
-            ("skill", skill_body(Code::RA014)),
+        // One anchor per family, in order. `explain` and the skill's
+        // `## Why it is an error` are separate prose, so each gets its own
+        // phrasing of the same five anchors.
+        let explain_anchors = [
+            // (1) a JSX construct the milestone cannot lower
+            "A first is a JSX construct this milestone",
+            // (2) a module the emitted file cannot resolve or write
+            "A second is a module the emitted file cannot resolve or write",
+            // (3) a value the generated module cannot see
+            "A third is a value the generated module cannot see",
+            // (4) a `declare` statement
+            "A `declare` statement is refused: it is the fourth family",
+            // (5) the emitted module's own reserved names
+            "A fifth is the emitted module's own names",
+        ];
+        let why_anchors = [
+            "The first is the JSX constructs it refuses",
+            "is the second family, refused for one of three reasons",
+            "The third family is a value the generated module genuinely cannot see",
+            "A `declare` statement is the fourth family",
+            "The fifth family is the generated module's own **reserved** names",
+        ];
+        let skill = skill_body(Code::RA014);
+        let why =
+            &skill[skill.find("## Why it is an error").unwrap()..skill.find("## Fix").unwrap()];
+        for (what, text, anchors) in [
+            (
+                "explain",
+                Code::RA014.explain().to_string(),
+                explain_anchors,
+            ),
+            ("skill", why.to_string(), why_anchors),
         ] {
             assert!(text.contains("five families"), "{what}: {text}");
             assert!(!text.contains("four families"), "{what}: {text}");
-            let third = text
-                .find("third")
-                .unwrap_or_else(|| panic!("{what}: no third: {text}"));
-            let fourth = text
-                .find("fourth")
-                .unwrap_or_else(|| panic!("{what}: no fourth: {text}"));
-            let fifth = text
-                .find("fifth")
-                .unwrap_or_else(|| panic!("{what}: no fifth: {text}"));
+            let positions: Vec<usize> = anchors
+                .iter()
+                .map(|anchor| {
+                    let count = text.matches(anchor).count();
+                    assert_eq!(
+                        count, 1,
+                        "{what}: family anchor `{anchor}` must appear exactly once: {text}"
+                    );
+                    text.find(anchor).unwrap()
+                })
+                .collect();
             assert!(
-                third < fifth && fourth < fifth,
-                "{what}: the fifth clause must follow the third and fourth: {text}"
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "{what}: the five families must appear in order: {positions:?}\n{text}"
             );
         }
     }
@@ -420,7 +458,7 @@ mod tests {
             "the import repair must precede the JSX repairs: {fix}"
         );
 
-        // The explain carries all four families, so `runai check` on an import
+        // The explain carries all five families, so `runai check` on an import
         // diagnostic does not explain a JSX construct the file does not contain.
         let explain = Code::RA014.explain();
         for family in [
