@@ -58,7 +58,7 @@ use crate::analyze::jsx::{
     BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR, MARKER_HOSTILE, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR,
     ancestor_refusal, dom_tag, element_has_binding, jsx_in_body_statements,
     jsx_outside_route_render, jsx_returns, jsx_spans, marker_hostile_message, parent_child_refusal,
-    route_render, text_refusal,
+    route_render, self_closing_refusal, text_refusal,
 };
 use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
 use crate::diagnostic::{Code, Diagnostic};
@@ -680,7 +680,11 @@ impl<'s> Lowerer<'s> {
 
         // The reparse refusals, repeated as invariants. `check_jsx` reports them
         // first; sharing the messages means a caller that skips analysis sees the
-        // same words, not a second rule.
+        // same words, not a second rule. The same-kind rule runs first, at the
+        // same precedence `check_jsx` uses, so the two lists cannot disagree.
+        if let Some(message) = self_closing_refusal(&name, ancestors) {
+            return Err(vec![reparse_invariant(element.span, message)]);
+        }
         if let Some(parent) = ancestors.last()
             && let Some(message) = parent_child_refusal(parent, &name)
         {
@@ -2421,6 +2425,38 @@ mod tests {
         }
     }
 
+    /// Two of the "closes its own kind" rows asserted end to end: `lower_route`
+    /// returns `Err` carrying the **same message** `check_jsx` reports. The shared
+    /// list test above covers four more rows by looping; this one pins the exact
+    /// text for two families.
+    #[test]
+    fn lowering_refuses_an_element_that_closes_its_own_kind() {
+        use crate::analyze::jsx::check_jsx;
+        use crate::source::parse_tsx;
+
+        for src in [
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <ul><li>a<li>b</li></li></ul> }\n",
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <table><tbody><tr><td>a<td>b</td></td></tr></tbody></table> }\n",
+        ] {
+            let alloc = oxc_allocator::Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let analysis = check_jsx(program, src);
+            assert_eq!(analysis.len(), 1, "{src}: {analysis:?}");
+
+            let errs = crate::ir::lower_route(src).unwrap_err();
+            assert_eq!(errs[0].code, Code::RA014, "{src}");
+            assert_eq!(
+                errs[0].message, analysis[0].message,
+                "{src}: lowering and analysis must report one refusal, not two"
+            );
+            assert!(
+                errs[0].message.contains("sibling"),
+                "{src}: names the shape: {}",
+                errs[0].message
+            );
+        }
+    }
+
     /// `lower_route` refuses the marker-hostile and required-ancestor shapes with
     /// the **same words** `check_jsx` reports. `template_html` and `lower_route`
     /// are both `pub`, so this is a public path to a template whose marker count
@@ -2437,6 +2473,11 @@ mod tests {
             "\"use island\"\nexport default function P() { return <div><tr><td>x</td></tr></div> }\n",
             "\"use island\"\nexport default function P() { return <td>x</td> }\n",
             "\"use island\"\nexport default function P() { return <div><li>x</li></div> }\n",
+            // The "closes its own kind" rows, repeated by lowering.
+            "\"use island\"\nexport default function P() { return <ul><li>a<li>b</li></li></ul> }\n",
+            "\"use island\"\nexport default function P() { return <div><h1>a<h3>b</h3></h1></div> }\n",
+            "\"use island\"\nexport default function P() { return <select><option>a<option>b</option></option></select> }\n",
+            "\"use island\"\nexport default function P() { return <table><tbody><tr><td>a<td>b</td></td></tr></tbody></table> }\n",
         ] {
             let alloc = oxc_allocator::Allocator::default();
             let program = parse_tsx(&alloc, src).unwrap();

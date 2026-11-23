@@ -69,11 +69,18 @@
 //! The island emitter writes markup as HTML **text**, so the browser's parser
 //! rebuilds the tree — and for these shapes it does not rebuild the tree the
 //! author wrote. [`reparse_refusal`], [`parent_child_refusal`],
-//! [`ancestor_refusal`], [`required_ancestors`], and [`text_refusal`] refuse them,
-//! because the emitter cannot fix a shape the parser rewrites:
+//! [`ancestor_refusal`], [`required_ancestors`], [`text_refusal`], and
+//! [`self_closing_refusal`] refuse them, because the emitter cannot fix a shape
+//! the parser rewrites:
 //!
 //! - `<p>` containing a block element — the parser closes the paragraph, so the
 //!   child becomes a sibling;
+//! - a tag that **closes an open element of its own kind** — `<li>` in `<li>`,
+//!   `<dt>`/`<dd>` in either, any heading in any other, `<button>` in `<button>`,
+//!   `<option>`/`<optgroup>` in either, `<td>`/`<th>` in either, `<tr>` in `<tr>`,
+//!   and the obsolete `<nobr>` in `<nobr>`. The author wrote nesting and the
+//!   parser produces siblings; `<label>` is deliberately **not** in the set,
+//!   because HTML allows it and the parser keeps the nesting;
 //! - `<table>` containing anything but `caption`/`colgroup`/`thead`/`tbody`/
 //!   `tfoot`/`tr`, or bare text — the parser fosters it out of the table;
 //! - `<thead>`/`<tbody>`/`<tfoot>` containing anything but `<tr>`, `<tr>`
@@ -88,10 +95,14 @@
 //!   section/`<caption>`/`<colgroup>`/`<col>` outside `<table>`,
 //!   `<option>`/`<optgroup>` outside `<select>`/`<datalist>`, `<figcaption>`
 //!   outside `<figure>`, `<legend>` outside `<fieldset>`, `<summary>` outside
-//!   `<details>` — outside its parent the parser **drops** the element (and its
-//!   content) or keeps only its content in the enclosing element, so every
-//!   later marker ordinal shifts and `_a[k]` addresses the wrong site. The
-//!   route **root** has no ancestors, which is not a legal parent either;
+//!   `<details>`. What happens outside differs by element, verified against
+//!   parse5 8.0.1: a table part is dropped with its content, a `<td>`/`<th>`
+//!   loses the cell but keeps its content in the enclosing element, and
+//!   `<option>`/`<optgroup>`/`<figcaption>`/`<legend>`/`<summary>` are **kept in
+//!   place** — outside its parent each is simply not the control or caption its
+//!   tag names. In every case the tree differs from the one the author wrote, so
+//!   the position is refused rather than emitted. The route **root** has no
+//!   ancestors, which is not a legal parent either;
 //! - **in an island**, a dynamic binding inside a text-only element (`script`,
 //!   `style`, `title`, `textarea`, `template`, …) — the `<!>` marker the emitter
 //!   needs is swallowed as text or moved into a fragment the marker walker never
@@ -361,6 +372,263 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
     Some(message)
 }
 
+/// The tags that **close an open element of their own kind**, with the ancestors
+/// that bound the search.
+///
+/// This is the wrong-**shape** class, the sibling of [`BLOCK_IN_P`]: the author
+/// wrote nesting, and the HTML parser ends the outer element at the inner start
+/// tag, so the inner element becomes the outer's **sibling**. `<li>a<li>b` inside
+/// one `<ul>` is two items, not one item containing another; `<h1>a<h3>b` is two
+/// headings, not one. Each row is verified against parse5 8.0.1, whose algorithms
+/// this table transcribes:
+///
+/// - `list` rows (`li`, `dt`, `dd`) walk the open stack and stop at the first
+///   *special* element that is not `address`/`div`/`p` — the
+///   `listItemStartTagInBody` loop in parse5's parser;
+/// - `html`/`button`/`table`/`template` rows stop at the corresponding *scope*
+///   set — the `hasInScope`/`hasInButtonScope`/`hasInTableScope` boundaries;
+/// - `option`, `optgroup` and the headings look at the **innermost open element
+///   only**: parse5 pops at most one `option`, and a heading closes a heading only
+///   when it is the current node.
+///
+/// `<label>` is deliberately **absent**: HTML allows a label to hold a label for a
+/// control inside it, and parse5 keeps the nesting, so refusing it would be a
+/// false positive. `<nobr>` is present even though it is obsolete: the parser
+/// still closes an open `<nobr>` at a second one (`nobrStartTagInBody`), so the
+/// shape is the same defect and is refused as an element rather than special-cased
+/// as a tag.
+///
+/// The `stop` field names the boundary by scope: `Some(SCOPE_*)` for a set of
+/// tags, `None` for the *special element* walk the list rows use, and
+/// [`Scan::Innermost`] for the rows that only look at the parent.
+pub(crate) enum Scan {
+    /// Walk the stack inward-out; stop at the first special element that is not
+    /// `address`, `div`, or `p` (parse5's `listItemStartTagInBody`).
+    Special,
+    /// Walk the stack inward-out; stop at any tag in this scope set.
+    Scope(&'static [&'static str]),
+    /// Only the innermost open element is consulted (parse5 pops one at most).
+    Innermost,
+}
+
+/// Tags that close an open element of the same kind; see [`Scan`].
+///
+/// One table, read by [`self_closing_refusal`] and therefore by
+/// [`crate::ir::lower_route`] too, so the analysis and the lowering cannot
+/// disagree about which nesting the parser would split.
+pub(crate) fn self_closing_refusal_for(tag: &str) -> Option<(&'static [&'static str], Scan)> {
+    const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+    // parse5's scope sets (open-element-stack.js), plus `select` in the two
+    // flow sets only. The in-select insertion mode discards every start tag but
+    // its own children, so a `<p>`/`<a>`/`<nobr>`/`<button>` above a `<select>`
+    // is never closed by a tag inside it: the inner element is discarded, and
+    // claiming a "sibling" would be false. `select` is **not** added to
+    // [`SCOPE_TABLE`]: verified against parse5, a `<td>` inside `<td><select>`
+    // still closes the outer cell, so the table rows must keep walking past it.
+    const SCOPE_HTML: &[&str] = &[
+        "applet", "caption", "html", "marquee", "object", "table", "td", "template", "th", "select",
+    ];
+    const SCOPE_BUTTON: &[&str] = &[
+        "applet", "caption", "html", "marquee", "object", "table", "td", "template", "th",
+        "button", "select",
+    ];
+    const SCOPE_TABLE: &[&str] = &["table", "template"];
+
+    match tag {
+        "li" => Some((&["li"], Scan::Special)),
+        "dt" | "dd" => Some((&["dt", "dd"], Scan::Special)),
+        "p" => Some((&["p"], Scan::Scope(SCOPE_BUTTON))),
+        "a" => Some((&["a"], Scan::Scope(SCOPE_HTML))),
+        "nobr" => Some((&["nobr"], Scan::Scope(SCOPE_HTML))),
+        "button" => Some((&["button"], Scan::Scope(SCOPE_HTML))),
+        "td" | "th" => Some((&["td", "th"], Scan::Scope(SCOPE_TABLE))),
+        "tr" => Some((&["tr"], Scan::Scope(SCOPE_TABLE))),
+        "option" => Some((&["option"], Scan::Innermost)),
+        "optgroup" => Some((&["option", "optgroup"], Scan::Innermost)),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some((HEADINGS, Scan::Innermost)),
+        _ => None,
+    }
+}
+
+/// The tags parse5 treats as *special*, for the [`Scan::Special`] walk.
+///
+/// From `common/html.js`'s `SPECIAL_ELEMENTS[NS.HTML]`. Kept as a list, not a
+/// predicate, because it is data from the spec rather than a rule of ours.
+const SPECIAL: &[&str] = &[
+    "address",
+    "applet",
+    "area",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "bgsound",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "iframe",
+    "img",
+    "input",
+    "li",
+    "link",
+    "listing",
+    "main",
+    "marquee",
+    "menu",
+    "meta",
+    "nav",
+    "noembed",
+    "noframes",
+    "noscript",
+    "object",
+    "ol",
+    "p",
+    "param",
+    "plaintext",
+    "pre",
+    "script",
+    "search",
+    "section",
+    "select",
+    "source",
+    "style",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+    "wbr",
+    "xmp",
+];
+
+/// Why `tag` may not open under `ancestors` because the parser would **close an
+/// open element of its own kind** first, or `None`.
+///
+/// `ancestors` is every enclosing element, outermost first — the same stack
+/// [`check_jsx`] and [`crate::ir::lower_route`] already keep. The innermost entry
+/// is the direct parent; the rest is what the scope walk sees.
+///
+/// The message names the tag that closes, the tag it closes, what the parser does,
+/// and a repair that is legal as written.
+pub(crate) fn self_closing_refusal(tag: &str, ancestors: &[String]) -> Option<String> {
+    let (closes, scan) = self_closing_refusal_for(tag)?;
+
+    let closed = match scan {
+        Scan::Innermost => {
+            let parent = ancestors.last()?;
+            closes
+                .contains(&parent.as_str())
+                .then_some(parent.clone())?
+        }
+        Scan::Special => {
+            let mut found = None;
+            for ancestor in ancestors.iter().rev() {
+                if closes.contains(&ancestor.as_str()) {
+                    found = Some(ancestor.clone());
+                    break;
+                }
+                if !matches!(ancestor.as_str(), "address" | "div" | "p")
+                    && SPECIAL.contains(&ancestor.as_str())
+                {
+                    break;
+                }
+            }
+            found?
+        }
+        Scan::Scope(scope) => {
+            let mut found = None;
+            for ancestor in ancestors.iter().rev() {
+                if closes.contains(&ancestor.as_str()) {
+                    found = Some(ancestor.clone());
+                    break;
+                }
+                if scope.contains(&ancestor.as_str()) {
+                    break;
+                }
+            }
+            found?
+        }
+    };
+
+    let repair = match tag {
+        "li" => {
+            "Put the second `<li>` after the first one's closing `</li>`, or nest it inside the \
+                 first item's own `<ul>` or `<ol>`."
+                .to_string()
+        }
+        "dt" | "dd" => "Put the second entry after the first one's closing tag, or nest it in a \
+                        `<dl>` inside the first entry."
+            .to_string(),
+        "td" | "th" => {
+            "Put the second cell after the first one's closing tag; a row holds sibling \
+                        cells."
+                .to_string()
+        }
+        "tr" => "Put the second row after the first one's closing `</tr>`; a table section holds \
+                 sibling rows."
+            .to_string(),
+        "option" => "Put the second `<option>` after the first one's closing tag; a select holds \
+                     sibling options."
+            .to_string(),
+        "optgroup" => "Put the second `<optgroup>` after the first one's closing tag; a select \
+                       holds sibling groups."
+            .to_string(),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "Put the second heading after the first one's \
+                        closing tag, and choose one heading level for both; a heading cannot \
+                        contain another heading."
+            .to_string(),
+        "nobr" => "Put the second `<nobr>` after the first one's closing tag, or drop `<nobr>` \
+                   entirely: it is obsolete, and `<span style=\"white-space: nowrap\">` (or a CSS \
+                   class) is the supported way to keep text on one line."
+            .to_string(),
+        _ => format!("Put the second `<{tag}>` outside the first one, after its closing tag."),
+    };
+
+    Some(format!(
+        "`<{closed}>` cannot contain `<{tag}>`: the HTML parser closes the outer `<{closed}>` at \
+         the inner `<{tag}>`, so the inner `<{tag}>` becomes a sibling of the outer `<{closed}>` \
+         and the page renders a different shape than you wrote. {repair}"
+    ))
+}
+
 /// Why bare text may not be a **direct child** of `parent`, or `None`.
 ///
 /// Only the table family fosters text: `<table>text` parses with the text moved
@@ -397,12 +665,14 @@ pub(crate) fn text_refusal(parent: &str) -> Option<String> {
 
 /// The parents a tag is only legal under, or `None` when any parent is.
 ///
-/// These are the elements the HTML parser refuses to build in place: a table
-/// part outside a table is dropped (or its content re-parented), a `<td>`
-/// outside a `<tr>` loses its cell, an `<option>` outside a `<select>` is
-/// dropped. The route **root** has no ancestors, which is not one of the legal
-/// parents — a root `<td>` leaves the marker's `parentNode` a document
-/// fragment, where `setAttribute` does not exist.
+/// These are the elements the HTML parser refuses to build in place, verified
+/// against parse5 8.0.1: a table part outside a table is dropped with its
+/// content, a `<td>`/`<th>` outside a `<tr>` loses the cell but keeps its content
+/// in the enclosing element, and an `<option>`/`<optgroup>`/`<figcaption>`/
+/// `<legend>`/`<summary>` is **kept** where it stands but is not the control or
+/// caption its tag names. The route **root** has no ancestors, which is not one
+/// of the legal parents — a root `<td>` leaves the marker's `parentNode` a
+/// document fragment, where `setAttribute` does not exist.
 ///
 /// Shared by [`check_jsx`] and [`crate::ir::lower_route`], like
 /// [`reparse_refusal`], so the two cannot disagree about a legal position.
@@ -478,8 +748,9 @@ fn required_ancestor_message(tag: &str, required: &[&str]) -> String {
 /// `<dt>`/`<dd>` outside `<dl>`), and a tag the parser only builds under one
 /// parent ([`required_ancestors`]: `<td>` outside `<tr>`, `<option>` outside
 /// `<select>`, …). The parser splits nested anchors and forms into siblings; a
-/// stray list item has no list to belong to; and a table part, option, caption,
-/// legend or summary is dropped outside its parent.
+/// stray list item has no list to belong to; and a table part is dropped while
+/// `<option>`/`<figcaption>`/`<legend>`/`<summary>` are kept but not the control
+/// their tag names.
 pub(crate) fn ancestor_refusal(tag: &str, ancestors: &[String]) -> Option<String> {
     let inside = |name: &str| ancestors.iter().any(|ancestor| ancestor == name);
 
@@ -887,20 +1158,34 @@ impl JsxChecker<'_> {
 
     /// The reparse refusals: a shape the HTML parser would rewrite.
     ///
-    /// Three checks for one element: its **parent/child** tag pair, a non-blank
-    /// **text** child in a table family element, and its **ancestors** (a nested
-    /// anchor or form, or a stray list item). Each is `RA014` — the file parses;
-    /// this is the compiler declining markup whose parsed DOM would differ from
-    /// what the author wrote, which the island emitter cannot fix because it emits
-    /// HTML text the browser re-parses.
+    /// Four checks for one element: whether it **closes an open element of its own
+    /// kind**, its **parent/child** tag pair, a non-blank **text** child in a table
+    /// family element, and its **ancestors** (a nested anchor or form, or a stray
+    /// list item). Each is `RA014` — the file parses; this is the compiler
+    /// declining markup whose parsed DOM would differ from what the author wrote,
+    /// which the island emitter cannot fix because it emits HTML text the browser
+    /// re-parses.
     ///
-    /// The messages come from [`parent_child_refusal`], [`text_refusal`], and
-    /// [`ancestor_refusal`], shared with [`crate::ir::lower_route`] so a caller
-    /// that skips the analysis gets the same words rather than a different rule.
+    /// The messages come from [`self_closing_refusal`], [`parent_child_refusal`],
+    /// [`text_refusal`], and [`ancestor_refusal`], shared with
+    /// [`crate::ir::lower_route`] so a caller that skips the analysis gets the same
+    /// words rather than a different rule.
     fn nesting(&mut self, element: &JSXElement<'_>) {
         let Some(tag) = element_tag(element) else {
             return;
         };
+
+        // A tag that closes an open element of its own kind: the author wrote
+        // nesting and the parser produces siblings. `self.ancestors` is the
+        // enclosing stack (this element is pushed only after the checks), so its
+        // innermost entry is this element's parent. This is checked **first**
+        // because it is the precise rule for the same-kind cases; the parent/child
+        // allow-list would describe `<optgroup>` in `<optgroup>` as "not an
+        // `<option>`", which is true but buries the actual defect.
+        if let Some(message) = self_closing_refusal(tag, &self.ancestors) {
+            self.diagnostics.push(reshaped(element.span, message));
+            return;
+        }
 
         // The parent is the innermost open element, if any. The route root has no
         // parent, so a root `<p>`, `<table>`, or `<li>` is never the parent/child
@@ -2392,9 +2677,11 @@ mod tests {
     }
 
     /// Every tag the HTML parser only accepts under one parent, outside it. The
-    /// parser drops the element (and its content, including a binding marker) or
-    /// keeps the marker but re-parents it — either way the emitted `_a[k]` is
-    /// wrong, so the analysis must refuse the shape.
+    /// parser drops a table part with its content, keeps a `<td>`'s content in the
+    /// enclosing element, and keeps an `<option>`/`<figcaption>`/`<legend>`/
+    /// `<summary>` where it stands but not as the control its tag names — either
+    /// way the emitted `_a[k]` addresses a node the author did not write, so the
+    /// analysis must refuse the shape.
     ///
     /// Verified against parse5 8.0.1: `<td>`/`<th>` lose the cell but keep their
     /// content in the enclosing element (so `_setAttr(_a[k].parentNode, …)` sets
@@ -2510,6 +2797,160 @@ mod tests {
                 "{body}: gives a reachable repair: {}",
                 d[0].message
             );
+        }
+    }
+
+    /// A tag that **closes an open element of its own kind** is the wrong-SHAPE
+    /// class: the author wrote nesting and the page gets siblings. `<li>a<li>b`
+    /// inside one `<ul>` parses as two sibling items, not one item containing
+    /// another. The same holds for the description list, the headings (any level
+    /// closes any level), buttons, options and optgroups, table cells and rows,
+    /// and `<p>`/`<a>`/`<form>`; `<nobr>` is the obsolete member of the family.
+    ///
+    /// Every row was verified against parse5 8.0.1 in a standards-mode document;
+    /// see the module report for the printed parses. Each asserts `RA014`, both
+    /// tag names in the message, and the word "sibling".
+    #[test]
+    fn an_element_that_closes_its_own_kind_is_ra014() {
+        // (body, outer tag, inner tag)
+        let cases: &[(&str, &str, &str)] = &[
+            ("<ul><li>a<li>b</li></li></ul>", "li", "li"),
+            ("<ol><li>a<li>b</li></li></ol>", "li", "li"),
+            ("<dl><dt>a<dt>b</dt></dt></dl>", "dt", "dt"),
+            ("<dl><dd>a<dd>b</dd></dd></dl>", "dd", "dd"),
+            // `dt` and `dd` close each other, in both directions.
+            ("<dl><dt>a<dd>b</dd></dt></dl>", "dt", "dd"),
+            ("<dl><dd>a<dt>b</dt></dd></dl>", "dd", "dt"),
+            ("<div><h1>a<h1>b</h1></h1></div>", "h1", "h1"),
+            ("<div><h6>a<h6>b</h6></h6></div>", "h6", "h6"),
+            // Any heading closes any heading, across levels.
+            ("<div><h1>a<h3>b</h3></h1></div>", "h1", "h3"),
+            ("<div><h6>a<h1>b</h1></h6></div>", "h6", "h1"),
+            (
+                "<div><button>a<button>b</button></button></div>",
+                "button",
+                "button",
+            ),
+            (
+                "<select><option>a<option>b</option></option></select>",
+                "option",
+                "option",
+            ),
+            (
+                "<select><optgroup label=\"x\"><optgroup label=\"y\"></optgroup></optgroup></select>",
+                "optgroup",
+                "optgroup",
+            ),
+            ("<div><nobr>a<nobr>b</nobr></nobr></div>", "nobr", "nobr"),
+            (
+                "<table><tbody><tr><td>a<td>b</td></td></tr></tbody></table>",
+                "td",
+                "td",
+            ),
+            (
+                "<table><tbody><tr><th>a<th>b</th></th></tr></tbody></table>",
+                "th",
+                "th",
+            ),
+            // `td` and `th` close each other, in both directions.
+            (
+                "<table><tbody><tr><td>a<th>b</th></td></tr></tbody></table>",
+                "td",
+                "th",
+            ),
+            (
+                "<table><tbody><tr><th>a<td>b</td></th></tr></tbody></table>",
+                "th",
+                "td",
+            ),
+            // A row closes an open row: the second becomes a sibling of the first.
+            (
+                "<table><tbody><tr><td>a</td><tr><td>b</td></tr></tr></tbody></table>",
+                "tr",
+                "tr",
+            ),
+            // The outer element closes at the inner one *through* a wrapper that
+            // does not stop the search (`span` is not a scope boundary here).
+            ("<p>a<span><p>b</p></span></p>", "p", "p"),
+            ("<ul><li>a<div><li>b</li></div></li></ul>", "li", "li"),
+        ];
+
+        for (body, outer, inner) in cases {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "{body}: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{body}");
+            assert!(
+                d[0].message.contains(&format!("`<{outer}>`")),
+                "{body}: names the outer tag: {}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains(&format!("`<{inner}>`")),
+                "{body}: names the inner tag: {}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains("sibling"),
+                "{body}: says the inner becomes a sibling: {}",
+                d[0].message
+            );
+        }
+    }
+
+    /// The shapes that look like the table's rows but are **legal nesting**. The
+    /// parser keeps every one of these exactly as written, so refusing any of them
+    /// would be a false positive on ordinary markup.
+    ///
+    /// `<label>` inside `<label>` is the one the table must not gain by pattern
+    /// matching: HTML explicitly allows a label to hold a label for a control
+    /// inside it, and parse5 keeps the nesting.
+    #[test]
+    fn the_shapes_that_nest_legally_stay_clean() {
+        for body in [
+            "<label><label>x</label></label>",
+            "<label>outer<input/><label>inner</label></label>",
+            // Separate lists: two sibling lists, not a nested item. (A route
+            // returns one root, so the page wraps them; the shapes under test are
+            // the two lists and the two headings.)
+            "<div><ul><li>a</li></ul><ul><li>b</li></ul></div>",
+            // Sibling headings are siblings by construction, not by a split.
+            "<div><h1>a</h1><h2>b</h2></div>",
+            // Sibling cells in one row.
+            "<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>",
+            "<table><tbody><tr><th>a</th><th>b</th></tr></tbody></table>",
+            "<dl><dt>a</dt><dd>b</dd></dl>",
+            "<select><option>a</option></select>",
+            "<select><option>a</option><option>b</option></select>",
+            "<select><optgroup label=\"g\"><option>a</option></optgroup></select>",
+            // A nested list inside an item is legal, and parse5 keeps it.
+            "<ul><li>a<ul><li>b</li></ul></li></ul>",
+            "<ol><li><ol><li>x</li></ol></li></ol>",
+            // A nested description list inside a value is legal.
+            "<dl><dd>a<dl><dt>x</dt><dd>y</dd></dl></dd></dl>",
+            // A nested table inside a cell is legal.
+            "<table><tbody><tr><td>a<table><tbody><tr><td>b</td></tr></tbody></table></td></tr></tbody></table>",
+            // A heading inside a wrapper is not closed by a heading inside a
+            // further wrapper: the wrapper bounds the search.
+            "<h1>a<span><h2>b</h2></span></h1>",
+            "<h1>a<div><h2>b</h2></div></h1>",
+            // A list item separated from its list by a table cell is not closed
+            // by an outer item: the cell bounds the search.
+            "<ul><li>a<table><tbody><tr><td><li>b</li></td></tr></tbody></table></li></ul>",
+            // A `<select>` bounds the flow families: the in-select mode discards
+            // what is not its own child, so no outer `<p>`/`<a>`/`<button>` is
+            // closed inside it.
+            "<p>a<select><option>b</option></select></p>",
+            "<a href=\"/x\">a<select><option>b</option></select></a>",
+            "<button>a<select><option>b</option></select></button>",
+        ] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert!(d.is_empty(), "{body}: {d:?}");
         }
     }
 
