@@ -488,4 +488,54 @@ mod tests {
             row.message
         );
     }
+
+    /// The reparse **shape** rules are mode-independent: a static route's template
+    /// is re-parsed as HTML too, so the parser reshapes it exactly as it reshapes
+    /// an island's. Only the *marker*-hostile rule is island-gated; the tree-shape
+    /// rules must fire in a `"use static"` route as well. Nothing asserted that
+    /// before, so a future "island-only" gate on the whole `RA014` block would
+    /// silently stop refusing a static page whose DOM the browser rewrites.
+    ///
+    /// RED for a wrongly gated rule: `emit_prerender_checked` returns `Ok`.
+    #[test]
+    fn a_static_route_refuses_a_shape_the_parser_reshapes() {
+        // `<div><td>` — parse5 drops the cell and keeps its content in the div
+        // (`<div><td>x</td></div>` → `(div "x")`), so the page is not the markup.
+        let src = format!("\"use static\"\n{P} {{ return <div><td>x</td></div> }}\n");
+        let diagnostics = emit_prerender_checked(&src, "src/routes/about.page.tsx")
+            .expect_err("a shaped static route must not emit");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, Code::RA014);
+        assert!(
+            diagnostics[0].message.contains("`<td>`") && diagnostics[0].message.contains("`<tr>`"),
+            "the shape rule names the tag and its required parent: {}",
+            diagnostics[0].message
+        );
+    }
+
+    /// The control: a **legal** static route that also contains a binding still
+    /// emits. It proves the refusal above is the shape rule and not "static routes
+    /// with markup are refused", and that a legal static template interpolates its
+    /// binding as a string (the mode independence cuts both ways).
+    #[test]
+    fn a_legal_static_route_with_a_binding_still_emits() {
+        let src = format!(
+            "\"use static\"\n{P} {{ const c = \"on\"; return <div class={{c}}><span>x</span></div> }}\n"
+        );
+        let js = emit_prerender_checked(&src, "src/routes/about.page.tsx")
+            .expect("a legal static route emits");
+        assert!(js.contains("export function render()"), "{js}");
+        assert!(
+            js.contains("_attr(\"class\", c)"),
+            "the static binding is interpolated as a string, not a marker: {js}"
+        );
+        assert!(
+            js.contains("<span>x</span>"),
+            "the legal nesting is written verbatim: {js}"
+        );
+        assert!(
+            !js.contains("<!>"),
+            "a static template has no markers: {js}"
+        );
+    }
 }

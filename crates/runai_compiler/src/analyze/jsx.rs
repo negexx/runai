@@ -87,7 +87,8 @@
 //!   anything but `<td>`/`<th>`, `<colgroup>` anything but `<col>`, `<select>`
 //!   anything but `<option>`/`<optgroup>`, `<ul>`/`<ol>` anything but `<li>`,
 //!   `<dl>` anything but `<dt>`/`<dd>` — each is moved out or wrapped;
-//! - `<a>` inside `<a>`, `<form>` inside `<form>` — the parser splits them;
+//! - `<a>` inside `<a>` — the parser splits it into siblings; `<form>` inside
+//!   `<form>` — the parser **drops** the nested form;
 //! - `<li>` outside `<ul>`/`<ol>`, `<dt>`/`<dd>` outside `<dl>` — a stray entry
 //!   with no list to belong to;
 //! - a tag the parser only builds under one parent ([`required_ancestors`]):
@@ -344,17 +345,55 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
              `<colgroup>`, so it moves `<{child}>` out and the page renders a different shape. Use \
              `<col>` here, and move `<{child}>` outside the `<colgroup>`."
         ),
-        "select" => format!(
-            "`<select>` cannot contain `<{child}>`: the HTML parser only accepts `<option>` or \
-             `<optgroup>` inside `<select>`, so it moves `<{child}>` out and the page renders a \
-             different shape. Use `<option>` or `<optgroup>` here, and move `<{child}>` outside the \
-             `<select>`."
-        ),
-        "optgroup" => format!(
-            "`<optgroup>` cannot contain `<{child}>`: the HTML parser only accepts `<option>` inside \
-             `<optgroup>`, so it moves `<{child}>` out and the page renders a different shape. Use \
-             `<option>` here, and move `<{child}>` outside the `<optgroup>`."
-        ),
+        "select" => {
+            // Three consequences inside `<select>`, verified against parse5 8.0.1
+            // (`startTagInSelect`): `input`/`keygen`/`textarea`/`select` pop the
+            // open `<select>` and reprocess the tag, so it becomes the select's
+            // **sibling**; every other start tag falls through the `default` arm
+            // and is **discarded** with only its text kept (`<select><p>b</p>` →
+            // `(select "b")`). Saying "moves it out" for the discard class — the
+            // old wording — was false; a `<p>`-inside-`<select>` does not become a
+            // sibling, it is gone.
+            if matches!(child, "input" | "keygen" | "textarea" | "select") {
+                format!(
+                    "`<select>` cannot contain `<{child}>`: the HTML parser closes the `<select>` at \
+                     `<{child}>`, so `<{child}>` becomes a sibling after the `<select>` and the page \
+                     renders a different shape. Move `<{child}>` outside the `<select>`, and keep \
+                     only `<option>` and `<optgroup>` inside it."
+                )
+            } else {
+                format!(
+                    "`<select>` cannot contain `<{child}>`: the HTML parser discards `<{child}>` \
+                     inside `<select>` and keeps only its text, so the page renders a different shape \
+                     without the `<{child}>`. Move `<{child}>` outside the `<select>`, and keep only \
+                     `<option>` and `<optgroup>` inside it."
+                )
+            }
+        }
+        "optgroup" => {
+            // Same two classes as `<select>`, verified against parse5 8.0.1:
+            // `input`/`keygen`/`textarea`/`select`/`hr` leave the open
+            // `<optgroup>` (`startTagInSelect` pops it; `hr` becomes a sibling of
+            // the group), and every other tag is **discarded** with only its text
+            // kept (`<select><optgroup><div>x</div></optgroup></select>` →
+            // `(select (optgroup "x"))`). "Moves it out" was false for the
+            // discard class.
+            if matches!(child, "input" | "keygen" | "textarea" | "select" | "hr") {
+                format!(
+                    "`<optgroup>` cannot contain `<{child}>`: the HTML parser closes the open \
+                     `<optgroup>` at `<{child}>`, so `<{child}>` becomes its sibling and the page \
+                     renders a different shape. Move `<{child}>` outside the `<optgroup>`, and keep \
+                     only `<option>` inside it."
+                )
+            } else {
+                format!(
+                    "`<optgroup>` cannot contain `<{child}>`: the HTML parser discards `<{child}>` \
+                     inside `<optgroup>` and keeps only its text, so the page renders a different \
+                     shape without the `<{child}>`. Move `<{child}>` outside the `<optgroup>`, and \
+                     keep only `<option>` inside it."
+                )
+            }
+        }
         "ul" | "ol" => format!(
             "`<{parent}>` cannot contain `<{child}>`: a list holds `<li>` children, so the HTML \
              parser treats `<{child}>` as an item wrapper and the page renders a different shape. \
@@ -452,8 +491,26 @@ pub(crate) fn self_closing_refusal_for(tag: &str) -> Option<(&'static [&'static 
 
 /// The tags parse5 treats as *special*, for the [`Scan::Special`] walk.
 ///
-/// From `common/html.js`'s `SPECIAL_ELEMENTS[NS.HTML]`. Kept as a list, not a
-/// predicate, because it is data from the spec rather than a rule of ours.
+/// An **exact mirror** of parse5 8.0.1's `SPECIAL_ELEMENTS[NS.HTML]`
+/// (`dist/common/html.js`): the same 81 tags, no additions and no omissions.
+/// This is data from the parser we are modelling, not a rule of ours, and the
+/// `Scan::Special` walk's correctness depends on the set being identical — one
+/// extra tag makes the walk stop early and silently loses a real nesting
+/// (`<li>a<search><li>b` splits in parse5, so a `search` here instead reports the
+/// markup clean and the page renders a shape the author did not write), and one
+/// missing tag makes the walk run past a boundary and refuses legal markup.
+/// `the_special_list_is_exactly_parse5s` pins every member so a hand-edit cannot
+/// drift; a tag that needs different handling than parse5 gives it belongs in its
+/// own named row with its own parse5 evidence, never quietly here.
+///
+/// Two absences are deliberate and verified, not oversights: `search` and
+/// `dialog` are **not** in parse5's set. `<search>` is still an *address-like*
+/// block that closes an open `<p>` (parse5's `addressStartTagInBody`, a separate
+/// list — see [`BLOCK_IN_P`]), and `<dialog>` closes an `<li>` through the same
+/// `Scan::Special` walk only when it is itself special; it is not, so
+/// `<ul><li>a<dialog><li>b</li></dialog></li></ul>` does split in parse5
+/// (`(ul (li (dialog)) (li))`) and the split is refused by the *li* row, not by
+/// anything `dialog` contributes.
 const SPECIAL: &[&str] = &[
     "address",
     "applet",
@@ -517,7 +574,6 @@ const SPECIAL: &[&str] = &[
     "plaintext",
     "pre",
     "script",
-    "search",
     "section",
     "select",
     "source",
@@ -743,16 +799,25 @@ fn required_ancestor_message(tag: &str, required: &[&str]) -> String {
 
 /// Why `tag` may not appear under `ancestors`, or `None`.
 ///
-/// Three kinds of rule: `<a>` inside `<a>`, `<form>` inside `<form>`, a
+/// Kinds of rule: `<a>` inside `<a>`, `<form>` inside `<form>`, a
 /// list/description item with no list parent (`<li>` outside `<ul>`/`<ol>`,
 /// `<dt>`/`<dd>` outside `<dl>`), and a tag the parser only builds under one
 /// parent ([`required_ancestors`]: `<td>` outside `<tr>`, `<option>` outside
-/// `<select>`, …). The parser splits nested anchors and forms into siblings; a
-/// stray list item has no list to belong to; and a table part is dropped while
-/// `<option>`/`<figcaption>`/`<legend>`/`<summary>` are kept but not the control
-/// their tag names.
+/// `<select>`, …). The parser splits nested anchors into siblings and **drops**
+/// a nested form; a stray list item has no list to belong to; and a table part is
+/// dropped while `<option>`/`<figcaption>`/`<legend>`/`<summary>` are kept but
+/// not the control their tag names.
 pub(crate) fn ancestor_refusal(tag: &str, ancestors: &[String]) -> Option<String> {
     let inside = |name: &str| ancestors.iter().any(|ancestor| ancestor == name);
+    // A `<select>` on the ancestor path means the parser is in its in-select
+    // insertion mode, whose default arm **discards** a start tag that is not
+    // `option`/`optgroup` (parse5 `startTagInSelect`): `<a href="/1">x<select><a
+    // href="/2">y</a></select></a>` parses as `(a href=/1 "x" (select "y"))` —
+    // the inner `<a>` is gone, not a sibling. So the "becomes a sibling" claim
+    // below is false there, and this rule stays silent; the `<select>` content
+    // model already refuses the inner element (its element is discarded, which is
+    // itself a shape change worth reporting).
+    let in_select = inside("select");
 
     // A tag the parser only builds under one parent. The root has no ancestors,
     // which is not one of those parents — so a root `<td>` is refused rather than
@@ -769,7 +834,7 @@ pub(crate) fn ancestor_refusal(tag: &str, ancestors: &[String]) -> Option<String
     }
 
     match tag {
-        "a" if inside("a") => Some(
+        "a" if inside("a") && !in_select => Some(
             "`<a>` cannot contain `<a>`: the HTML parser closes the outer anchor at the inner one, \
              so the inner `<a>` becomes a sibling and the page renders a different shape. Use a \
              `<span>` for the inner content, or move the inner anchor out of the outer one."
@@ -2805,7 +2870,13 @@ mod tests {
     /// inside one `<ul>` parses as two sibling items, not one item containing
     /// another. The same holds for the description list, the headings (any level
     /// closes any level), buttons, options and optgroups, table cells and rows,
-    /// and `<p>`/`<a>`/`<form>`; `<nobr>` is the obsolete member of the family.
+    /// and `<p>`/`<a>`; `<nobr>` is the obsolete member of the family.
+    ///
+    /// `<form>` is deliberately **not** here: parse5 *drops* a nested form
+    /// (`<form><form>x</form></form>` → `(form "x")`), which is the DROP class,
+    /// not the sibling class. It is refused by [`ancestor_refusal`]'s
+    /// `<form>`-in-`<form>` arm with a message that says so; including it in this
+    /// table would replace that true message with a false "becomes a sibling".
     ///
     /// Every row was verified against parse5 8.0.1 in a standards-mode document;
     /// see the module report for the printed parses. Each asserts `RA014`, both
@@ -2900,6 +2971,147 @@ mod tests {
         }
     }
 
+    /// `SPECIAL` is an **exact** mirror of parse5's special-element set.
+    ///
+    /// The `Scan::Special` walk (the `li`/`dt`/`dd` rows) stops at the first
+    /// special element that is not `address`/`div`/`p`. One extra tag makes it
+    /// stop early and silently accept a nesting parse5 splits (`<li>a<search><li>b`
+    /// → two items), one missing tag makes it run past a boundary and refuse legal
+    /// markup. So the list is pinned member-for-member against the real set,
+    /// transcribed from **parse5 8.0.1**, `dist/common/html.js`,
+    /// `SPECIAL_ELEMENTS[NS.HTML]` (81 tags). A hand-edit that adds or removes a
+    /// tag fails here and must be justified against parse5, not by taste.
+    #[test]
+    fn the_special_list_is_exactly_parse5s() {
+        // `[...SPECIAL_ELEMENTS[NS.HTML]]` mapped through `TAG_ID` → name, from
+        // parse5 8.0.1; dumped and diffed against `SPECIAL` in the task report.
+        // Sorted; 81 members.
+        let parse5_8_0_1: &[&str] = &[
+            "address",
+            "applet",
+            "area",
+            "article",
+            "aside",
+            "base",
+            "basefont",
+            "bgsound",
+            "blockquote",
+            "body",
+            "br",
+            "button",
+            "caption",
+            "center",
+            "col",
+            "colgroup",
+            "dd",
+            "details",
+            "dir",
+            "div",
+            "dl",
+            "dt",
+            "embed",
+            "fieldset",
+            "figcaption",
+            "figure",
+            "footer",
+            "form",
+            "frame",
+            "frameset",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "head",
+            "header",
+            "hgroup",
+            "hr",
+            "html",
+            "iframe",
+            "img",
+            "input",
+            "li",
+            "link",
+            "listing",
+            "main",
+            "marquee",
+            "menu",
+            "meta",
+            "nav",
+            "noembed",
+            "noframes",
+            "noscript",
+            "object",
+            "ol",
+            "p",
+            "param",
+            "plaintext",
+            "pre",
+            "script",
+            "section",
+            "select",
+            "source",
+            "style",
+            "summary",
+            "table",
+            "tbody",
+            "td",
+            "template",
+            "textarea",
+            "tfoot",
+            "th",
+            "thead",
+            "title",
+            "tr",
+            "track",
+            "ul",
+            "wbr",
+            "xmp",
+        ];
+
+        let mut ours = SPECIAL.to_vec();
+        let mut theirs = parse5_8_0_1.to_vec();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(
+            ours, theirs,
+            "SPECIAL must equal parse5 8.0.1's set exactly"
+        );
+        assert_eq!(ours.len(), 81, "parse5 8.0.1 has 81 special tags");
+
+        // The two absences the round-3 ruling called out, asserted explicitly so a
+        // reader sees them as decisions, not oversights.
+        assert!(
+            !SPECIAL.contains(&"search"),
+            "`search` is NOT special in parse5; adding it loses a real nesting"
+        );
+        assert!(
+            !SPECIAL.contains(&"dialog"),
+            "`dialog` is NOT special in parse5; the li split is refused by the `li` row"
+        );
+    }
+
+    /// `search` is not special, so a `<li>` inside one is **not** protected by the
+    /// special-element walk: the parser closes the outer `<li>` at it. Before the
+    /// round-3 fix `SPECIAL` contained `search`, the walk stopped there, and this
+    /// markup was reported CLEAN while parse5 split it.
+    ///
+    /// RED (with `search` in `SPECIAL`): `check` returned `[]`.
+    /// GREEN: `RA014`, naming both `<li>`s and "sibling".
+    #[test]
+    fn a_list_item_inside_search_still_closes_the_outer_item() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <ul><li>outer<search><li>x</li></search></li><li>tail</li></ul> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<li>`") && d[0].message.contains("sibling"),
+            "names the closed `<li>` and says it becomes a sibling: {}",
+            d[0].message
+        );
+    }
+
     /// The shapes that look like the table's rows but are **legal nesting**. The
     /// parser keeps every one of these exactly as written, so refusing any of them
     /// would be a false positive on ordinary markup.
@@ -2939,12 +3151,6 @@ mod tests {
             // A list item separated from its list by a table cell is not closed
             // by an outer item: the cell bounds the search.
             "<ul><li>a<table><tbody><tr><td><li>b</li></td></tr></tbody></table></li></ul>",
-            // A `<select>` bounds the flow families: the in-select mode discards
-            // what is not its own child, so no outer `<p>`/`<a>`/`<button>` is
-            // closed inside it.
-            "<p>a<select><option>b</option></select></p>",
-            "<a href=\"/x\">a<select><option>b</option></select></a>",
-            "<button>a<select><option>b</option></select></button>",
         ] {
             let src = format!(
                 "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
@@ -2952,6 +3158,77 @@ mod tests {
             let d = check(&src);
             assert!(d.is_empty(), "{body}: {d:?}");
         }
+    }
+
+    /// The `<select>` boundary keeps the **ancestor** rule silent, and the one
+    /// diagnostic that remains tells the truth.
+    ///
+    /// Round 2 put `select` in `SCOPE_HTML`/`SCOPE_BUTTON` so the self-closing
+    /// walk stops there, but `ancestor_refusal`'s `<a>`-in-`<a>` arm did not know
+    /// about it, so `<a href="/1">x<select><a href="/2">y</a></select></a>` was
+    /// refused **twice** — the second with "the inner `<a>` becomes a sibling",
+    /// which parse5 contradicts: it parses as `(a href=/1 "x" (select "y"))`, the
+    /// inner anchor is *discarded*.
+    ///
+    /// Each fixture below places the same tag inside the `<select>`, so it fails
+    /// two ways if the boundary regresses: a second diagnostic appears when the
+    /// ancestor arm fires, and the word "sibling" reappears when the false
+    /// sentence does. The remaining `<select>` content-model message is honest —
+    /// every one of these inner tags is in parse5's *discard* arm
+    /// (`startTagInSelect`'s `default`), so it says the element is discarded and
+    /// only its text kept, never that it becomes a sibling.
+    #[test]
+    fn the_select_boundary_keeps_the_ancestor_rule_silent() {
+        for tag in ["p", "a", "button", "nobr"] {
+            let open = if tag == "a" {
+                "<a href=\"/1\">".to_string()
+            } else {
+                format!("<{tag}>")
+            };
+            let inner = if tag == "a" {
+                "<a href=\"/2\">y</a>".to_string()
+            } else {
+                format!("<{tag}>b</{tag}>")
+            };
+            let body = format!("{open}a<select>{inner}</select></{tag}>");
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "{body}: one element, one diagnostic: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{body}");
+            assert!(
+                d[0].message.contains("`<select>`"),
+                "{body}: the select content model is what refuses it: {}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains("discards"),
+                "{body}: states parse5's real outcome (the element is discarded): {}",
+                d[0].message
+            );
+            assert!(
+                !d[0].message.contains("sibling"),
+                "{body}: must NOT claim the discarded element becomes a sibling: {}",
+                d[0].message
+            );
+        }
+
+        // The `<optgroup>` arm had the same false "moves it out" sentence for the
+        // discard class; parse5 keeps only the text (`(select (optgroup "x"))`).
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <select><optgroup><div>x</div></optgroup></select> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].message.contains("`<optgroup>`") && d[0].message.contains("discards"),
+            "the optgroup discard class is stated as a discard: {}",
+            d[0].message
+        );
+        assert!(
+            !d[0].message.contains("moves `<div>` out"),
+            "must not claim a discarded child is moved out: {}",
+            d[0].message
+        );
     }
 
     /// Every legal nesting of the tags the required-ancestor rule governs stays
