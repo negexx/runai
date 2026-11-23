@@ -1524,33 +1524,175 @@ git commit -m "feat(compiler): emit self-contained prerender modules with no imp
 
 ### Task 11: Island codegen
 
+This task emits the first module that runs in a browser, and the browser rebuilds the
+template from HTML text rather than from the IR. That difference is not cosmetic: the
+HTML parser moves elements (`<p><div>`), inserts them (`<table><tr>` → tbody), and
+fosters them out of tables entirely. Six defects found by execution are closed here;
+the first is the reason the pinned shape changed.
+
 **Files:**
 - Create: `crates/runai_compiler/src/codegen/client.rs`
 - Modify: `crates/runai_compiler/src/codegen/mod.rs`
+- Modify: `crates/runai_compiler/src/codegen/prerender.rs` (share the template writer)
+- Modify: `crates/runai_compiler/src/analyze/jsx.rs` (reparse-safe nesting rule)
+- Modify: `crates/runai_compiler/src/analyze/emitted_names.rs` (island reserved set)
+- Modify: `crates/runai_compiler/src/ir.rs` (the island name list)
 
 **Interfaces:**
-- Consumes: `RouteIr`, `IrNode`, `Binding`.
+- Consumes: `RouteIr`, `IrNode`, `Binding`, `analyze`, `runai_imports`.
 - Produces:
-  - `pub(crate) fn emit_client(route: &RouteIr, runtime_url: &str) -> String`. An ESM module with exactly **one** import, from `runtime_url`. That import merges the route's own `"runai"` specifiers with the internal helpers it uses. The module ends by mounting the page into `#app`. `pub(crate)` for the same reason as `emit_prerender`: only the `*_checked` form is public.
-  - `pub fn template_html(node: &IrNode) -> String`. The markup, with each `Expr` child replaced by a `<!>` placeholder comment.
+  - `pub(crate) fn emit_client(route: &RouteIr, runtime_url: &str, imports: &[String]) -> String`. An ESM module with exactly **one** import, from `runtime_url`. `imports` is every `"runai"` specifier the module needs — the caller computes it from `runai_imports(program)` plus the helpers the emitter uses, merged and sorted. `pub(crate)` for the same reason as `emit_prerender`.
+  - `pub fn template_html(node: &IrNode) -> String`. The markup with a `<!>` marker for **every** binding site: each `Expr` child, each `Binding::Attr`, and each `Binding::Event`. Markers appear in the same document order the emitter's binding list uses.
+  - `pub fn emit_client_checked(source: &str, path: &str, runtime_url: &str) -> Result<String, Vec<Diagnostic>>`, in `codegen/mod.rs`.
 
-**Emitted shape** (pinned, so the runtime API and the emitter cannot drift):
+**Emitted shape** (pinned; this REPLACES the index-path shape in the previous revision,
+for the reason in Step 0):
 
 ```js
-import { signal, template, mount, _setText } from "/assets/runtime.js"
+import { _on, _setAttr, _setText, mount, signal, template } from "/assets/runtime.js"
 const _t0 = template("<p class=\"a\"><!></p>")
 function Page(props) {
   const n = signal(0)
-  const el = _t0.content.firstChild.cloneNode(true)
-  _setText(el.firstChild, () => n())
-  return el
+  const _el = _t0.clone()
+  const _a = _c(_el)
+  _setAttr(_a[0].parentNode, "class", () => n() > 0 ? "on" : "off")
+  _setText(_a[1], () => String(n()))
+  _on(_a[2].parentNode, "click", () => n(n() + 1))
+  return _el
 }
 mount(Page, document.getElementById("app"))
 ```
 
-Templates sit at module scope, so each template is parsed once, not on every render. The node path to each binding is walked from `el` with `firstChild`/`nextSibling`, following the binding's position in the IR. The runtime only receives `_on` and `_setAttr` when the page uses them.
+`_c` collects every comment node under the cloned fragment in document order, and the
+emitter emits it once at module scope (not a runtime export: it is three lines and
+belongs to the artifact that needs it). The k-th binding the emitter writes reads
+`_a[k]`, so the ordering contract between `template_html` and the binding list is the
+one thing that must be tested hard.
 
-- [ ] **Step 1: Write the failing tests**
+A marker's `parentNode` is what `_setAttr`/`_on` target: a marker holds a position,
+and its parent is the element the attribute or listener belongs to. That is why an
+attribute or event site gets a marker even though the value is not text.
+
+**Why not index paths.** The previous revision pinned `el.firstChild.firstChild`.
+Measured against happy-dom with the shipped runtime:
+
+| Source | Parsed shape | Index path addresses |
+|---|---|---|
+| `<p>a<div>b</div></p>` | `<p>a</p><div>b</div>` | `undefined` — the div is a SIBLING |
+| `<table><tr><td>` | tbody inserted by real HTML | wrong depth |
+| `<table><div>x</div>` | div fostered BEFORE the table | a different element entirely |
+| `<a><a>x</a></a>` | two sibling anchors | `undefined` |
+| `<p><p>x</p></p>` | two sibling paragraphs | `undefined` |
+
+I demonstrated the fatal case: a marker meant for a `<div>` inside a `<table>` landed
+inside the `<table>` instead, so the user's div rendered empty and its text appeared in
+the table. Silent wrong DOM on legal markup. Markers survive because the parser never
+renames, splits, or re-parents a comment: I verified the marker count and document
+order are identical to the IR's in every hostile case above.
+
+- [ ] **Step 0: Teach the analysis to refuse markup the parser would reshape**
+
+The emitter cannot fix a shape the browser rewrites, so the analyzer must refuse it.
+Add to `analyze/jsx.rs`:
+
+```rust
+// crates/runai_compiler/src/analyze/jsx.rs
+
+/// Parents whose content model the HTML parser enforces by moving, splitting, or
+/// closing nodes — so the parsed DOM would not be the tree the author wrote.
+/// `None` means "any child this milestone can emit".
+pub(crate) fn reparse_refusal(tag: &str) -> Option<&'static [&'static str]> {
+    match tag {
+        "p" => Some(&[]),                     // no block-level children; see below
+        "table" => Some(&["caption", "colgroup", "thead", "tbody", "tfoot", "tr"]),
+        "thead" | "tbody" | "tfoot" => Some(&["tr"]),
+        "tr" => Some(&["td", "th"]),
+        "colgroup" => Some(&["col"]),
+        "select" => Some(&["option", "optgroup"]),
+        "optgroup" => Some(&["option"]),
+        "ul" | "ol" => Some(&["li"]),
+        "dl" => Some(&["dt", "dd"]),
+        _ => None,
+    }
+}
+```
+
+Two rules, both `RA014`, both in the existing element walk:
+
+1. **Parent/child**: for a tag with a content model above, every element child must be
+   in the allowed list, and a non-whitespace text child is refused (`<table>text` is
+   fostered). `p` is the special case: its allowed children are phrasing content, so the
+   rule is "no element whose tag is in `BLOCK_IN_P` is a child of `p`", where
+   `BLOCK_IN_P` is the small list the parser closes `p` for (`address article aside
+   blockquote details div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6
+   header hr main nav ol p pre section table ul`). Write it as a const, not inline.
+2. **Ancestor**: `a` inside `a`, `form` inside `form`, and `li` outside `ul`/`ol`, `dt`
+   or `dd` outside `dl`.
+
+The repair text must be legal verbatim and name the tag: for `<p><div>` write
+"`<p>` cannot contain `<div>`: the HTML parser closes the paragraph and the div becomes
+its sibling, so the page would render a different shape. Wrap the div in a `<div>` (or
+any element that may contain it), or use `<span>` if the child is inline." Mirror that
+shape for each pair — the message names the actual parent and child.
+
+`lower_route` repeats both as invariants, the way `dom_tag` is shared, so a caller that
+skips analysis gets a diagnostic rather than a wrong template.
+
+Tests (RED first — every one of these is `check []` today):
+
+```rust
+#[test]
+fn a_block_element_inside_a_paragraph_is_ra014() {
+    let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>a<div>b</div></p> }\n";
+    // ... RA014 naming `p` and `div`, and the message says "sibling".
+}
+
+#[test]
+fn a_table_may_contain_rows_but_not_a_div() {
+    let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <table><div>x</div><tr><td>y</td></tr></table> }\n";
+    // ... RA014 naming `table` and `div`.
+}
+
+#[test]
+fn bare_text_inside_a_table_is_ra014() {
+    let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <table>text</table> }\n";
+    // ... RA014: the parser fosters text out of the table.
+}
+
+#[test]
+fn an_anchor_inside_an_anchor_is_ra014() {
+    let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <a href=\"/x\"><a href=\"/y\">z</a></a> }\n";
+}
+
+#[test]
+fn a_nested_paragraph_is_ra014() {
+    let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p><p>z</p></p> }\n";
+}
+
+#[test]
+fn a_list_item_must_have_a_list_parent() {
+    let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <div><li>x</li></div> }\n";
+}
+
+#[test]
+fn the_legal_shapes_stay_clean() {
+    for src in [
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <ul><li>a</li><li>b</li></ul> }\n",
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <table><tbody><tr><td>x</td></tr></tbody></table> }\n",
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <p><span>a</span> and <b>b</b></p> }\n",
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <dl><dt>a</dt><dd>b</dd></dl> }\n",
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <select><option>a</option></select> }\n",
+        // A route root may be `p`: the rule is about CHILDREN, not the root tag.
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>plain</p> }\n",
+    ] {
+        let alloc = oxc_allocator::Allocator::default();
+        let program = crate::source::parse_tsx(&alloc, src).unwrap();
+        assert!(check_jsx(program, src).is_empty(), "{src}");
+    }
+}
+```
+
+- [ ] **Step 1: Write the failing emitter tests**
 
 ```rust
 // crates/runai_compiler/src/codegen/client.rs (tests)
@@ -1559,64 +1701,163 @@ mod tests {
     use super::*;
     use crate::ir::lower_route;
 
+    /// Every emitted module must parse as ESM, and the template literal must hold
+    /// exactly as many markers as the emitter has binding sites.
+    fn assert_parses(js: &str) {
+        let alloc = oxc_allocator::Allocator::default();
+        let ret = oxc_parser::Parser::new(&alloc, js, oxc_span::SourceType::mjs()).parse();
+        assert!(ret.diagnostics.is_empty(), "emitted code must parse: {js}\n{:?}", ret.diagnostics);
+    }
+
+    /// The import list for a route, computed the way the checked wrapper does it.
+    fn imports_for(src: &str) -> Vec<String> {
+        crate::codegen::client_imports(src).expect("analysis accepted")
+    }
+
     #[test]
     fn imports_only_the_runtime_url_in_one_statement() {
-        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P() { const n = signal(0); return <p>{n()}</p> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <p>{n()}</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
         assert!(js.contains("from \"/assets/runtime.js\""));
         assert!(!js.contains("\"runai\""), "{js}");
         assert_eq!(js.matches("import ").count(), 1, "{js}");
         assert!(js.contains("signal"), "{js}");
+        assert_parses(&js);
     }
 
     #[test]
     fn mounts_into_app() {
-        let src = "\"use island\"\nexport default function P() { return <p>hi</p> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
-        assert!(js.contains("mount(P, document.getElementById(\"app\"))"), "{js}");
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
+        assert!(js.contains("mount(Page, document.getElementById(\"app\"))"), "{js}");
     }
 
     #[test]
     fn template_is_hoisted_to_module_scope() {
-        let src = "\"use island\"\nexport default function P() { return <p>hi</p> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
         let t = js.find("const _t0 = template(").expect("hoisted template");
-        assert!(t < js.find("function P").unwrap(), "{js}");
+        assert!(t < js.find("function Page").unwrap(), "{js}");
     }
 
     #[test]
-    fn nested_binding_walks_a_child_path() {
-        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P() { const n = signal(0); return <div><span>{n()}</span></div> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
-        assert!(js.contains("_setText(el.firstChild.firstChild, () => n())"), "{js}");
+    fn a_nested_text_binding_addresses_the_second_marker() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <div><span>{n()}</span></div> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
+        // No index paths: the marker ordinal is the contract.
+        assert!(!js.contains(".firstChild"), "{js}");
+        assert!(js.contains("_setText(_a[0]"), "{js}");
+        assert_parses(&js);
     }
 
     #[test]
     fn static_text_is_in_the_template_not_the_runtime() {
-        let src = "\"use island\"\nexport default function P() { return <p>hello</p> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>hello</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
         assert!(js.contains("hello"));
         assert!(!js.contains("_setText"));
+        assert!(!js.contains("_c("), "no markers means no collector call: {js}");
     }
 
     #[test]
-    fn event_handler_is_wired_with_addEventListener_via_on() {
-        let src = "\"use island\"\nexport default function P() { return <button onClick={go}>x</button> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
+    fn event_handler_is_wired_via_on_with_a_marker_ordinal() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <button onClick={go}>x</button> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
         assert!(js.contains("_on("));
         assert!(js.contains("\"click\""));
+        assert!(js.contains("_a[0]"));
+    }
+
+    #[test]
+    fn a_dynamic_attribute_targets_the_markers_parent() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <p class={n() > 0 ? \"on\" : \"off\"}>x</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
+        assert!(js.contains("_setAttr(_a[0].parentNode, \"class\""), "{js}");
+    }
+
+    #[test]
+    fn bindings_in_ir_order_map_to_ascending_markers() {
+        // The one contract the whole design rests on: the k-th binding the emitter
+        // writes is the k-th marker in the template. Attr before child text inside
+        // one element, then the next element's text.
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <div id={String(n())}><span>{n()}</span><b>{n() + 1}</b></div> }\n";
+        let route = lower_route(src).unwrap();
+        let html = template_html(&route.tree);
+        assert_eq!(html.matches("<!>").count(), 3, "{html}");
+        let js = emit_client(&route, "/assets/runtime.js", &imports_for(src));
+        let attr = js.find("_setAttr(_a[0]").expect("attr is first");
+        let first = js.find("_setText(_a[1]").expect("first text is second");
+        let second = js.find("_setText(_a[2]").expect("second text is third");
+        assert!(attr < first && first < second, "{js}");
+    }
+
+    #[test]
+    fn module_statements_are_written_above_the_component() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nconst start = signal(5)\nexport default function P(props: Record<never, never>) { return <p>{start()}</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
+        let module = js.find("const start = signal(5)").expect("module statement written");
+        let component = js.find("function Page").expect("component written");
+        assert!(module < component, "module statements go above the component: {js}");
+        assert_parses(&js);
+    }
+
+    #[test]
+    fn an_import_used_only_by_a_module_statement_is_still_imported() {
+        // Task 9's cross-task risk: merging from markup-used names drops this.
+        let src = "\"use island\"\nimport { signal, effect } from \"runai\"\nconst start = signal(5); effect(() => start(6))\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let imports = imports_for(src);
+        assert!(imports.iter().any(|i| i == "signal"), "{imports:?}");
+        assert!(imports.iter().any(|i| i == "effect"), "{imports:?}");
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports);
+        assert_parses(&js);
+    }
+
+    #[test]
+    fn the_emitters_locals_cannot_collide_with_author_names() {
+        // Verified by node: `const el` beside the emitter's `const el` is a
+        // redeclaration, and a module `const mount` beside the import is too.
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nconst el = 1\nexport default function P(props: Record<never, never>) { const el2 = signal(0); return <p>{el}{el2()}</p> }\n";
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
+        assert!(!js.contains("const el ="), "the emitter must not use `el`: {js}");
+        assert_parses(&js);
     }
 
     #[test]
     fn typed_source_emits_parseable_javascript() {
         let src = "\"use island\"\nimport { signal } from \"runai\"\ntype Props = Record<never, never>\nexport default function P(props: Props) { const n = signal<number>(0); return <p class=\"a\">{n() as number}</p> }\n";
-        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js");
-        let alloc = oxc_allocator::Allocator::default();
-        let ret = oxc_parser::Parser::new(&alloc, &js, oxc_span::SourceType::mjs()).parse();
-        assert!(ret.diagnostics.is_empty(), "emitted code must parse: {:?}", ret.diagnostics);
+        let js = emit_client(&lower_route(src).unwrap(), "/assets/runtime.js", &imports_for(src));
+        assert_parses(&js);
+    }
+
+    #[test]
+    fn refuses_to_emit_when_analysis_reports_errors() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); const x = n(); return <p>x</p> }\n";
+        let err = emit_client_checked(src, "src/routes/index.page.tsx", "/assets/runtime.js").unwrap_err();
+        assert_eq!(err[0].code, crate::diagnostic::Code::RA001);
+    }
+
+    #[test]
+    fn refuses_a_static_route() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let err = emit_client_checked(src, "src/routes/about.page.tsx", "/assets/runtime.js").unwrap_err();
+        assert_eq!(err[0].code, crate::diagnostic::Code::RA014);
+        assert_eq!(err[0].line, 1);
+    }
+
+    #[test]
+    fn refuses_a_non_page_path() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let err = emit_client_checked(src, "index.tsx", "/assets/runtime.js").unwrap_err();
+        assert_eq!(err[0].code, crate::diagnostic::Code::RA014);
+        assert!(err[0].message.contains("index.tsx"));
     }
 }
 ```
+
+The marker/ordinal contract needs one test that can only pass if the ordering is
+right, which `bindings_in_ir_order_map_to_ascending_markers` is. It is deliberately
+an assertion about the emitted text, because the runtime's own behaviour is covered by
+Task 6's suite.
 
 - [ ] **Step 2: Run and verify failure**
 
@@ -1626,43 +1867,104 @@ Expected: FAIL — `emit_client` not found.
 - [ ] **Step 3: Implement**
 
 Emit in this order:
-1. the merged import;
-2. the hoisted `const _tN = template(...)` lines;
-3. `function <Name>(props) {`, then the route's `statements` (already type-stripped), the clone, and the binding wiring, then `return el` and `}`;
-4. the `mount` call.
+1. the merged import — `import { … } from "<runtime_url>"`, one statement, specifiers
+   sorted so two runs of the same input produce the same bytes;
+2. `const _c = (root) => { … }` **only when the route has at least one binding**;
+3. the hoisted `const _tN = template("<template_html>")` lines — one per template; this
+   milestone emits one, named `_t0`;
+4. `module_statements` verbatim, each on its own line;
+5. `function <Name>(props) {`, the route's `statements` verbatim, `const _el = _t0.clone();`,
+   `const _a = _c(_el);` when there is at least one binding, then the binding wiring in
+   IR order, `return _el`, `}`;
+6. `mount(<Name>, document.getElementById("app"))`.
 
-The default export becomes a plain named function, so the module's only effect is mounting. Use `Page` when the default export is anonymous.
+Use `Page` when the default export is anonymous (the `display_name` convention).
 
-Bindings are wired like this:
-- an `Expr` child becomes `_setText(<path to its placeholder>, () => expr)`;
-- a dynamic attribute becomes `_setAttr(<path>, "name", () => expr)`;
-- an event becomes `_on(<path>, "click", handler)`.
+Bindings, all addressed by ordinal:
+- `Expr` child → `_setText(_a[k], () => expr)`;
+- `Binding::Attr` → `_setAttr(_a[k].parentNode, "name", expr)` — the value is passed
+  **unwrapped** when it reads as a plain value and wrapped in `() => …` when it is an
+  expression that must be tracked. Use the same form the pinned shape shows: an
+  expression that calls a signal accessor becomes `() => expr`, so the runtime's
+  `_setAttr` subscribes; a constant stays a constant. Do not emit `() => …` around a
+  string literal;
+- `Binding::Event` → `_on(_a[k].parentNode, "event", expr)`, **unwrapped** (a listener
+  is a function, not a tracked value).
 
-**The emitter must run `analyze` first and refuse to emit when it returns errors.** The `_setText(..., () => n())` form would otherwise silently wrap an untracked read in a function and defeat `RA001`, so Task 8's check has to fire before any codegen. Add this test alongside the others:
+`template_html` writes exactly what `prerender.rs`'s writer does for elements, text,
+and static attributes — share that code rather than copying it — except an `Expr`,
+an `Attr`, and an `Event` each contribute a `<!>` marker at its position. A marker for
+an attribute or event has no position among children (attributes are not children), so
+**place it as the element's first children, in attribute order, before any child
+markers.** That keeps the ordinal contract total and independent of attribute order.
+
+`client_imports(source: &str) -> Result<Vec<String>, Vec<Diagnostic>>` in
+`codegen/mod.rs`: run `analyze`, refuse on error, then strip types, parse, and collect
+`runai_imports` — **every** named specifier, regardless of whether the markup uses it —
+merged with the helpers the artifact needs (`mount`, `template`, and the used subset of
+`_setText`/`_setAttr`/`_on`). Sort and dedupe. This is why the import list is a
+parameter to `emit_client` and not computed there: the emitter sees only the IR, and the
+IR cannot see an import that only a module statement uses.
+
+**The emitter must run `analyze` first and refuse to emit when it returns errors**
+(this is what `emit_client_checked` does; `emit_client` is the pure IR half). The
+`_setText(…, () => n())` form would otherwise silently wrap an untracked read in a
+function and defeat `RA001`.
+
+- [ ] **Step 4: Wire the island reserved names into `emitted_names.rs`**
+
+`reserved_names(Mode::Island)` returns the helpers the island module declares itself:
+`_c`, `_a`, `_el`, `_t0` … plus every import specifier **the module will actually
+import**, which is data, not a constant: it depends on the route. So the function takes
+the merged import list:
 
 ```rust
-#[test]
-fn refuses_to_emit_when_analysis_reports_errors() {
-    let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); const x = n(); return <p/> }\n";
-    let err = emit_client_checked(src, "src/routes/index.page.tsx", "/assets/runtime.js").unwrap_err();
-    assert_eq!(err[0].code, crate::diagnostic::Code::RA001);
-}
+pub(crate) fn reserved_names(mode: Mode, imports: &[String]) -> Vec<String>
 ```
 
-This requires a second entry point in `codegen/mod.rs`: `pub fn emit_client_checked(source: &str, path: &str, runtime_url: &str) -> Result<String, Vec<Diagnostic>>`. It calls `analyze` and returns `Err` before lowering. Task 13's builder calls this one and `emit_prerender_checked`.
+For `Static` it is `PRERENDER_NAMES` (unchanged). For `Island` it is
+`ISLAND_LOCALS` (`_c`, `_a`, `_el`, and the template prefix `_t`) plus `imports`. The
+"is the name in scope at the emitted call site" predicate from Task 10 stays exactly as
+it is; only the name set grows. That is the point of having one rule: Task 11 adds
+data, not a second walk.
 
-Only the `*_checked` forms are public. `emit_client` and `emit_prerender` are `pub(crate)`, existing only for their own unit tests, so a caller inside this crate and outside the codegen module cannot lower without gating on `analyze`: the unchecked path is unreachable at compile time from outside, not merely discouraged by convention.
+Tests: a module-level `const mount`, a module-level `const signal`, and a body
+`const _a` are each RA014 in an island; the same names are legal in a **static** route
+except the prerender set; and a name that is *not* imported (`derived` when the route
+never mentions it) must NOT be refused — refusing it would be a false positive on a
+legal page.
 
-- [ ] **Step 4: Run and verify pass**
+- [ ] **Step 5: Run and verify pass**
 
 Run: `cargo test -p runai_compiler client`
-Expected: PASS, 8 tests.
+Expected: PASS, 15 tests.
+Run: `cargo test -p runai_compiler emitted_names`
+Expected: PASS, the previous 7 plus the island cases.
+Run: `cargo test --workspace`
+Expected: PASS — 365 existing tests plus the new ones.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Prove the module actually runs**
+
+Add an integration test that emits a real island and executes it under `bun` with
+happy-dom, mirroring what Task 13's builder will do but without the CLI:
+
+```rust
+// crates/runai_compiler/tests/island_runs.rs
+// Emit a route with: a module-level const, a signal, a dynamic attribute, a text
+// binding, an event handler, and a reparse-safe nested structure.
+// Write the module to a temp dir, run it under bun with the shipped runtime, click
+// the button twice, and assert the rendered HTML after each click.
+```
+
+The assertions must be about the **rendered DOM**, not the emitted text. This is the
+test that would have caught every one of the six defects in this task, and it is the
+first test in the project that proves the artifact works end to end.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/runai_compiler/src
-git commit -m "feat(compiler): emit island ESM modules against the runtime URL"
+git add crates/runai_compiler/src crates/runai_compiler/tests
+git commit -m "feat(compiler): emit island modules that address markers, not parser-dependent paths"
 ```
 
 ---
