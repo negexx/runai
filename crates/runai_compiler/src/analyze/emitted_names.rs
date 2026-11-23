@@ -27,7 +27,10 @@
 //!    render = …` is shape 1's declaration and 2's name in one statement, and one
 //!    row is enough;
 //! 3. a **reference** to a reserved name, in the markup, the body, or the module
-//!    level.
+//!    level — but only when it resolves to the compiler's own helper, to a
+//!    module-level binding, or to the route component. A reference to an
+//!    ordinary nested-scope local (`items.map((render) => …)`) is legal
+//!    JavaScript shadowing the emitted module preserves.
 //!
 //! # What is deliberately not refused
 //!
@@ -36,6 +39,9 @@
 //!   review round 2 proved;
 //! - **a member property** (`o.render`) or an **object key** (`{ render: 1 }`) —
 //!   neither is a binding, and refusing them would reject an ordinary page;
+//! - **a nested-scope local** named a reserved name — an arrow parameter, a
+//!   nested function's local, a block `const`. It shadows the helper only inside
+//!   its own callback, and the template's calls still reach the module-level one;
 //! - **a reserved name in a component module** (`_shell.tsx`, or a `.tsx` with no
 //!   route) — nothing is emitted from such a file, so there is no helper to
 //!   shadow. The same boundary [`crate::analyze::reachable`] draws.
@@ -99,49 +105,106 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
 
     // (3) References in the three emitted regions.
     //
-    // A reference is reported at **its own** span, separately from the
-    // declaration that binds it. That is deliberate and matches how this crate
-    // reports an accessor write beside its primitive call: `const render = 1`
-    // followed by `{render}` is two sites the artifact cannot hold — the
-    // declaration shadows `export function render()`, and the use names the
-    // shadow. Renaming only one leaves the other, and the surviving row is still
-    // true, so this is not a repair loop.
+    // A reference is refused only when it resolves to something the emitted module
+    // cannot have as a distinct binding:
+    //
+    // - **unresolved** (`symbol` is `None`): the name is declared nowhere, so in
+    //   the template it resolves to the compiler's own helper or to `render()`.
+    //   This is the silent case the rule exists for.
+    // - **module scope** (the symbol's declaration scope is the root): a module
+    //   binding named `render` collides with `export function render()`, and one
+    //   named `_esc` shadows the helper for every statement and for the template.
+    // - **the route component or its parameter** when that name is reserved.
+    //
+    // A reference that resolves to a binding declared in a **nested** scope inside
+    // the component — an arrow parameter, a local of a nested function, a block's
+    // `const` — is ordinary JavaScript shadowing of a legal local, and the emitted
+    // module preserves it: the template's own `${_esc(…)}` still reaches the
+    // module-level helper, because the shadow lives only inside that callback.
+    // Refusing it would reject `<p>{items.map((render) => render.name)}</p>`, which
+    // is why [`reference_collision`] narrows on the scope rather than the name
+    // alone.
     for reference in references(scoping, |visitor| visitor.visit_expression(render.root)) {
-        if reserved.contains(&reference.name.as_str()) {
-            diagnostics.push(reference_refusal(
-                reference.span,
-                &reference.name,
-                reference.symbol.is_some(),
-                &route,
-            ));
+        if let Some(row) = reference_collision(scoping, &reference, &route, reserved) {
+            diagnostics.push(row);
         }
     }
     if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
         for statement in emitted_body_statements(body, return_span) {
             for reference in references(scoping, |visitor| visitor.visit_statement(statement)) {
-                if reserved.contains(&reference.name.as_str()) {
-                    diagnostics.push(reference_refusal(
-                        reference.span,
-                        &reference.name,
-                        reference.symbol.is_some(),
-                        &route,
-                    ));
+                if let Some(row) = reference_collision(scoping, &reference, &route, reserved) {
+                    diagnostics.push(row);
                 }
             }
         }
     }
     for reference in emitted_reference_roots(program, &route, scoping) {
-        if reserved.contains(&reference.name.as_str()) {
-            diagnostics.push(reference_refusal(
-                reference.span,
-                &reference.name,
-                reference.symbol.is_some(),
-                &route,
-            ));
+        if let Some(row) = reference_collision(scoping, &reference, &route, reserved) {
+            diagnostics.push(row);
         }
     }
     diagnostics.sort_by_key(|diagnostic| diagnostic.span.0);
     diagnostics
+}
+
+/// `RA014` for `reference` if it collides with a reserved name, or `None` when it
+/// is an ordinary shadow the emitted module preserves.
+///
+/// The three refused shapes are documented on the call site. The distinction is
+/// the **scope** the reference resolves to: a binding declared in the root scope
+/// is one the emitter would also declare or merge, while a binding declared in a
+/// nested scope is a local the emitted function keeps.
+fn reference_collision(
+    scoping: &oxc_semantic::Scoping,
+    reference: &crate::analyze::reachable::Reference,
+    route: &crate::analyze::ComponentInfo<'_>,
+    reserved: &[&str],
+) -> Option<Diagnostic> {
+    if !reserved.contains(&reference.name.as_str()) {
+        return None;
+    }
+
+    let Some(symbol) = reference.symbol else {
+        // Undeclared: in the emitted template it resolves to the compiler's own
+        // helper or to `render()`, which is the silent case this rule exists for.
+        return Some(reference_refusal(
+            reference.span,
+            &reference.name,
+            ShadowKind::Undeclared,
+            route,
+        ));
+    };
+
+    let declaration = scoping.symbol_span(symbol);
+    let declaration_scope = scoping.symbol_scope_id(symbol);
+
+    // Module scope: a binding there is one the emitter would also declare
+    // (`render`) or one that shadows a helper for the whole module (`_esc`).
+    if declaration_scope == scoping.root_scope_id() {
+        return Some(reference_refusal(
+            reference.span,
+            &reference.name,
+            ShadowKind::ModuleScope,
+            route,
+        ));
+    }
+
+    // The route component's own name is excluded from `module_statements` and the
+    // emitters rebuild it, so a reserved-named component is still a collision with
+    // the emitted `render()`.
+    if declaration.start == route.name_span.0 && declaration.end == route.name_span.1 {
+        return Some(reference_refusal(
+            reference.span,
+            &reference.name,
+            ShadowKind::RouteComponent,
+            route,
+        ));
+    }
+
+    // Any other nested-scope binding is an ordinary local the emitted function
+    // keeps: it shadows the reserved name only inside its own callback/block, and
+    // the template's calls still reach the module-level helper.
+    None
 }
 
 /// The names the module for `mode` declares for itself.
@@ -370,39 +433,61 @@ fn declaration_refusal(span: (u32, u32), name: &str) -> Diagnostic {
 
 /// `RA014` for a reference to a reserved name.
 ///
-/// The message distinguishes the two cases, because they are different defects
-/// with different repairs:
+/// The message distinguishes the kinds, because they are different defects with
+/// different repairs, and the repair must be legal when applied verbatim:
 ///
-/// - **unresolved** (`reference.symbol` is `None`): the name is declared nowhere,
-///   so in the emitted template it resolves to the compiler's own helper and
-///   renders its source text. This is the silent case the rule exists for, and the
-///   message says so.
-/// - **resolved to the file's own binding**: the name is declared here, so the
-///   declaration row already reports the rename; this row says the *use* names the
-///   shadow, so the agent knows to update it too rather than only the declaration.
+/// - [`ShadowKind::Undeclared`]: the name is declared nowhere, so in the emitted
+///   template it resolves to the compiler's own helper and renders its source
+///   text. This is the silent case the rule exists for.
+/// - [`ShadowKind::ModuleScope`] and [`ShadowKind::RouteComponent`]: the name is
+///   declared here, so the declaration row already reports the rename; this row
+///   says the *use* names the shadow, so the agent updates it too rather than only
+///   the declaration.
 fn reference_refusal(
     span: (u32, u32),
     name: &str,
-    declared: bool,
+    kind: ShadowKind,
     route: &crate::analyze::ComponentInfo<'_>,
 ) -> Diagnostic {
     let names = crate::ir::PRERENDER_NAMES.join("`, `");
-    let message = if declared {
-        format!(
-            "`{name}` is one of the names the generated module declares for itself (`{names}`). \
-             This use names the binding the file declares, which shadows it, so the template \
-             would call that binding instead. Rename it here and at its declaration.",
-        )
-    } else {
-        format!(
+    let message = match kind {
+        ShadowKind::Undeclared => format!(
             "`{name}` is one of the names the generated module declares for itself (`{names}`), \
              and nothing in `{route}` declares it, so in the emitted template it resolves to the \
              compiler's own helper or to `render()` and renders their source text. Declare the \
              value under a different name.",
             route = route.display_name(),
-        )
+        ),
+        ShadowKind::ModuleScope => format!(
+            "`{name}` is one of the names the generated module declares for itself (`{names}`). \
+             This use names a module-level binding the file declares, which collides with the \
+             emitted module's own `{name}`. Rename it here and at its declaration.",
+        ),
+        ShadowKind::RouteComponent => format!(
+            "`{name}` is one of the names the generated module declares for itself (`{names}`). \
+             This use names the route component itself, which the emitters rebuild rather than \
+             copy, so `{name}` is not a binding in the artifact. Rename the component here and at \
+             its declaration.",
+        ),
     };
     Diagnostic::new(Code::RA014, span, message)
+}
+
+/// How a reserved-name reference collides with the emitted module, which decides
+/// the reason [`reference_refusal`] gives.
+///
+/// A reference that resolves to an ordinary nested-scope local is none of these
+/// and is not refused; see [`reference_collision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowKind {
+    /// Declared nowhere: it resolves to the compiler's own helper or `render()`.
+    Undeclared,
+    /// Declared at the file's module scope, where the emitter also declares
+    /// `render` and its helpers.
+    ModuleScope,
+    /// Declared as the route component, which the emitters rebuild from `name`
+    /// and `statements` rather than copy.
+    RouteComponent,
 }
 
 #[cfg(test)]
@@ -485,6 +570,36 @@ mod tests {
     fn a_member_property_named_render_is_allowed() {
         let src = "\"use static\"\nconst o = { render: \"x\" }\nexport default function P(props: Record<never, never>) { return <p>{o.render}</p> }\n";
         assert!(crate::analyze::analyze(src, "src/routes/about.page.tsx").is_empty());
+    }
+
+    /// A nested arrow parameter named `render` shadows nothing the emitter
+    /// declares: it is an ordinary local of a callback in the markup, and every
+    /// `${_esc(…)}` in the template still reaches the module-level helper. The
+    /// reference resolves to that parameter, which the file itself declares, so it
+    /// is a legitimate local, not a collision. Refusing it was a false positive on
+    /// a legal page.
+    #[test]
+    fn a_nested_arrow_parameter_named_render_is_allowed() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{items.map((render) => render.render).join(\",\")}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "an arrow parameter is an ordinary shadow: {d:?}"
+        );
+    }
+
+    /// The control for the test above: an **undeclared** `render` is still
+    /// refused, because it resolves to the compiler's own `export function
+    /// render()` and the template would call it. Loosening the rule for a real
+    /// shadow must not loosen it for the silent case.
+    #[test]
+    fn an_undeclared_render_reference_is_still_refused() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{render}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter().any(|row| row.code == Code::RA014),
+            "an undeclared `render` resolves to the emitted `render()`: {d:?}"
+        );
     }
 
     /// A component module is not emitted by this milestone, so there is no helper

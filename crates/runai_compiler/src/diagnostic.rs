@@ -195,7 +195,13 @@ impl Code {
                  prerender call supplies with nothing, or at module scope, where no emitter \
                  declares it. A module-level declaration is *not* in \
                  this family: module-scope statements are emitted above the component. Neither is \
-                 a component-body statement's own local, which is emitted inside the component."
+                 a component-body statement's own local, which is emitted inside the component. \
+                 The same first family also covers four emit-time shapes whose output would differ \
+                 by mode or not parse: children inside a void element, a duplicate attribute, an \
+                 early `return` before the route's JSX return, and an `async` or generator route \
+                 component. A fifth is the emitted module's own names: a declaration, export name, \
+                 or reference to `_esc`, `_attr`, or `render` is refused because the generated \
+                 module declares those itself."
             }
         }
     }
@@ -269,7 +275,17 @@ impl Code {
                  literal value. For a JSX construct, write the spread out, move the JSX into the \
                  children or the returned tree, give the attribute or prop a value, wrap a root \
                  fragment in one parent element, render a runtime primitive's markup directly, or \
-                 keep exactly one JSX return."
+                 keep exactly one JSX return. \
+                 For children inside a void element, move them out of it or use an element that \
+                 accepts children. For a duplicate attribute, keep exactly one of them, because a \
+                 prerendered page keeps the first value and a hydrated island keeps the last. \
+                 For an early `return` before the route's JSX return, return one element from \
+                 the component: `render()` returns one string, so the body cannot exit early. \
+                 For an `async` or generator route component, remove the modifier and return the \
+                 markup directly, because both modes call the component synchronously. \
+                 For a declaration, export name, or reference that uses a reserved generated \
+                 name (`_esc`, `_attr`, or `render`), rename it, because the emitted module \
+                 declares those names itself."
             }
         }
     }

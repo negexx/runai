@@ -282,7 +282,13 @@ fn erased_declaration(span: (u32, u32)) -> Diagnostic {
 /// underscore marks a component module (`_shell.tsx`) — a real file with real
 /// components, but never a route, so it is checked for props and JSX and never
 /// asked for a directive.
-fn is_page(path: &str) -> bool {
+///
+/// `pub(crate)` because [`crate::codegen::emit_prerender_checked`] emits a
+/// **route**, and the page-only rules this function gates (`RA010`, the
+/// reserved-name rule, the reachability rule) are exactly the ones an emitter must
+/// not skip. The emitter asks the same question rather than re-deriving it, so
+/// "is this a route file?" has one answer in the crate.
+pub(crate) fn is_page(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     !name.starts_with('_') && name.ends_with(".page.tsx")
 }

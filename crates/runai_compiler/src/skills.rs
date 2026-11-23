@@ -75,6 +75,22 @@ fn why(code: Code) -> &'static str {
              module, and a helper there may legitimately hold module-level JSX. The plan's later \
              milestones lift these one slice at a time. \
              \
+             Four emit-time shapes join that family because the artifact they would produce is \
+             wrong rather than merely unsupported: children inside a void element, which the HTML \
+             parser would move outside it; a duplicate attribute, which a prerendered page would \
+             resolve to the first value and a hydrated island to the last; an early `return` \
+             before the route's JSX return, which `render()` cannot carry because it returns one \
+             string; and an `async` or generator route component, which both render modes refuse \
+             because they call the component synchronously and use its return value. It is \
+             specifically a generator route component and an `async` one that are refused for the \
+             same reason: an iterator or a promise is not the markup the emitter inserts. \
+             \
+             A fifth name-based family is the generated module's own **reserved** names: \
+             `_esc`, `_attr`, and `render`. A declaration, export name, or reference to one of \
+             them is refused because the emitted module declares those names itself, so a route \
+             binding would shadow a helper the template calls or export `render` twice. \
+             \
+             \
              An import or re-export the emitted module cannot resolve or write is refused for one \
              of three reasons. A module other than `\"runai\"` has no bundler yet: each route is \
              emitted from its own file's text, so a second module can be neither resolved nor \
@@ -278,6 +294,11 @@ mod tests {
             "JSX in any other route body statement",
             "module-level statement of a route file",
             "`<For>`/`<Show>`/`<When>`",
+            "children inside a void element",
+            "a duplicate attribute",
+            "an early `return` before the route's JSX return",
+            "a generator route component",
+            "reserved",
         ] {
             assert!(body.contains(construct), "missing {construct}: {body}");
         }
@@ -380,6 +401,79 @@ mod tests {
             "A `declare` statement is refused",
         ] {
             assert!(explain.contains(family), "missing `{family}`: {explain}");
+        }
+    }
+
+    /// Task 10 added five refusals whose defects are not "a JSX construct cannot
+    /// be lowered" and whose repairs are not in the older clauses. Each must be
+    /// named in the skill **and** in the canonical fix, and the canonical fix
+    /// must name a repair that is legal when applied verbatim — a duplicate
+    /// attribute cannot be fixed by "give the attribute a value", which would
+    /// leave the duplicate in place and the next run would report the same row.
+    ///
+    /// The clauses are per-code ("For X, do Y"), not interpolated per-site text:
+    /// the per-file specifics belong in the diagnostic's `message` (Task 2's
+    /// ruling), so this asserts the code-wide sentence, not filenames or spans.
+    #[test]
+    fn ra014_names_the_emit_time_refusals_in_skill_and_fix() {
+        let body = skill_body(Code::RA014);
+        for (label, phrase) in [
+            // (a) void element with children
+            ("void with children", "children inside a void element"),
+            // (b) duplicate attribute
+            ("duplicate attribute", "a duplicate attribute"),
+            // (c) early non-JSX return
+            (
+                "early return",
+                "an early `return` before the route's JSX return",
+            ),
+            // (d) async or generator component
+            ("async/generator", "a generator route component"),
+            // (e) reserved generated name
+            ("reserved name", "reserved"),
+        ] {
+            assert!(
+                body.contains(phrase),
+                "{label}: the skill must name the refusal `{phrase}`: {body}"
+            );
+        }
+
+        let fix = Code::RA014.fix_template();
+        for (label, repair) in [
+            // (a) the legal repair moves the children out of the void element.
+            (
+                "void with children",
+                "For children inside a void element, move them out of it or use an element that \
+                 accepts children",
+            ),
+            // (b) keeping one is the only legal repair; "give it a value" cannot
+            // remove a duplicate.
+            (
+                "duplicate attribute",
+                "For a duplicate attribute, keep exactly one of them",
+            ),
+            // (c) the body must return one element.
+            (
+                "early return",
+                "For an early `return` before the route's JSX return, return one element from \
+                 the component",
+            ),
+            // (d) remove the modifier.
+            (
+                "async/generator",
+                "For an `async` or generator route component, remove the modifier",
+            ),
+            // (e) rename.
+            (
+                "reserved name",
+                "For a declaration, export name, or reference that uses a reserved generated \
+                 name (`_esc`, `_attr`, or `render`), rename it",
+            ),
+        ] {
+            assert!(
+                fix.contains(repair),
+                "{label}: the canonical fix must carry a legal repair, missing: {repair}\n{fix}"
+            );
         }
     }
 }

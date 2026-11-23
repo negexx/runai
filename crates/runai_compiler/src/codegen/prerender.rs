@@ -50,6 +50,17 @@
 
 use crate::ir::{Binding, IrNode, RouteIr, VOID_ELEMENTS};
 
+/// The `_esc` helper's guard, before the replace: `null` and `undefined` are
+/// empty, everything else is `String(v)`.
+///
+/// This reproduces `_setText`'s policy exactly (`text.data = v == null ? "" :
+/// String(v)` in `packages/runai/runtime.js`), so the same `{maybeNull}` slot
+/// renders the same text in both modes. A truthiness test would be wrong: `false`
+/// and `0` are real values (`tabindex={0}`) and must still render. `String(v)` is
+/// load-bearing for the other half — a child slot is any expression, and a number
+/// or a boolean has no `.replace`.
+const ESCAPE_GUARD: &str = "(v == null ? \"\" : String(v)).replace";
+
 /// The `_esc` helper, exactly as emitted.
 ///
 /// `String(v)` is load-bearing: a child slot is any expression, and a number or a
@@ -70,7 +81,9 @@ const ESCAPE_TABLE: &str =
 pub(crate) fn emit_prerender(route: &RouteIr) -> String {
     let mut out = String::new();
 
-    out.push_str("const _esc = (v) => String(v).replace(/[&<>\"']/g, ");
+    out.push_str("const _esc = (v) => ");
+    out.push_str(ESCAPE_GUARD);
+    out.push_str("(/[&<>\"']/g, ");
     out.push_str(ESCAPE_TABLE);
     out.push_str(")\n");
 
@@ -186,6 +199,13 @@ fn write_node(node: &IrNode, out: &mut String) {
                     // silently is what this comment exists to prevent — so a
                     // debug build panics, and a release build writes nothing for
                     // a construct the analysis already refused.
+                    //
+                    // The guard that keeps this unreachable lives in a *different*
+                    // walk (`analyze::rules::check_static_mode`, which RA010 is
+                    // raised from), so a later narrowing of RA010 — say,
+                    // permitting a handler on a static element — turns this arm
+                    // into silent attribute loss rather than a compile error. Any
+                    // such change has to revisit this arm in the same edit.
                     Binding::Event { .. } => {
                         debug_assert!(
                             false,
@@ -391,6 +411,61 @@ mod tests {
         );
     }
 
+    /// `null` and `undefined` reach `_esc` from a `{maybeNull}` slot, because a
+    /// child slot is any expression. The runtime's `_setText` writes
+    /// `v == null ? "" : String(v)` (`packages/runai/runtime.js`), so a
+    /// `"use static"` page must agree: without the guard the same source renders
+    /// the word `null` statically and nothing when hydrated. `false` and `0` are
+    /// real values and must still render, which is why the guard is `== null` and
+    /// not a truthiness test — so `_esc(false)` is `"false"` and `_esc(0)` is
+    /// `"0"`.
+    ///
+    /// Pinned as the emitted **text**, not by running the module: this task's
+    /// tests are the artifact's shape, and Task 13 is where the module actually
+    /// runs (the original brief draws that line for the `<Ada>` escaping too). The
+    /// exact line plus the parse check is what makes a dropped guard fail here.
+    #[test]
+    fn an_escaped_slot_treats_null_as_empty_and_keeps_false_and_zero() {
+        let js = emit_prerender(
+            &lower_route("\"use static\"\nexport default function P() { return <p>hi</p> }\n")
+                .unwrap(),
+        );
+        assert_parses(&js);
+        // The whole policy in one expression, exactly as emitted: `null`/`undefined`
+        // are empty, everything else is `String(v)` — so `false` is `"false"` and
+        // `0` is `"0"`.
+        assert!(
+            js.contains("const _esc = (v) => (v == null ? \"\" : String(v)).replace("),
+            "the `!= null` guard the runtime's `_setText` uses must be emitted: {js}"
+        );
+        // The control, in the same string: a truthiness test (`v ? String(v) : ""`)
+        // would drop `false` and `0`, so the guard must be `== null` specifically.
+        assert!(
+            !js.contains("(v ? \"\" : String(v))") && !js.contains("(v ? String(v) : \"\")"),
+            "`false` and `0` are real values and must render: {js}"
+        );
+    }
+
+    /// The same two characters the text arm escapes are reachable in a **static
+    /// attribute value**, and they are the two arms of `escape_attribute_value`
+    /// no other fixture reaches. A raw backtick would close the template literal
+    /// and a raw backslash would escape the character after it; either one turns
+    /// the module into a syntax error. A single-quoted source attribute is what
+    /// lets a backtick and a backslash sit in a value without also needing the
+    /// `"` case, which `a_double_quote_in_a_single_quoted_attribute_is_escaped`
+    /// covers.
+    #[test]
+    fn a_backtick_or_backslash_in_a_static_attribute_cannot_break_the_literal() {
+        let src =
+            "\"use static\"\nexport default function P() { return <p title='a ` b \\ c'>x</p> }\n";
+        let js = emit_prerender(&lower_route(src).unwrap());
+        assert_parses(&js);
+        assert!(
+            js.contains("title=\"a \\` b \\\\ c\""),
+            "both must be escaped inside the attribute: {js}"
+        );
+    }
+
     #[test]
     fn the_declared_helpers_are_exactly_the_reserved_names() {
         // The emitter and the refusal rule share one list, so a helper added
@@ -414,3 +489,4 @@ mod tests {
         }
     }
 }
+
