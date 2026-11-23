@@ -64,7 +64,9 @@
 //!
 //! - **a type alias** named `render` — `strip_types` erases it, so nothing is
 //!   emitted under that name. Refusing it would be the false positive Task 9's
-//!   review round 2 proved;
+//!   review round 2 proved. The test is "type-only", not "a type": a `type _esc`
+//!   beside a `var _esc` is *one* symbol whose unioned flags report a type, and
+//!   the value declaration in it is refused — see [`check_scope_bindings`];
 //! - **a member property** (`o.render`) or an **object key** (`{ render: 1 }`) —
 //!   neither is a binding, and refusing them would reject an ordinary page;
 //! - **a deeper-scope local** named a reserved name — an arrow parameter, a
@@ -74,11 +76,16 @@
 //! - **a reserved name in a component module** (`_shell.tsx`, or a `.tsx` with no
 //!   route) — nothing is emitted from such a file, so there is no helper to
 //!   shadow. The same boundary [`crate::analyze::reachable`] draws;
-//! - **a component's own name in a named function expression**
-//!   (`export default (function render(props) {…})`) — its name is bound in the
-//!   component's scope, but the emitter rebuilds the component from `RouteIr`
-//!   rather than writing the expression, so the name never appears in the
-//!   artifact.
+//! - **a component's own name in a named function expression** — one shape binds
+//!   it in the component's own scope (`export default (function render(props)
+//!   {…})`), another binds a *declarator* beside it (`const Page = function
+//!   render(props) {…}`). In both the emitter rebuilds the component from
+//!   `RouteIr` and never writes the expression, so the name is not in the
+//!   artifact; `SymbolFlags::FunctionExpression` identifies them without a skip by
+//!   name (a genuine body `var render` keeps refusing);
+//! - **a binding after the route's `return`** — unreachable code the emitter never
+//!   writes, because it slices exactly [`crate::ir::emitted_body_statements`], which
+//!   stops at `return_span`.
 //!
 //! The reference walk is [`crate::analyze::reachable`]'s, shared rather than
 //! reimplemented, so "a type-only reference is not a value" has one definition in
@@ -348,13 +355,33 @@ fn reference_collision(
 /// `function` declaration (ESM is strict), a nested function's or arrow's own
 /// locals and parameters, and a `catch` parameter.
 ///
-/// Two bindings in this map are not this rule's: a type alias or interface
-/// (erased by `strip_types`, so nothing is emitted under the name), the route
-/// parameter, which [`crate::analyze::reachable`] already refuses when it is
-/// named something other than `props` (refusing it here too would be two rows for
-/// one problem), and a named function expression's own name in the one shape that
-/// binds it here — there is nothing to shadow, because the emitter never writes
-/// the expression.
+/// Two bindings in this map are not this rule's: the route parameter, which
+/// [`crate::analyze::reachable`] already refuses when it is named something other
+/// than `props` (refusing it here too would be two rows for one problem), and a
+/// named function expression's own name in the one shape that binds it here —
+/// there is nothing to shadow, because the emitter never writes the expression.
+///
+/// Three things about this walk are narrower than the first version's, and each
+/// was a defect a review round found:
+///
+/// - **each declaration's own flags**, not the symbol's union: Oxc's binder merges
+///   declarations that share a name in one scope into one symbol and unions their
+///   flags, so `type _esc = 1; if (false) { var _esc = 1 }` is one symbol that
+///   reports a type. Judging the union let the `var` hide behind the alias, and
+///   the artifact carried `var _esc = 1` above `${_esc(1 + 1)}` — `TypeError:
+///   _esc is not a function` at build time. [`declarations_of`] reads each site.
+/// - **the returned range**, not the whole body: the emitter writes
+///   [`crate::ir::emitted_body_statements`] only, which stops at `return_span`.
+///   A `var _esc` after the `return` is unreachable code nothing writes, so
+///   refusing it would be a false positive. This filter reads the same bound the
+///   emitter does rather than reimplementing it.
+/// - **`SymbolFlags::FunctionExpression`**, not the name: a function expression's
+///   own name is bound in the function's own scope, which for a route is this one,
+///   and the emitter rebuilds the component from `RouteIr` instead of writing the
+///   expression. `route.name_span` is the *declarator* (`const Page = function
+///   render(…)` binds `render` at a different span), so the flag is what
+///   identifies the shape. It is deliberately not a skip by name: a genuine
+///   `var render` in the body keeps refusing.
 fn check_scope_bindings(
     scoping: &oxc_semantic::Scoping,
     route_scope: oxc_semantic::ScopeId,
@@ -364,30 +391,86 @@ fn check_scope_bindings(
     out: &mut Vec<Diagnostic>,
 ) {
     let params = render.params.span;
+    // The bound the emitter writes up to: `render()` carries only the statements
+    // before the JSX `return`, so a binding declared at or after it is not in the
+    // artifact. A concise body (`(props) => <p/>`) has no statements at all, so
+    // nothing is emitted and nothing can be shadowed.
+    let Some(return_span) = render.return_span else {
+        return;
+    };
     for name in reserved {
         let Some(symbol) = scoping.get_binding(route_scope, oxc_ast::ast::Ident::from(*name))
         else {
             continue;
         };
-        if scoping.symbol_flags(symbol).is_type() {
-            continue;
+        // The declarations of this **name**, each with its own flags. Oxc's
+        // binder merges declarations that share a name in one scope into one
+        // symbol and unions their flags onto it, so the symbol's flags cannot
+        // answer "is there a value here, and where is it written": a `type _esc`
+        // and a `var _esc` in the same scope are one symbol whose union reports a
+        // type, and whose span is whichever declaration came first. Reading the
+        // redeclaration list keeps each site's own span and meaning.
+        for (span, flags) in declarations_of(scoping, symbol) {
+            // Only a **value** declaration can shadow the helper. A type alias or
+            // interface is erased by `strip_types`, so nothing is emitted under
+            // the name. `is_type()` alone is not the test: the union above reports
+            // a type for the `var` too, which is how the `var` hid behind the
+            // alias and emitted `TypeError: _esc is not a function`.
+            if !flags.is_value() {
+                continue;
+            }
+            // A function expression's own name is bound in the function's own
+            // scope, which for a route is this one, and the emitter rebuilds the
+            // component from `RouteIr` instead of writing the expression — so the
+            // name is not in the artifact. The flag, not the name, identifies the
+            // shape: `route.name_span` is the **declarator**
+            // (`const Page = function render(…)` binds `render` elsewhere), while
+            // a genuine `var render` in the body must keep refusing.
+            if flags.contains(oxc_syntax::symbol::SymbolFlags::FunctionExpression) {
+                continue;
+            }
+            // Unreachable code after the route's `return` is not emitted. This
+            // bound mirrors `crate::ir::emitted_body_statements`, the one
+            // definition of "emitted" the slicer filters with.
+            if span.start >= return_span.start {
+                continue;
+            }
+            // The route parameter: `analyze::reachable` already refuses a
+            // differently-named one, so refusing it here would be a second row.
+            if span.start >= params.start && span.end <= params.end {
+                continue;
+            }
+            // The component's own name in `export default (function render(…))`:
+            // its span *is* the name span, and the emitter never writes it.
+            if (span.start, span.end) == route.name_span {
+                continue;
+            }
+            out.push(scope_binding_refusal((span.start, span.end), name));
         }
-        let span = scoping.symbol_span(symbol);
-        if span.start >= params.start && span.end <= params.end {
-            continue;
-        }
-        // The component's own name, in the one shape that binds it in the
-        // component's own scope: a named **function expression**
-        // (`export default (function render(props) {…})`), whose name lives in
-        // the function's scope rather than at module level. The emitter rebuilds
-        // the component as `export function render()`, so the inner name is never
-        // written — there is nothing to shadow. `analyze::reachable` owns the case
-        // where the file *references* the component.
-        if (span.start, span.end) == route.name_span {
-            continue;
-        }
-        out.push(scope_binding_refusal((span.start, span.end), name));
     }
+}
+
+/// Every declaration of `symbol`, each with that declaration's own flags.
+///
+/// [`oxc_semantic::Scoping::symbol_redeclarations`] is empty for a name declared
+/// once; when it is not, it already holds the first declaration followed by each
+/// redeclaration, each with the flags it was declared with. Reading that list
+/// instead of the symbol's unioned flags is what lets a `type` alias and a `var`
+/// of one name be judged separately — the union cannot say which site is which.
+fn declarations_of(
+    scoping: &oxc_semantic::Scoping,
+    symbol: oxc_syntax::symbol::SymbolId,
+) -> Vec<(oxc_span::Span, oxc_syntax::symbol::SymbolFlags)> {
+    let redeclarations = scoping.symbol_redeclarations(symbol);
+    if redeclarations.is_empty() {
+        return vec![(scoping.symbol_span(symbol), scoping.symbol_flags(symbol))];
+    }
+    let mut declarations: Vec<_> = redeclarations
+        .iter()
+        .map(|redeclaration| (redeclaration.span, redeclaration.flags))
+        .collect();
+    declarations.sort_by_key(|(span, _)| span.start);
+    declarations
 }
 
 /// `RA014` for a reserved name bound in the route component's own scope.
@@ -822,21 +905,34 @@ mod tests {
         let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
         // Two rows for one problem, the same shape the module-scope arm has: the
         // declaration is where the rename happens, the use is where the agent reads
-        // why. The declaration row is `check_scope_bindings`'s; this one is the
-        // reference walk's.
-        assert!(
-            d.iter()
-                .any(|row| row.code == Code::RA014 && row.message.contains("body declares")),
-            "the reference names the hoisted binding: {d:?}"
-        );
-        let row = d
+        // why. The declaration row is `check_scope_bindings`'s; the other is the
+        // reference walk's. Both rows are pinned, not "at least one": each names a
+        // distinct edit, and dropping either would hide a site.
+        assert_eq!(d.len(), 2, "a declaration row and a reference row: {d:?}");
+
+        let declaration = d
             .iter()
-            .find(|row| row.code == Code::RA014 && row.message.contains("body declares"))
-            .unwrap_or_else(|| panic!("a hoisted `var` shadows the escaper: {d:?}"));
+            .find(|row| {
+                row.message
+                    .contains("declared in the route component's own scope")
+            })
+            .unwrap_or_else(|| panic!("the declaration row is missing: {d:?}"));
+        assert_eq!(declaration.code, Code::RA014);
         assert_eq!(
-            &src[row.span.0 as usize..row.span.1 as usize],
+            &src[declaration.span.0 as usize..declaration.span.1 as usize],
             "_esc",
-            "the span is the hijacking call: {row:?}"
+            "the declaration row points at the binding to rename: {declaration:?}"
+        );
+
+        let reference = d
+            .iter()
+            .find(|row| row.message.contains("body declares"))
+            .unwrap_or_else(|| panic!("the reference row is missing: {d:?}"));
+        assert_eq!(reference.code, Code::RA014);
+        assert_eq!(
+            &src[reference.span.0 as usize..reference.span.1 as usize],
+            "_esc",
+            "the span is the hijacking call: {reference:?}"
         );
     }
 
@@ -1122,6 +1218,223 @@ mod tests {
         assert!(
             crate::analyze::analyze(src, "src/routes/_shell.tsx").is_empty(),
             "nothing is emitted from a component module"
+        );
+    }
+
+    /// Run `module` as an ESM file under `node` and return what `render()` prints.
+    ///
+    /// The point of the clean-fixture controls below is the **artifact**, not the
+    /// diagnostic list: a module can be clean and still throw, which is exactly how
+    /// earlier rounds found their defects. `node` is the engine the build uses.
+    /// `None` means `node` is not installed, in which case the caller still proves
+    /// the artifact is a module (it was emitted and parses); shelling out is the
+    /// extra evidence, not the only evidence.
+    fn render_under_node(module: &str) -> Option<String> {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "runai-emitted-names-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("route.mjs");
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(module.as_bytes()))
+            .expect("write the emitted module");
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(format!(
+                "const {{ pathToFileURL }} = await import(\"node:url\"); \
+                 const m = await import(pathToFileURL(\"{}\").href); \
+                 process.stdout.write(m.render());",
+                path.display()
+            ))
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match output {
+            Ok(output) if output.status.success() => {
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            Ok(output) => panic!(
+                "the emitted module must run under node: {module}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("could not run node: {error}"),
+        }
+    }
+
+    /// Assert that `module` renders `expected` — running it under `node` when it is
+    /// installed, and otherwise asserting it parses as ESM, so the check never
+    /// silently disappears.
+    fn assert_renders(module: &str, expected: &str) {
+        match render_under_node(module) {
+            Some(html) => assert_eq!(html, expected, "the artifact renders: {module}"),
+            None => {
+                let alloc = oxc_allocator::Allocator::default();
+                let ret =
+                    oxc_parser::Parser::new(&alloc, module, oxc_span::SourceType::mjs()).parse();
+                assert!(
+                    ret.diagnostics.is_empty(),
+                    "node is unavailable; the artifact must at least parse: {module}\n{:?}",
+                    ret.diagnostics
+                );
+                eprintln!("node is not installed: asserted the artifact parses instead");
+            }
+        }
+    }
+
+    /// NEW-3: a body `type` alias beside a `var` of the same reserved name. Oxc's
+    /// binder unions the nested `var`'s flags onto the type-alias symbol for the
+    /// name, so the union reports a type — and skipping "any symbol whose flags
+    /// look like a type" hid the **value** binding with it. The `var` alone is a
+    /// real hoist into `render()`'s scope: the artifact carried `var _esc = 1`
+    /// above `${_esc(1 + 1)}` and threw `TypeError: _esc is not a function`.
+    #[test]
+    fn a_var_beside_a_type_alias_of_the_same_name_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  type _esc = 1; if (false) { var _esc = 1 }\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "the `var` is a value binding: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message
+                .contains("declared in the route component's own scope"),
+            "the row is the declaration rule's: {}",
+            d[0].message
+        );
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx").is_err(),
+            "the file is refused, so no module with `var _esc = 1` is written"
+        );
+    }
+
+    /// The control for NEW-3: `type _esc = 1` **alone** is erased by
+    /// `strip_types`, so nothing is emitted under the name. The ruling is "skip
+    /// only when the symbol is type-only", not "skip when it is a type".
+    #[test]
+    fn a_body_type_alias_alone_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  type _esc = 1\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "a type is erased before emission: {d:?}");
+        let module = crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx")
+            .expect("a type alias alone emits");
+        assert!(
+            !module.contains("_esc = 1"),
+            "the type alias is not written: {module}"
+        );
+        assert_renders(&module, "<p>2</p>");
+    }
+
+    /// The pin for the shape that already refused: a `type` alias and a top-level
+    /// `var` of the same reserved name in the same scope. Oxc merges them into one
+    /// symbol whose flags are both type and value; the declaration rule must see
+    /// the value half. One row, because both walks land on the same identifier.
+    #[test]
+    fn a_top_level_var_beside_a_type_alias_of_the_same_name_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  type _esc = 1; var _esc = 1\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "one problem, one row: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    /// NEW-1: a **declarator-named** function-expression component. The binder
+    /// puts the function expression's own name (`render`) in the function's own
+    /// scope — which is the route scope — while `ComponentInfo::name_span` records
+    /// the **declarator** (`Page`), so the `route.name_span` skip misses it. The
+    /// emitter rebuilds the component from `RouteIr` and never writes the function
+    /// expression's name, so this is a false positive on a legal page — and the
+    /// artifact it refused was fine, which the `node` run below proves.
+    #[test]
+    fn a_declarator_named_function_expression_route_is_clean() {
+        let src = "\"use static\"\nconst Page = function render(props: Record<never, never>) { return <p>hi</p> }\nexport default Page\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "the function expression's own name is not a binding in the artifact: {d:?}"
+        );
+        let module = crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx")
+            .expect("the artifact is emitted");
+        assert!(
+            !module.contains("function render(props)"),
+            "the function expression itself is not written: {module}"
+        );
+        assert_renders(&module, "<p>hi</p>");
+    }
+
+    /// The control for the ruling's "do not widen the skip by name": a function
+    /// expression whose own name is an ordinary identifier stays clean.
+    #[test]
+    fn a_declarator_named_function_expression_with_an_ordinary_name_is_clean() {
+        let src = "\"use static\"\nconst Page = function helper(props: Record<never, never>) { return <p>hi</p> }\nexport default Page\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "an ordinary own name is clean: {d:?}");
+    }
+
+    /// The other half of NEW-1's ruling: `SymbolFlags::FunctionExpression` must
+    /// not become a blanket skip. A genuine `var render` in a nested block of a
+    /// block-body route is a real hoist into `render()`'s scope and keeps refusing.
+    #[test]
+    fn a_genuine_nested_var_named_render_is_still_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { var render = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var render` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`render`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// NEW-2: a reserved binding **after** the JSX `return` is never emitted —
+    /// [`crate::ir::emitted_body_statements`] stops at `return_span`, so the
+    /// artifact has no shadow and the only defect would be a false positive.
+    #[test]
+    fn a_reserved_var_after_the_return_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p>; var _esc = 1 }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a binding after the return is never emitted: {d:?}"
+        );
+    }
+
+    /// The same rule for a `const`, which is not hoisted anywhere the emitter
+    /// writes: unreachable code after the `return` is not copied into `render()`.
+    #[test]
+    fn a_reserved_const_after_the_return_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p>; const _attr = 1 }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a binding after the return is never emitted: {d:?}"
+        );
+    }
+
+    /// The control for NEW-2: move the same binding **before** the return and it is
+    /// emitted into `render()`, so it refuses. Narrowing the rule to the emitted
+    /// range must not narrow it past the range.
+    #[test]
+    fn a_reserved_var_before_the_return_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { var _esc = 1; return <p>hi</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "the emitted range includes this binding: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
         );
     }
 }
