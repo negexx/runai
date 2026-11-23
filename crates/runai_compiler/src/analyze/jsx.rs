@@ -64,14 +64,18 @@
 //! module-level JSX declaration is legal and this milestone simply does not emit
 //! that module.
 //!
-//! # `RA014`: markup the HTML parser would reshape
+//! # `RA014`: markup the HTML parser would reshape, or that a content model excludes
 //!
 //! The island emitter writes markup as HTML **text**, so the browser's parser
-//! rebuilds the tree — and for these shapes it does not rebuild the tree the
-//! author wrote. [`reparse_refusal`], [`parent_child_refusal`],
+//! rebuilds the tree — and for some of these shapes it does not rebuild the tree
+//! the author wrote. The rest are refused because they are **outside a content
+//! model** this milestone states: a `<div>` directly inside a `<ul>` is not a list
+//! item, and although the parser keeps it, the markup is not conforming HTML. Each
+//! message says which of the two it is, and never claims a parser action that was
+//! not verified. [`content_model`], [`parent_child_refusal`],
 //! [`ancestor_refusal`], [`required_ancestors`], [`text_refusal`], and
 //! [`self_closing_refusal`] refuse them, because the emitter cannot fix a shape
-//! the parser rewrites:
+//! the parser rewrites and does not silently rewrite markup for the author:
 //!
 //! - `<p>` containing a block element — the parser closes the paragraph, so the
 //!   child becomes a sibling;
@@ -85,12 +89,13 @@
 //!   `tfoot`/`tr`, or bare text — the parser fosters it out of the table;
 //! - `<thead>`/`<tbody>`/`<tfoot>` containing anything but `<tr>`, `<tr>`
 //!   anything but `<td>`/`<th>`, `<colgroup>` anything but `<col>`, `<select>`
-//!   anything but `<option>`/`<optgroup>`, `<ul>`/`<ol>` anything but `<li>`,
-//!   `<dl>` anything but `<dt>`/`<dd>` — each is moved out or wrapped;
+//!   anything but `<option>`/`<optgroup>`, `<ul>`/`<ol>`/`<menu>` anything but
+//!   `<li>`, `<dl>` anything but `<dt>`/`<dd>`/`<div>` — the **content model**
+//!   from [`content_model`], which the parser enforces by moving the child;
 //! - `<a>` inside `<a>` — the parser splits it into siblings; `<form>` inside
 //!   `<form>` — the parser **drops** the nested form;
-//! - `<li>` outside `<ul>`/`<ol>`, `<dt>`/`<dd>` outside `<dl>` — a stray entry
-//!   with no list to belong to;
+//! - `<li>` outside `<ul>`/`<ol>`/`<menu>`, `<dt>`/`<dd>` outside `<dl>` — a
+//!   stray entry with no list to belong to;
 //! - a tag the parser only builds under one parent ([`required_ancestors`]):
 //!   `<td>`/`<th>` outside `<tr>`, `<tr>` outside a table, a table
 //!   section/`<caption>`/`<colgroup>`/`<col>` outside `<table>`,
@@ -233,30 +238,71 @@ pub(crate) const BLOCK_IN_P: &[&str] = &[
     "ul",
 ];
 
-/// Parents whose content model the HTML parser enforces by moving, splitting, or
-/// closing nodes — so the parsed DOM would not be the tree the author wrote.
+/// The HTML **content model** of every parent whose children this milestone
+/// constrains, transcribed from the WHATWG spec — one table, not a set of
+/// per-family deny-lists.
 ///
-/// `None` means "any child this milestone can emit". `Some(&[])` is the `<p>`
-/// case, whose children are governed by [`BLOCK_IN_P`] rather than an
-/// allow-list.
+/// The spec's own words for each row:
 ///
-/// One table, read by [`JsxChecker`]'s nesting rule and repeated by
-/// [`crate::ir::lower_route`] as an invariant, the way [`dom_tag`] is shared: a
-/// caller that skips the analysis gets a diagnostic rather than a template the
-/// browser will reshape.
-pub(crate) fn reparse_refusal(tag: &str) -> Option<&'static [&'static str]> {
-    match tag {
-        "p" => Some(&[]), // no block-level children; see BLOCK_IN_P
+/// - `ul`, `ol`, `menu` (`grouping-content.html`): "Zero or more `li` and
+///   script-supporting elements."
+/// - `dl`: "**Either** zero or more groups of `dt` then `dd` … **Or** one or more
+///   `div` elements" — so both a `div` wrapper and bare `dt`/`dd` are
+///   conforming.
+/// - `select`: `option`, `optgroup`, script-supporting elements.
+/// - `optgroup`: `option`, script-supporting elements.
+/// - `table`, `thead`/`tbody`/`tfoot`, `tr`, `colgroup`: the table parts listed
+///   in each row.
+///
+/// `script` and `template` are **script-supporting**, so they are legal in every
+/// one of these parents rather than being written out per row — one exception,
+/// `colgroup`, whose content model admits `template` but not `script`; the
+/// parser agrees and moves a `script` out of a `<colgroup>` (verified against
+/// parse5 8.0.1, see [`SCRIPT_SUPPORTING`]).
+///
+/// `None` means "any child this milestone can emit". `<p>` is deliberately
+/// **absent**: its content model is "phrasing content", a much larger set than
+/// any list here, and [`BLOCK_IN_P`] carries the deny-list form instead.
+///
+/// One table, read by [`parent_child_refusal`] and therefore by [`check_jsx`] and
+/// [`crate::ir::lower_route`] alike, so the refusal and its message cannot
+/// disagree about which children a parent permits.
+pub(crate) fn content_model(parent: &str) -> Option<&'static [&'static str]> {
+    match parent {
+        "ul" | "ol" | "menu" => Some(&["li"]),
+        "dl" => Some(&["dt", "dd", "div"]),
+        "select" => Some(&["option", "optgroup"]),
+        "optgroup" => Some(&["option"]),
         "table" => Some(&["caption", "colgroup", "thead", "tbody", "tfoot", "tr"]),
         "thead" | "tbody" | "tfoot" => Some(&["tr"]),
         "tr" => Some(&["td", "th"]),
         "colgroup" => Some(&["col"]),
-        "select" => Some(&["option", "optgroup"]),
-        "optgroup" => Some(&["option"]),
-        "ul" | "ol" => Some(&["li"]),
-        "dl" => Some(&["dt", "dd"]),
         _ => None,
     }
+}
+
+/// The tags that are legal in every content model above because they are
+/// **script-supporting** elements.
+///
+/// `template` is legal in all of them, `colgroup` included ("zero or more `col`
+/// and `template` elements"). `script` is legal in all but `colgroup`, and that
+/// is a fact about the parser, not a preference: parse5 8.0.1 keeps a `<script>`
+/// directly inside `<ul>`, `<dl>`, `<select>`, `<optgroup>`, `<table>`, a table
+/// section, and a `<tr>`, but **moves it out** of `<colgroup>` —
+/// `<table><colgroup><script></script><col></colgroup></table>` parses as
+/// `(table (colgroup) (script) (colgroup (col)))`. Allowing it there would accept
+/// markup whose tree the parser changes.
+const SCRIPT_SUPPORTING: &[&str] = &["script", "template"];
+
+/// Whether `child` is one of `parent`'s permitted children.
+///
+/// The content model plus [`SCRIPT_SUPPORTING`]; the `colgroup`/`script`
+/// exception is the only place the two lists need to be considered apart.
+fn content_model_admits(parent: &str, child: &str) -> bool {
+    if SCRIPT_SUPPORTING.contains(&child) {
+        return child == "template" || parent != "colgroup";
+    }
+    content_model(parent).is_some_and(|model| model.contains(&child))
 }
 
 /// Elements whose content the HTML parser reads as **raw text** or **RCDATA**,
@@ -316,8 +362,10 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
         return None;
     }
 
-    let allowed = reparse_refusal(parent)?;
-    if allowed.is_empty() || allowed.contains(&child) {
+    // The content model decides; a parent not in the table accepts anything this
+    // milestone can emit.
+    content_model(parent)?;
+    if content_model_admits(parent, child) {
         return None;
     }
 
@@ -394,25 +442,26 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
                 )
             }
         }
-        // parse5 8.0.1 keeps the child where it stands — it does **not** wrap it
-        // in an `<li>`: `<ul><div>x</div></ul>` → `(ul (div "x"))`. The refusal is
-        // the content model, not a parser rewrite.
-        "ul" | "ol" => format!(
-            "`<{parent}>` cannot contain `<{child}>`: a list's content model is `<li>`, so a \
-             `<{child}>` directly inside one is not an item of the list and the page holds a \
-             structure you did not write. Put `<{child}>` inside an `<li>`, or move it outside the \
-             `<{parent}>`."
+        // The content model, stated as the spec states it — never a parser
+        // rewrite. parse5 8.0.1 keeps the child exactly where it stands:
+        // `<ul><div>x</div></ul>` → `(ul (div "x"))`, `<menu><div>x</div></menu>`
+        // → `(menu (div "x"))`.
+        "ul" | "ol" | "menu" => format!(
+            "`<{parent}>` cannot contain `<{child}>`: `<{parent}>` holds `<li>` children (and \
+             script-supporting elements), so `<{child}>` here is not a list item. Put `<{child}>` \
+             inside an `<li>`, or move it outside the `<{parent}>`."
         ),
-        // Also kept in place by parse5 8.0.1: `<dl><div>x</div></dl>` →
-        // `(dl (div "x"))`. Same content-model refusal, no rewrite.
+        // A `<dl>` admits both shapes ("either zero or more groups of `dt` then
+        // `dd` … or one or more `div` elements"), so this message fires only for a
+        // child that is neither — and `div` never reaches it. parse5 8.0.1 keeps a
+        // `<span>` in place: `<dl><span>x</span></dl>` → `(dl (span "x"))`.
         "dl" => format!(
-            "`<dl>` cannot contain `<{child}>`: a description list's content model is `<dt>` and \
-             `<dd>`, so a `<{child}>` directly inside one is not an entry of the list and the page \
-             holds a structure you did not write. Put `<{child}>` inside a `<dt>` or `<dd>`, or \
-             move it outside the `<dl>`."
+            "`<dl>` cannot contain `<{child}>`: a `<dl>` holds `<dt>`/`<dd>` groups, optionally \
+             wrapped in `<div>`, so `<{child}>` here is not part of a description list. Put \
+             `<{child}>` inside a `<dt>` or `<dd>`, or move it outside the `<dl>`."
         ),
         // `p` is handled above; this arm is unreachable for any other tag because
-        // `reparse_refusal` returns a list only for the tags above.
+        // [`content_model`] returns a list only for the tags above.
         _ => return None,
     };
     Some(message)
@@ -738,7 +787,7 @@ pub(crate) fn text_refusal(parent: &str) -> Option<String> {
 /// document fragment, where `setAttribute` does not exist.
 ///
 /// Shared by [`check_jsx`] and [`crate::ir::lower_route`], like
-/// [`reparse_refusal`], so the two cannot disagree about a legal position.
+/// [`content_model`], so the two cannot disagree about a legal position.
 pub(crate) fn required_ancestors(tag: &str) -> Option<&'static [&'static str]> {
     match tag {
         "td" | "th" => Some(&["tr"]),
@@ -853,12 +902,14 @@ pub(crate) fn ancestor_refusal(tag: &str, ancestors: &[String]) -> Option<String
              out of the outer one."
                 .to_string(),
         ),
-        "li" if !ancestors.is_empty() && !inside("ul") && !inside("ol") => Some(
-            "`<li>` must be inside a `<ul>` or `<ol>`: outside a list it has no list to belong to, \
-             so the parser renders a stray item. Wrap the `<li>` in a `<ul>` or `<ol>`, or use a \
-             `<div>` if it is not a list item."
-                .to_string(),
-        ),
+        "li" if !ancestors.is_empty() && !inside("ul") && !inside("ol") && !inside("menu") => {
+            Some(
+                "`<li>` must be inside a `<ul>`, `<ol>`, or `<menu>`: outside a list it has no list \
+                 to belong to, so the parser renders a stray item. Wrap the `<li>` in a `<ul>`, \
+                 `<ol>`, or `<menu>`, or use a `<div>` if it is not a list item."
+                    .to_string(),
+            )
+        }
         "dt" | "dd" if !ancestors.is_empty() && !inside("dl") => Some(format!(
             "`<{tag}>` must be inside a `<dl>`: a description term or value only belongs to a \
              description list, so outside one the parser renders a stray entry. Wrap the `<{tag}>` \
@@ -2663,43 +2714,184 @@ mod tests {
         );
     }
 
-    /// A non-item child of a list or description list is refused, and the message
-    /// says what is actually wrong: the child is not an item of the list, so the
-    /// page holds a structure the author did not write.
+    /// Every row of the ruling's **content model** table, asserted through the rule
+    /// that reads it: a permitted child yields no refusal.
     ///
-    /// It must **not** claim a parser rewrite. parse5 8.0.1 keeps the child where
-    /// it stands — `<ul><div>x</div></ul>` → `(ul (div "x"))` and
-    /// `<dl><div>x</div></dl>` → `(dl (div "x"))` — so "the parser treats it as an
-    /// item wrapper / as an entry" is false. The repair still names the real
-    /// item element.
+    /// The rows are the WHATWG spec's, not a deny-list:
+    ///
+    /// - `ul`, `ol`, `menu`: "zero or more `li` and script-supporting elements";
+    /// - `dl`: "either zero or more groups of `dt` then `dd` … or one or more
+    ///   `div` elements" — **both** shapes are conforming;
+    /// - `select`: `option`, `optgroup`, script-supporting;
+    /// - `optgroup`: `option`, script-supporting;
+    /// - the table family: the parts each element may hold.
+    ///
+    /// `script` and `template` are script-supporting and legal in every parent
+    /// here; `colgroup` is the one that admits `template` but not `script`,
+    /// because parse5 8.0.1 moves a `<script>` out of a `<colgroup>`
+    /// (`<table><colgroup><script></script><col></colgroup></table>` →
+    /// `(table (colgroup) (script) (colgroup (col)))`). The `script`/`colgroup`
+    /// pair is asserted as a **refusal** so the exception is pinned, not implied.
     #[test]
-    fn a_non_item_child_of_a_list_says_what_is_wrong() {
-        for (src, item) in [
+    fn the_content_model_table_admits_the_specs_children() {
+        let rows: &[(&str, &[&str])] = &[
+            ("ul", &["li", "script", "template"]),
+            ("ol", &["li", "script", "template"]),
+            ("menu", &["li", "script", "template"]),
+            ("dl", &["dt", "dd", "div", "script", "template"]),
+            ("select", &["option", "optgroup", "script", "template"]),
+            ("optgroup", &["option", "script", "template"]),
             (
-                "\"use island\"\nexport default function P(props: Record<never, never>) { return <ul><div>x</div></ul> }\n",
-                "`<li>`",
+                "table",
+                &[
+                    "caption", "colgroup", "thead", "tbody", "tfoot", "tr", "script", "template",
+                ],
             ),
+            ("thead", &["tr", "script", "template"]),
+            ("tbody", &["tr", "script", "template"]),
+            ("tfoot", &["tr", "script", "template"]),
+            ("tr", &["td", "th", "script", "template"]),
+            ("colgroup", &["col", "template"]),
+        ];
+
+        for (parent, children) in rows {
+            for child in *children {
+                assert!(
+                    parent_child_refusal(parent, child).is_none(),
+                    "`<{parent}>` admits `<{child}>` per the spec, but the rule refuses it: {:?}",
+                    parent_child_refusal(parent, child)
+                );
+            }
+        }
+
+        // The `colgroup` exception, and two plain illegal children, so the test
+        // cannot pass by admitting everything.
+        assert!(
+            parent_child_refusal("colgroup", "script").is_some(),
+            "parse5 moves a `<script>` out of a `<colgroup>`; it is not admitted"
+        );
+        assert!(parent_child_refusal("ul", "div").is_some());
+        assert!(parent_child_refusal("dl", "span").is_some());
+    }
+
+    /// The conforming shapes the old deny-lists refused are **clean**, and still
+    /// emit: a `div` wrapper in a `<dl>`, script-supporting children in a list, and
+    /// a `<menu>` list. Each was a verified false positive (parse5 8.0.1 keeps
+    /// every one of these trees unchanged).
+    #[test]
+    fn the_conforming_list_shapes_are_clean() {
+        for body in [
+            // "Either zero or more groups of `dt` then `dd` … or one or more `div`".
+            "<dl><div><dt>a</dt><dd>b</dd></div></dl>",
+            "<dl><div>x</div></dl>",
+            // Script-supporting children are part of the content model.
+            "<ul><script src=\"/a.js\"></script><li>x</li></ul>",
+            "<ol><template><li>x</li></template></ol>",
+            "<dl><script src=\"/a.js\"></script><dt>a</dt><dd>b</dd></dl>",
+            "<select><script src=\"/a.js\"></script><option>a</option></select>",
+            "<select><optgroup label=\"g\"><script src=\"/a.js\"></script><option>a</option></optgroup></select>",
+            // `<menu>` is a list: `<li>` is its child and its list item.
+            "<menu><li>x</li></menu>",
+            "<menu><script src=\"/a.js\"></script><li>x</li></menu>",
+            // The pre-existing legal set, so a table edit cannot regress it.
+            "<ul><li>a</li><li>b</li></ul>",
+            "<dl><dt>a</dt><dd>b</dd></dl>",
+            "<select><option>a</option></select>",
+            "<table><colgroup><col /><template><col /></template></colgroup><tbody><tr><td>x</td></tr></tbody></table>",
+            "<table><script src=\"/a.js\"></script><tbody><tr><td>x</td></tr></tbody></table>",
+        ] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert!(d.is_empty(), "{body}: {d:?}");
+        }
+    }
+
+    /// A child outside the content model is still refused, and the message states
+    /// the **content model** — never a parser action nobody verified.
+    ///
+    /// parse5 8.0.1 keeps each of these children exactly where it stands
+    /// (`<ul><div>x</div></ul>` → `(ul (div "x"))`, `<dl><span>x</span></dl>` →
+    /// `(dl (span "x"))`, `<menu><div>x</div></menu>` → `(menu (div "x"))`), and
+    /// discards a `<div>` inside `<select>` (`(select "x")`). The refusal is the
+    /// model, so the message names the model.
+    #[test]
+    fn a_child_outside_the_content_model_is_ra014() {
+        for (body, names) in [
+            ("<ul><div>x</div></ul>", "`<li>`"),
+            ("<ol><div>x</div></ol>", "`<li>`"),
+            ("<menu><div>x</div></menu>", "`<li>`"),
+            ("<dl><span>x</span></dl>", "`<dt>`"),
+            ("<select><div>x</div></select>", "`<option>`"),
             (
-                "\"use island\"\nexport default function P(props: Record<never, never>) { return <dl><div>x</div></dl> }\n",
-                "`<dt>`",
+                "<select><optgroup label=\"g\"><div>x</div></optgroup></select>",
+                "`<option>`",
             ),
         ] {
-            let d = check(src);
-            assert_eq!(d.len(), 1, "{src}: {d:?}");
-            assert_eq!(d[0].code, Code::RA014, "{src}");
-            for phrase in ["item wrapper", "as an entry", "parser treats"] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "{body}: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{body}");
+            assert!(
+                d[0].message.contains(names),
+                "{body}: the message names the content model's element {names}: {}",
+                d[0].message
+            );
+        }
+    }
+
+    /// The list messages must not invent a parser action. `item wrapper`, `as an
+    /// entry`, `structure you did not write` and `parser treats` were all false for
+    /// a `<div>` directly inside a list — parse5 keeps the child where it stands —
+    /// so none of them may come back.
+    #[test]
+    fn a_list_message_states_the_content_model_not_a_parser_action() {
+        for body in ["<ul><div>x</div></ul>", "<dl><span>x</span></dl>"] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "{body}: {d:?}");
+            for phrase in [
+                "item wrapper",
+                "as an entry",
+                "structure you did not write",
+                "parser treats",
+            ] {
                 assert!(
                     !d[0].message.contains(phrase),
-                    "{src}: the message claims the parser does `{phrase}`, which it does not: {}",
+                    "{body}: the message claims `{phrase}`, which the parser does not do: {}",
                     d[0].message
                 );
             }
             assert!(
-                d[0].message.contains(item),
-                "{src}: the repair names the real item element `{item}`: {}",
+                d[0].message.contains("content model") || d[0].message.contains("holds"),
+                "{body}: the message states what the parent holds: {}",
                 d[0].message
             );
         }
+    }
+
+    /// `<menu>` is a list for `<li>` context, not only for its content model: the
+    /// ancestor rule accepts it, so the same `<li>` that is legal in a `<ul>` is
+    /// legal in a `<menu>`, and a stray one is still refused.
+    #[test]
+    fn a_menu_is_a_list_for_a_list_item() {
+        let clean = "\"use island\"\nexport default function P(props: Record<never, never>) { return <menu><li>x</li></menu> }\n";
+        assert!(check(clean).is_empty(), "{:?}", check(clean));
+
+        let stray = "\"use island\"\nexport default function P(props: Record<never, never>) { return <div><li>x</li></div> }\n";
+        let d = check(stray);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<menu>`"),
+            "the repair offers `<menu>` as a list parent: {}",
+            d[0].message
+        );
     }
 
     /// The shapes the parser rebuilds faithfully stay clean. A route root may be

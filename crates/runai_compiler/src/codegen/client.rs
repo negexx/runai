@@ -32,7 +32,7 @@
 //! the k-th comment in the cloned fragment, read by the `_c` TreeWalker. A comment
 //! is the one node the parser never renames, re-parents, or closes early.
 //!
-//! [Step 0]: [`crate::analyze::jsx::reparse_refusal`] — the analyzer refuses the
+//! [Step 0]: [`crate::analyze::jsx::content_model`] — the analyzer refuses the
 //! markup shapes whose *element* tree the parser relocates, so a marker only ever
 //! has to survive comment-preserving edits, which it does.
 //!

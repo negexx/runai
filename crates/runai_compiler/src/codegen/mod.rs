@@ -394,6 +394,28 @@ mod tests {
         );
     }
 
+    /// The conforming content-model shapes from the spec emit — not just pass the
+    /// analyzer. A `div` wrapper in a `<dl>`, a script-supporting child in a list,
+    /// and a `<menu>` list are all legal HTML, so a static route holding them must
+    /// produce an artifact with the markup written verbatim.
+    #[test]
+    fn the_conforming_list_shapes_emit() {
+        for body in [
+            "<dl><div><dt>a</dt><dd>b</dd></div></dl>",
+            "<dl><div>x</div></dl>",
+            "<ul><script src=\"/a.js\"></script><li>x</li></ul>",
+            "<menu><li>x</li></menu>",
+        ] {
+            let src = format!("\"use static\"\n{P} {{ return {body} }}\n");
+            let js = emit_prerender_checked(&src, "src/routes/about.page.tsx")
+                .unwrap_or_else(|d| panic!("{body}: a conforming shape must emit: {d:?}"));
+            assert!(
+                js.contains(body),
+                "{body}: the markup is written verbatim: {js}"
+            );
+        }
+    }
+
     /// A clean static route emits, and the artifact is what the emitter's own
     /// tests pin.
     #[test]
