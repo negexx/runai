@@ -394,15 +394,22 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
                 )
             }
         }
+        // parse5 8.0.1 keeps the child where it stands — it does **not** wrap it
+        // in an `<li>`: `<ul><div>x</div></ul>` → `(ul (div "x"))`. The refusal is
+        // the content model, not a parser rewrite.
         "ul" | "ol" => format!(
-            "`<{parent}>` cannot contain `<{child}>`: a list holds `<li>` children, so the HTML \
-             parser treats `<{child}>` as an item wrapper and the page renders a different shape. \
-             Put `<{child}>` inside an `<li>`, or move it outside the `<{parent}>`."
+            "`<{parent}>` cannot contain `<{child}>`: a list's content model is `<li>`, so a \
+             `<{child}>` directly inside one is not an item of the list and the page holds a \
+             structure you did not write. Put `<{child}>` inside an `<li>`, or move it outside the \
+             `<{parent}>`."
         ),
+        // Also kept in place by parse5 8.0.1: `<dl><div>x</div></dl>` →
+        // `(dl (div "x"))`. Same content-model refusal, no rewrite.
         "dl" => format!(
-            "`<dl>` cannot contain `<{child}>`: a description list holds `<dt>` and `<dd>` children, \
-             so the HTML parser treats `<{child}>` as an entry and the page renders a different \
-             shape. Put `<{child}>` inside a `<dt>` or `<dd>`, or move it outside the `<dl>`."
+            "`<dl>` cannot contain `<{child}>`: a description list's content model is `<dt>` and \
+             `<dd>`, so a `<{child}>` directly inside one is not an entry of the list and the page \
+             holds a structure you did not write. Put `<{child}>` inside a `<dt>` or `<dd>`, or \
+             move it outside the `<dl>`."
         ),
         // `p` is handled above; this arm is unreachable for any other tag because
         // `reparse_refusal` returns a list only for the tags above.
@@ -2654,6 +2661,45 @@ mod tests {
             "names the list: {}",
             d[0].message
         );
+    }
+
+    /// A non-item child of a list or description list is refused, and the message
+    /// says what is actually wrong: the child is not an item of the list, so the
+    /// page holds a structure the author did not write.
+    ///
+    /// It must **not** claim a parser rewrite. parse5 8.0.1 keeps the child where
+    /// it stands — `<ul><div>x</div></ul>` → `(ul (div "x"))` and
+    /// `<dl><div>x</div></dl>` → `(dl (div "x"))` — so "the parser treats it as an
+    /// item wrapper / as an entry" is false. The repair still names the real
+    /// item element.
+    #[test]
+    fn a_non_item_child_of_a_list_says_what_is_wrong() {
+        for (src, item) in [
+            (
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <ul><div>x</div></ul> }\n",
+                "`<li>`",
+            ),
+            (
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <dl><div>x</div></dl> }\n",
+                "`<dt>`",
+            ),
+        ] {
+            let d = check(src);
+            assert_eq!(d.len(), 1, "{src}: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{src}");
+            for phrase in ["item wrapper", "as an entry", "parser treats"] {
+                assert!(
+                    !d[0].message.contains(phrase),
+                    "{src}: the message claims the parser does `{phrase}`, which it does not: {}",
+                    d[0].message
+                );
+            }
+            assert!(
+                d[0].message.contains(item),
+                "{src}: the repair names the real item element `{item}`: {}",
+                d[0].message
+            );
+        }
     }
 
     /// The shapes the parser rebuilds faithfully stay clean. A route root may be
