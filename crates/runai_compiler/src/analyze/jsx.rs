@@ -69,8 +69,8 @@
 //! The island emitter writes markup as HTML **text**, so the browser's parser
 //! rebuilds the tree — and for these shapes it does not rebuild the tree the
 //! author wrote. [`reparse_refusal`], [`parent_child_refusal`],
-//! [`ancestor_refusal`], and [`text_refusal`] refuse them, because the emitter
-//! cannot fix a shape the parser rewrites:
+//! [`ancestor_refusal`], [`required_ancestors`], and [`text_refusal`] refuse them,
+//! because the emitter cannot fix a shape the parser rewrites:
 //!
 //! - `<p>` containing a block element — the parser closes the paragraph, so the
 //!   child becomes a sibling;
@@ -83,6 +83,15 @@
 //! - `<a>` inside `<a>`, `<form>` inside `<form>` — the parser splits them;
 //! - `<li>` outside `<ul>`/`<ol>`, `<dt>`/`<dd>` outside `<dl>` — a stray entry
 //!   with no list to belong to;
+//! - a tag the parser only builds under one parent ([`required_ancestors`]):
+//!   `<td>`/`<th>` outside `<tr>`, `<tr>` outside a table, a table
+//!   section/`<caption>`/`<colgroup>`/`<col>` outside `<table>`,
+//!   `<option>`/`<optgroup>` outside `<select>`/`<datalist>`, `<figcaption>`
+//!   outside `<figure>`, `<legend>` outside `<fieldset>`, `<summary>` outside
+//!   `<details>` — outside its parent the parser **drops** the element (and its
+//!   content) or keeps only its content in the enclosing element, so every
+//!   later marker ordinal shifts and `_a[k]` addresses the wrong site. The
+//!   route **root** has no ancestors, which is not a legal parent either;
 //! - **in an island**, a dynamic binding inside a text-only element (`script`,
 //!   `style`, `title`, `textarea`, `template`, …) — the `<!>` marker the emitter
 //!   needs is swallowed as text or moved into a fragment the marker walker never
@@ -90,7 +99,9 @@
 //!
 //! They are repeated by [`crate::ir::lower_route`] as invariants, the way
 //! [`dom_tag`] is, so a caller that skips the analysis gets a diagnostic rather
-//! than a template the browser will reshape.
+//! than a template the browser will reshape. Lowering carries the route's
+//! [`crate::source::Mode`], so the island-only rule is repeated there too, not
+//! just the tree-shape ones: `template_html` and `lower_route` are both `pub`.
 //!
 //! [`RouteIr::statements`]: crate::ir::RouteIr::statements
 //! [`RouteIr::module_statements`]: crate::ir::RouteIr::module_statements
@@ -384,14 +395,108 @@ pub(crate) fn text_refusal(parent: &str) -> Option<String> {
     }
 }
 
+/// The parents a tag is only legal under, or `None` when any parent is.
+///
+/// These are the elements the HTML parser refuses to build in place: a table
+/// part outside a table is dropped (or its content re-parented), a `<td>`
+/// outside a `<tr>` loses its cell, an `<option>` outside a `<select>` is
+/// dropped. The route **root** has no ancestors, which is not one of the legal
+/// parents — a root `<td>` leaves the marker's `parentNode` a document
+/// fragment, where `setAttribute` does not exist.
+///
+/// Shared by [`check_jsx`] and [`crate::ir::lower_route`], like
+/// [`reparse_refusal`], so the two cannot disagree about a legal position.
+pub(crate) fn required_ancestors(tag: &str) -> Option<&'static [&'static str]> {
+    match tag {
+        "td" | "th" => Some(&["tr"]),
+        // A row needs a table section, or a table (the parser inserts the
+        // section itself, which the marker scheme survives: the marker stays
+        // inside the row).
+        "tr" => Some(&["table", "thead", "tbody", "tfoot"]),
+        "caption" | "colgroup" | "col" => Some(&["table"]),
+        "thead" | "tbody" | "tfoot" => Some(&["table"]),
+        "option" | "optgroup" => Some(&["select", "datalist"]),
+        "figcaption" => Some(&["figure"]),
+        "legend" => Some(&["fieldset"]),
+        "summary" => Some(&["details"]),
+        _ => None,
+    }
+}
+
+/// The refusal for `tag` under ancestors that do not include one it requires.
+///
+/// The message names the tag, the parent it needs, what actually happens, and the
+/// repair. Three consequences, because the parser treats three families
+/// differently — verified against parse5 8.0.1, the spec-compliant parser:
+///
+/// - `<td>`/`<th>` outside `<tr>`: the **cell** is dropped and its content (with
+///   the marker) stays in the enclosing element, so an attribute binding would be
+///   set on that element instead;
+/// - `<tr>` and the table sections, `<caption>`, `<colgroup>`, `<col>` outside a
+///   table: the element **and its content** are dropped, so the page renders
+///   without them;
+/// - `<option>`/`<optgroup>`/`<figcaption>`/`<legend>`/`<summary>`: the parser
+///   keeps the element in place, but outside its parent it is not the control or
+///   caption it names and browsers render it inert. Saying "the parser drops it"
+///   for these would be false.
+fn required_ancestor_message(tag: &str, required: &[&str]) -> String {
+    let named: Vec<String> = required
+        .iter()
+        .map(|parent| format!("`<{parent}>`"))
+        .collect();
+    let joined = match named.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    let wrapper = required.first().copied().unwrap_or("");
+
+    match tag {
+        "td" | "th" => format!(
+            "`<{tag}>` must be inside {joined}: the HTML parser drops a cell that is not in a row \
+             and keeps its content in the enclosing element, so an attribute bound inside `<{tag}>` \
+             would be set on the enclosing element instead. Wrap the `<{tag}>` in a `<tr>` inside a \
+             `<table>`."
+        ),
+        "option" | "optgroup" | "figcaption" | "legend" | "summary" => format!(
+            "`<{tag}>` must be inside {joined}: outside it the element is not the control or caption \
+             it names, so browsers render something other than you wrote. Wrap the `<{tag}>` in a \
+             `<{wrapper}>`."
+        ),
+        _ => format!(
+            "`<{tag}>` must be inside {joined}: the HTML parser drops the element outside its \
+             required parent, so the page renders without it and every later marker points at a \
+             different node. Wrap the `<{tag}>` in a `<{wrapper}>`."
+        ),
+    }
+}
+
 /// Why `tag` may not appear under `ancestors`, or `None`.
 ///
-/// The three ancestor rules: `<a>` inside `<a>`, `<form>` inside `<form>`, and a
-/// list/description item with no list parent — `<li>` outside `<ul>`/`<ol>`,
-/// `<dt>`/`<dd>` outside `<dl>`. The parser splits nested anchors and nested forms
-/// into siblings; a stray list item has no list to belong to.
+/// Three kinds of rule: `<a>` inside `<a>`, `<form>` inside `<form>`, a
+/// list/description item with no list parent (`<li>` outside `<ul>`/`<ol>`,
+/// `<dt>`/`<dd>` outside `<dl>`), and a tag the parser only builds under one
+/// parent ([`required_ancestors`]: `<td>` outside `<tr>`, `<option>` outside
+/// `<select>`, …). The parser splits nested anchors and forms into siblings; a
+/// stray list item has no list to belong to; and a table part, option, caption,
+/// legend or summary is dropped outside its parent.
 pub(crate) fn ancestor_refusal(tag: &str, ancestors: &[String]) -> Option<String> {
     let inside = |name: &str| ancestors.iter().any(|ancestor| ancestor == name);
+
+    // A tag the parser only builds under one parent. The root has no ancestors,
+    // which is not one of those parents — so a root `<td>` is refused rather than
+    // emitted with a marker whose `parentNode` is the document fragment. If the
+    // immediate parent already carries a more specific parent/child refusal, that
+    // one stands: one element, one diagnostic.
+    if let Some(required) = required_ancestors(tag) {
+        let parent_refuses = ancestors
+            .last()
+            .is_some_and(|parent| parent_child_refusal(parent, tag).is_some());
+        if !parent_refuses && !required.iter().any(|parent| inside(parent)) {
+            return Some(required_ancestor_message(tag, required));
+        }
+    }
+
     match tag {
         "a" if inside("a") => Some(
             "`<a>` cannot contain `<a>`: the HTML parser closes the outer anchor at the inner one, \
@@ -1453,8 +1558,9 @@ fn reshaped(span: Span, message: String) -> Diagnostic {
 ///
 /// This is the test the marker-hostile rule needs: only a **binding** inside a
 /// text-only element puts a marker where the parser will not keep it as a comment.
-/// Static text is fine — it is written verbatim either way.
-fn element_has_binding(element: &JSXElement<'_>) -> bool {
+/// Static text is fine — it is written verbatim either way. Shared with
+/// [`crate::ir::lower_route`] so the rule is one predicate, not two.
+pub(crate) fn element_has_binding(element: &JSXElement<'_>) -> bool {
     for attribute in &element.opening_element.attributes {
         if let JSXAttributeItem::Attribute(attribute) = attribute
             && matches!(
@@ -1490,7 +1596,25 @@ fn child_has_binding(child: &JSXChild<'_>) -> bool {
 
 /// The `RA014` for a binding inside a text-only element an island cannot place a
 /// marker in.
+///
+/// The message is [`marker_hostile_message`], shared with
+/// [`crate::ir::lower_route`] so the rule is one sentence, not two.
 fn marker_hostile_refusal(span: Span, tag: &str) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        (span.start, span.end),
+        marker_hostile_message(tag),
+    )
+}
+
+/// Why a binding inside `tag` cannot survive an island's marker scheme.
+///
+/// The two repairs offered are the only two that are **reachable**: static text,
+/// or a binding on a sibling element. Moving the binding into an attribute is not
+/// a repair — [`element_has_binding`] counts attribute bindings, so the whole
+/// element is refused again with the same words, and an agent following that fix
+/// loops forever.
+pub(crate) fn marker_hostile_message(tag: &str) -> String {
     let reason = match tag {
         "script" | "style" => {
             "the browser reads the contents of `<script>` and `<style>` as literal text, so the \
@@ -1505,15 +1629,10 @@ fn marker_hostile_refusal(span: Span, tag: &str) -> Diagnostic {
              walker does not reach"
         }
     };
-    Diagnostic::new(
-        Code::RA014,
-        (span.start, span.end),
-        format!(
-            "`<{tag}>` cannot contain a dynamic binding here: {reason}, so the island would wire \
-             the wrong node. Write the value as static text, or move it into an attribute on the \
-             element (`<{tag}>` with no children and a plain attribute), or bind it on a sibling \
-             element that holds normal content."
-        ),
+    format!(
+        "`<{tag}>` cannot contain a dynamic binding here: {reason}, so the island would wire the \
+         wrong node. Write the value as static text, or bind it on a sibling element that holds \
+         normal content — not on `<{tag}>`, because the binding is what the element cannot keep."
     )
 }
 
@@ -2242,5 +2361,179 @@ mod tests {
             check_jsx(program, static_src).is_empty(),
             "a static template may hold a binding in a text-only element"
         );
+    }
+
+    /// The marker-hostile fix must be **reachable**: applying it verbatim may not
+    /// land in another refusal. Moving the binding into an attribute is not a
+    /// repair — [`element_has_binding`] counts attribute bindings, so the whole
+    /// element is refused again with the same words. An agent follows that fix
+    /// forever. The only honest repairs are static text, or a sibling element.
+    #[test]
+    fn the_marker_hostile_fix_names_a_reachable_repair() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const u = signal(\"x\"); return <textarea value={u()}>static</textarea> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            !d[0].message.contains("into an attribute"),
+            "the fix sends the agent into a repair loop: {}",
+            d[0].message
+        );
+        assert!(
+            !d[0].message.contains("plain attribute"),
+            "the fix promises an attribute escape hatch that does not exist: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("sibling"),
+            "the fix does not name a reachable repair: {}",
+            d[0].message
+        );
+    }
+
+    /// Every tag the HTML parser only accepts under one parent, outside it. The
+    /// parser drops the element (and its content, including a binding marker) or
+    /// keeps the marker but re-parents it — either way the emitted `_a[k]` is
+    /// wrong, so the analysis must refuse the shape.
+    ///
+    /// Verified against parse5 8.0.1: `<td>`/`<th>` lose the cell but keep their
+    /// content in the enclosing element (so `_setAttr(_a[k].parentNode, …)` sets
+    /// the attribute on the *outer* element); `<tr>`, `<tbody>`, `<thead>`,
+    /// `<tfoot>`, `<caption>`, `<colgroup>`, and `<col>` are dropped with their
+    /// content; `<option>`/`<optgroup>`/`<figcaption>`/`<legend>`/`<summary>` are
+    /// kept but inert, so the page is not the markup the author wrote.
+    #[test]
+    fn a_tag_outside_its_required_ancestor_is_ra014() {
+        // (body, tag, required ancestor, the consequence in the user's terms)
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("<div><td>x</td></div>", "td", "tr", "enclosing element"),
+            ("<div><th>x</th></div>", "th", "tr", "enclosing element"),
+            (
+                "<div><tr><td>x</td></tr></div>",
+                "tr",
+                "table",
+                "drops the element",
+            ),
+            (
+                "<div><tbody></tbody></div>",
+                "tbody",
+                "table",
+                "drops the element",
+            ),
+            (
+                "<div><thead></thead></div>",
+                "thead",
+                "table",
+                "drops the element",
+            ),
+            (
+                "<div><tfoot></tfoot></div>",
+                "tfoot",
+                "table",
+                "drops the element",
+            ),
+            (
+                "<div><caption>c</caption></div>",
+                "caption",
+                "table",
+                "drops the element",
+            ),
+            (
+                "<div><colgroup></colgroup></div>",
+                "colgroup",
+                "table",
+                "drops the element",
+            ),
+            ("<div><col/></div>", "col", "table", "drops the element"),
+            (
+                "<div><option>a</option></div>",
+                "option",
+                "select",
+                "browsers render",
+            ),
+            (
+                "<div><optgroup></optgroup></div>",
+                "optgroup",
+                "select",
+                "browsers render",
+            ),
+            (
+                "<div><figcaption>c</figcaption></div>",
+                "figcaption",
+                "figure",
+                "browsers render",
+            ),
+            (
+                "<div><legend>l</legend></div>",
+                "legend",
+                "fieldset",
+                "browsers render",
+            ),
+            (
+                "<div><summary>s</summary></div>",
+                "summary",
+                "details",
+                "browsers render",
+            ),
+            // The route root has no ancestor at all, which is not a legal parent
+            // either: a root `<td>` leaves the marker's `parentNode` a document
+            // fragment, where `setAttribute` does not exist.
+            ("<td>x</td>", "td", "tr", "enclosing element"),
+            ("<tr><td>x</td></tr>", "tr", "table", "drops the element"),
+            ("<option>a</option>", "option", "select", "browsers render"),
+        ];
+
+        for (body, tag, required, consequence) in cases {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert_eq!(d.len(), 1, "{body}: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{body}");
+            assert!(
+                d[0].message.contains(&format!("`<{tag}>`")),
+                "{body}: names the tag: {}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains(&format!("`<{required}>`")),
+                "{body}: names the required ancestor: {}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains(consequence),
+                "{body}: states the consequence in the user's terms: {}",
+                d[0].message
+            );
+            assert!(
+                d[0].message.contains("Wrap the"),
+                "{body}: gives a reachable repair: {}",
+                d[0].message
+            );
+        }
+    }
+
+    /// Every legal nesting of the tags the required-ancestor rule governs stays
+    /// clean — the rule refuses a position, not a tag.
+    #[test]
+    fn the_legal_ancestors_stay_clean() {
+        for body in [
+            "<table><tbody><tr><td>x</td></tr></tbody></table>",
+            "<table><thead><tr><th>h</th></tr></thead></table>",
+            "<table><tfoot><tr><td>f</td></tr></tfoot></table>",
+            "<table><caption>c</caption></table>",
+            "<table><colgroup><col/></colgroup></table>",
+            "<select><option>a</option></select>",
+            "<select><optgroup><option>a</option></optgroup></select>",
+            "<figure><figcaption>c</figcaption></figure>",
+            "<details><summary>s</summary></details>",
+            "<fieldset><legend>l</legend></fieldset>",
+        ] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return {body} }}\n"
+            );
+            let d = check(&src);
+            assert!(d.is_empty(), "{body}: {d:?}");
+        }
     }
 }

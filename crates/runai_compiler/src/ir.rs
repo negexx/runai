@@ -55,8 +55,10 @@ use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
 use crate::analyze::jsx::{
-    BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR, dom_tag,
-    jsx_in_body_statements, jsx_outside_route_render, jsx_returns, jsx_spans, route_render,
+    BODY_JSX_CONSTRUCT, BODY_JSX_REPAIR, MARKER_HOSTILE, MODULE_JSX_CONSTRUCT, MODULE_JSX_REPAIR,
+    ancestor_refusal, dom_tag, element_has_binding, jsx_in_body_statements,
+    jsx_outside_route_render, jsx_returns, jsx_spans, marker_hostile_message, parent_child_refusal,
+    route_render, text_refusal,
 };
 use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
 use crate::diagnostic::{Code, Diagnostic};
@@ -286,7 +288,11 @@ pub fn lower_route(source: &str) -> Result<RouteIr, Vec<Diagnostic>> {
         )]);
     }
 
-    let tree = Lowerer { source: &stripped }.root(render.root)?;
+    let tree = Lowerer {
+        source: &stripped,
+        island: matches!(mode, Mode::Island),
+    }
+    .root(render.root)?;
 
     Ok(RouteIr {
         mode,
@@ -598,6 +604,12 @@ fn contains_start(span: Span, start: u32) -> bool {
 /// becomes JavaScript.
 struct Lowerer<'s> {
     source: &'s str,
+    /// Whether the route is an island, which decides the marker-hostile rule: a
+    /// `"use static"` template interpolates a string and never places a `<!>`
+    /// marker, so only an island can be broken by a binding in a text-only
+    /// element. `mode` is already in scope in [`lower_route`]; this carries it to
+    /// the walk rather than re-detecting it.
+    island: bool,
 }
 
 impl<'s> Lowerer<'s> {
@@ -670,20 +682,30 @@ impl<'s> Lowerer<'s> {
         // first; sharing the messages means a caller that skips analysis sees the
         // same words, not a second rule.
         if let Some(parent) = ancestors.last()
-            && let Some(message) = crate::analyze::jsx::parent_child_refusal(parent, &name)
+            && let Some(message) = parent_child_refusal(parent, &name)
         {
             return Err(vec![reparse_invariant(element.span, message)]);
         }
-        if let Some(message) = crate::analyze::jsx::ancestor_refusal(&name, ancestors) {
+        if let Some(message) = ancestor_refusal(&name, ancestors) {
             return Err(vec![reparse_invariant(element.span, message)]);
         }
-        if let Some(message) = crate::analyze::jsx::text_refusal(&name) {
+        if let Some(message) = text_refusal(&name) {
             let fostered = element.children.iter().any(|child| {
                 matches!(child, JSXChild::Text(text) if !text.value.as_str().trim().is_empty())
             });
             if fostered {
                 return Err(vec![reparse_invariant(element.span, message)]);
             }
+        }
+        // The marker-hostile rule, repeated here because `template_html` and
+        // `lower_route` are both `pub`: without it a caller could get a template
+        // whose marker count differs from `sites()`. Island-only, and the same
+        // predicate and message `check_jsx` uses.
+        if self.island && MARKER_HOSTILE.contains(&name.as_str()) && element_has_binding(element) {
+            return Err(vec![reparse_invariant(
+                element.span,
+                marker_hostile_message(&name),
+            )]);
         }
 
         let mut static_attrs: Vec<(String, String)> = Vec::new();
@@ -2373,6 +2395,21 @@ mod tests {
                 "\"use island\"\nexport default function P() { const header = <h1>x</h1>; return <p>{header}</p> }\n",
                 "JSX in a route body statement",
             ),
+            (
+                // A binding in a text-only element breaks the marker ordinal, and
+                // `mode` is in scope in `lower_route`; the refusal must not be
+                // analysis-only. `template_html` is `pub`, so a caller could
+                // otherwise get a template whose marker count differs from
+                // `sites()`.
+                "\"use island\"\nexport default function P() { const n = signal(0); return <div><script>{n()}</script></div> }\n",
+                "`<script>`",
+            ),
+            (
+                // A `<td>` outside `<tr>`: the parser keeps the marker but
+                // re-parents it, so the attribute would land on the enclosing div.
+                "\"use island\"\nexport default function P() { const n = signal(0); return <div><td class={n()}>x</td></div> }\n",
+                "`<td>`",
+            ),
         ] {
             let errs = crate::ir::lower_route(src).unwrap_err();
             assert_eq!(errs[0].code, Code::RA014, "{src}");
@@ -2380,6 +2417,37 @@ mod tests {
                 errs[0].message.contains(expected),
                 "{src}: the message must name the construct, got {:?}",
                 errs[0].message
+            );
+        }
+    }
+
+    /// `lower_route` refuses the marker-hostile and required-ancestor shapes with
+    /// the **same words** `check_jsx` reports. `template_html` and `lower_route`
+    /// are both `pub`, so this is a public path to a template whose marker count
+    /// differs from `sites()` unless lowering repeats the rules.
+    #[test]
+    fn lowering_repeats_the_rules_check_jsx_reports() {
+        use crate::analyze::jsx::check_jsx;
+        use crate::source::parse_tsx;
+
+        for src in [
+            "\"use island\"\nexport default function P() { const n = signal(0); return <script>{n()}</script> }\n",
+            "\"use island\"\nexport default function P() { const n = signal(0); return <textarea value={n()}>static</textarea> }\n",
+            "\"use island\"\nexport default function P() { const n = signal(0); return <div><td class={n()}>x</td></div> }\n",
+            "\"use island\"\nexport default function P() { return <div><tr><td>x</td></tr></div> }\n",
+            "\"use island\"\nexport default function P() { return <td>x</td> }\n",
+            "\"use island\"\nexport default function P() { return <div><li>x</li></div> }\n",
+        ] {
+            let alloc = oxc_allocator::Allocator::default();
+            let program = parse_tsx(&alloc, src).unwrap();
+            let analysis = check_jsx(program, src);
+            assert_eq!(analysis.len(), 1, "{src}: {analysis:?}");
+
+            let errs = crate::ir::lower_route(src).unwrap_err();
+            assert_eq!(errs[0].code, analysis[0].code, "{src}");
+            assert_eq!(
+                errs[0].message, analysis[0].message,
+                "{src}: lowering and analysis must report one refusal, not two"
             );
         }
     }
