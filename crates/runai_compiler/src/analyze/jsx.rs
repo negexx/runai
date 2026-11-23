@@ -590,6 +590,17 @@ pub(crate) struct RouteRender<'a> {
     /// which is why [`crate::analyze::reachable`] checks this region's *shape*
     /// and not just its references.
     pub params: &'a oxc_ast::ast::FormalParameters<'a>,
+    /// The scope cell of the route component itself, filled in by the semantic
+    /// pass.
+    ///
+    /// This is the one scope the emitted `render()` shares with the source: the
+    /// emitter copies the component body into it, so a name bound **here** is in
+    /// scope at every emitted call site. `var` is why the distinction matters — it
+    /// hoists to this scope from a nested block, a `for` init, or a `try`/`catch`,
+    /// while a block-scoped `const` stays in its block. The cell is read after the
+    /// caller's semantic build ([`crate::analyze::emitted_names`] does exactly
+    /// that), so it is carried as the cell rather than the resolved value.
+    pub scope_id: &'a std::cell::Cell<Option<oxc_semantic::ScopeId>>,
 }
 
 /// The JSX the default export returns, or `None` when there is no such export.
@@ -736,6 +747,7 @@ fn render_of_function<'a>(function: &'a Function<'a>) -> Option<RouteRender<'a>>
         body: Some(body),
         return_span: Some(returned),
         params: &function.params,
+        scope_id: &function.scope_id,
     })
 }
 
@@ -751,6 +763,7 @@ fn render_of_arrow<'a>(
                 body: Some(body),
                 return_span: Some(returned),
                 params: &arrow.params,
+                scope_id: &arrow.scope_id,
             })
         }
         concise => {
@@ -761,6 +774,7 @@ fn render_of_arrow<'a>(
                 body: None,
                 return_span: None,
                 params: &arrow.params,
+                scope_id: &arrow.scope_id,
             })
         }
     }

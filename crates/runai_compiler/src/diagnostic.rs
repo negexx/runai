@@ -173,35 +173,35 @@ impl Code {
             }
             Code::RA014 => {
                 "The parser accepted this file: this is a limitation of the compiler, not a \
-                 syntax error. It covers four families. A JSX construct this milestone cannot \
-                 lower (a component tag, a spread, a fragment root, and so on), where lowering \
-                 reports the construct instead of dropping it, because markup emitted without \
-                 part of a node is wrong in a way nothing reports. A module the emitted file \
-                 cannot resolve or write: an `import` or re-export of a module other than \
-                 `\"runai\"` has no bundler, a default or namespace import of `\"runai\"` is not a \
-                 form the client module emits, and `import x = require(…)` or `export =` is \
-                 rewritten by type stripping into `require`/`module.exports`, which an ES module \
-                 does not have — each route is emitted from its own file, so a second module \
-                 cannot be resolved or inlined. A re-export is refused even when its source is \
-                 `\"runai\"`, because the emitted module never carries one, so accepting it would \
-                 drop the statement silently. A `declare` statement is refused because type \
-                 stripping erases it before the route is emitted, so the binding it introduces \
-                 never exists in the generated module — a route file defines the values it names. \
-                 And a value the generated module cannot see — a \
-                 `\"runai\"` name or the route component's own name at module scope, in a \
+                 syntax error. It covers five families. A first is a JSX construct this milestone \
+                 cannot lower (a component tag, a spread, a fragment root, and so on), where \
+                 lowering reports the construct instead of dropping it, because markup emitted \
+                 without part of a node is wrong in a way nothing reports. That first family also \
+                 covers four emit-time shapes whose output would differ by mode or not parse: \
+                 children inside a void element, a duplicate attribute, an early `return` before \
+                 the route's JSX return, and an `async` or generator route component. A second is \
+                 a module the emitted file cannot resolve or write: an `import` or re-export of a \
+                 module other than `\"runai\"` has no bundler, a default or namespace import of \
+                 `\"runai\"` is not a form the client module emits, and `import x = require(…)` or \
+                 `export =` is rewritten by type stripping into `require`/`module.exports`, which \
+                 an ES module does not have — each route is emitted from its own file, so a second \
+                 module cannot be resolved or inlined. A re-export is refused even when its source \
+                 is `\"runai\"`, because the emitted module never carries one, so accepting it would \
+                 drop the statement silently. A third is a value the generated module cannot see — \
+                 a `\"runai\"` name or the route component's own name at module scope, in a \
                  component-body statement, or in a \
                  `\"use static\"` route's markup, whose prerender module has no imports and does \
                  not declare the component, or the route's own parameter there, which the \
                  prerender call supplies with nothing, or at module scope, where no emitter \
-                 declares it. A module-level declaration is *not* in \
-                 this family: module-scope statements are emitted above the component. Neither is \
-                 a component-body statement's own local, which is emitted inside the component. \
-                 The same first family also covers four emit-time shapes whose output would differ \
-                 by mode or not parse: children inside a void element, a duplicate attribute, an \
-                 early `return` before the route's JSX return, and an `async` or generator route \
-                 component. A fifth is the emitted module's own names: a declaration, export name, \
-                 or reference to `_esc`, `_attr`, or `render` is refused because the generated \
-                 module declares those itself."
+                 declares it. A module-level declaration is *not* in this family: module-scope \
+                 statements are emitted above the component. Neither is a component-body \
+                 statement's own local, which is emitted inside the component. A `declare` \
+                 statement is refused: it is the fourth family, because type stripping erases it \
+                 before the route is emitted, so the binding it introduces never exists in the \
+                 generated module — a route file defines the values it names. A fifth is the \
+                 emitted module's own names: a declaration, export name, or reference to `_esc`, \
+                 `_attr`, or `render` is refused because the generated module declares those \
+                 itself."
             }
         }
     }

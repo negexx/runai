@@ -27,10 +27,13 @@
 //!    render = …` is shape 1's declaration and 2's name in one statement, and one
 //!    row is enough;
 //! 3. a **reference** to a reserved name, in the markup, the body, or the module
-//!    level — but only when it resolves to the compiler's own helper, to a
-//!    module-level binding, or to the route component. A reference to an
-//!    ordinary nested-scope local (`items.map((render) => …)`) is legal
-//!    JavaScript shadowing the emitted module preserves.
+//!    level — but only when the reserved name is **in scope at the emitted call
+//!    site**: unresolved, declared at module scope, declared in the route
+//!    component's own function scope (the `var` case, including a `var` in a
+//!    nested block, a `for` init, or a `try`/`catch`), or the route component
+//!    itself. A reference to any deeper scope (`items.map((render) => …)`, a
+//!    nested function's local, a block `const`) is legal JavaScript shadowing the
+//!    emitted module preserves.
 //!
 //! # What is deliberately not refused
 //!
@@ -39,9 +42,10 @@
 //!   review round 2 proved;
 //! - **a member property** (`o.render`) or an **object key** (`{ render: 1 }`) —
 //!   neither is a binding, and refusing them would reject an ordinary page;
-//! - **a nested-scope local** named a reserved name — an arrow parameter, a
-//!   nested function's local, a block `const`. It shadows the helper only inside
-//!   its own callback, and the template's calls still reach the module-level one;
+//! - **a deeper-scope local** named a reserved name — an arrow parameter, a
+//!   nested function's local, a block `const`. Its nearest enclosing function is
+//!   not `render()`, so the template's call site cannot reach it, and the calls
+//!   still reach the module-level helper;
 //! - **a reserved name in a component module** (`_shell.tsx`, or a `.tsx` with no
 //!   route) — nothing is emitted from such a file, so there is no helper to
 //!   shadow. The same boundary [`crate::analyze::reachable`] draws.
@@ -89,6 +93,16 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
     let semantic = SemanticBuilder::new().build(program).semantic;
     let scoping = semantic.scoping();
 
+    // The one scope the emitted `render()` copy shares with the source: the route
+    // component's own function scope. A reference whose binding lives there is in
+    // scope at every emitted call site, because the emitter copies the body into
+    // `render()` and the template's calls sit at the end of that same function.
+    // This is why `var` is the sharp case: it hoists to this scope from anywhere
+    // in the body — a nested block, a `for` init, a `try`/`catch` — while the
+    // block-scoped `const` beside it stays in its block and does not reach the
+    // call site at all.
+    let route_scope = render.scope_id.get();
+
     let mut diagnostics = Vec::new();
 
     // (1) Declarations in the two emitted scopes: an emitted module statement
@@ -105,8 +119,9 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
 
     // (3) References in the three emitted regions.
     //
-    // A reference is refused only when it resolves to something the emitted module
-    // cannot have as a distinct binding:
+    // A reference is refused when the reserved name is **in scope at the emitted
+    // call site**, which is the template's `${_esc(…)}` / `${_attr(…)}` and the
+    // module-level `render`:
     //
     // - **unresolved** (`symbol` is `None`): the name is declared nowhere, so in
     //   the template it resolves to the compiler's own helper or to `render()`.
@@ -114,32 +129,43 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
     // - **module scope** (the symbol's declaration scope is the root): a module
     //   binding named `render` collides with `export function render()`, and one
     //   named `_esc` shadows the helper for every statement and for the template.
-    // - **the route component or its parameter** when that name is reserved.
+    // - **the route component's own function scope**: the emitter copies the body
+    //   into `render()`, so a binding in that scope is in scope at the call site.
+    //   This is the `var` case — a `var` hoists here from a nested block, a `for`
+    //   init, or a `try`/`catch`. It is *not* "declared at root": round 1's
+    //   predicate, which missed this case and emitted a module that rendered
+    //   `<p>hijacked</p>`.
+    // - **the route component itself** when its name is reserved: the emitters
+    //   rebuild it, so the name is not a binding in the artifact. The row for that
+    //   case is `analyze::reachable`'s; this walk lands on the module-scope arm
+    //   above and `analyze` keeps one row per span.
     //
-    // A reference that resolves to a binding declared in a **nested** scope inside
-    // the component — an arrow parameter, a local of a nested function, a block's
-    // `const` — is ordinary JavaScript shadowing of a legal local, and the emitted
-    // module preserves it: the template's own `${_esc(…)}` still reaches the
-    // module-level helper, because the shadow lives only inside that callback.
-    // Refusing it would reject `<p>{items.map((render) => render.name)}</p>`, which
-    // is why [`reference_collision`] narrows on the scope rather than the name
-    // alone.
+    // A reference that resolves to any **other** scope — an arrow parameter, a
+    // local of a nested function, a block's `const` — is ordinary JavaScript
+    // shadowing of a legal local, and the emitted module preserves it: the
+    // template's own `${_esc(…)}` still reaches the module-level helper, because
+    // the shadow's nearest enclosing function is not `render()`'s. Refusing it
+    // would reject `<p>{items.map((render) => render.name)}</p>`, which is why
+    // [`reference_collision`] asks "is it in scope at the call site" rather than
+    // "is it declared at root".
     for reference in references(scoping, |visitor| visitor.visit_expression(render.root)) {
-        if let Some(row) = reference_collision(scoping, &reference, &route, reserved) {
+        if let Some(row) = reference_collision(scoping, &reference, &route, route_scope, reserved) {
             diagnostics.push(row);
         }
     }
     if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
         for statement in emitted_body_statements(body, return_span) {
             for reference in references(scoping, |visitor| visitor.visit_statement(statement)) {
-                if let Some(row) = reference_collision(scoping, &reference, &route, reserved) {
+                if let Some(row) =
+                    reference_collision(scoping, &reference, &route, route_scope, reserved)
+                {
                     diagnostics.push(row);
                 }
             }
         }
     }
     for reference in emitted_reference_roots(program, &route, scoping) {
-        if let Some(row) = reference_collision(scoping, &reference, &route, reserved) {
+        if let Some(row) = reference_collision(scoping, &reference, &route, route_scope, reserved) {
             diagnostics.push(row);
         }
     }
@@ -147,17 +173,30 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
     diagnostics
 }
 
-/// `RA014` for `reference` if it collides with a reserved name, or `None` when it
-/// is an ordinary shadow the emitted module preserves.
+/// `RA014` for `reference` if it names something in scope at the emitted call
+/// site, or `None` when it is an ordinary shadow the emitted module preserves.
 ///
-/// The three refused shapes are documented on the call site. The distinction is
-/// the **scope** the reference resolves to: a binding declared in the root scope
-/// is one the emitter would also declare or merge, while a binding declared in a
-/// nested scope is a local the emitted function keeps.
+/// The predicate is "is the reserved name in scope where `render()` calls its
+/// helpers", not "is it declared at root":
+///
+/// - an unresolved name resolves to the emitter's own helper — refused;
+/// - a binding in the module scope is one the emitter also writes — refused;
+/// - a binding in the route component's own function scope is in scope at the
+///   call site, because the emitter copies the body there — refused. This is the
+///   `var` arm: `var` hoists to this scope from nested blocks, `for` inits, and
+///   `try`/`catch`;
+/// - a binding in any deeper scope (an arrow parameter, a nested function's
+///   local, a block `const`) is not in scope at the call site — allowed.
+///
+/// A reserved-named route component is declared at module scope, so it lands in
+/// the module-scope arm here; the row an agent sees for it is
+/// [`crate::analyze::reachable`]'s, which owns the "the component is not a
+/// binding in the artifact" wording, and `analyze` dedupes one problem to one row.
 fn reference_collision(
     scoping: &oxc_semantic::Scoping,
     reference: &crate::analyze::reachable::Reference,
     route: &crate::analyze::ComponentInfo<'_>,
+    route_scope: Option<oxc_semantic::ScopeId>,
     reserved: &[&str],
 ) -> Option<Diagnostic> {
     if !reserved.contains(&reference.name.as_str()) {
@@ -175,11 +214,13 @@ fn reference_collision(
         ));
     };
 
-    let declaration = scoping.symbol_span(symbol);
     let declaration_scope = scoping.symbol_scope_id(symbol);
 
     // Module scope: a binding there is one the emitter would also declare
-    // (`render`) or one that shadows a helper for the whole module (`_esc`).
+    // (`render`) or one that shadows a helper for the whole module (`_esc`). A
+    // route component named a reserved name is also declared here; its row is
+    // `analyze::reachable`'s, which owns the "the component is not a binding in
+    // the artifact" wording, and `analyze` dedupes one problem to one row.
     if declaration_scope == scoping.root_scope_id() {
         return Some(reference_refusal(
             reference.span,
@@ -189,21 +230,22 @@ fn reference_collision(
         ));
     }
 
-    // The route component's own name is excluded from `module_statements` and the
-    // emitters rebuild it, so a reserved-named component is still a collision with
-    // the emitted `render()`.
-    if declaration.start == route.name_span.0 && declaration.end == route.name_span.1 {
+    // The route component's own function scope: the emitter copies the body into
+    // `render()`, so a binding here is in scope at the template's call site. A
+    // `var` lands here from any depth, which is exactly the defect this arm
+    // closes.
+    if Some(declaration_scope) == route_scope {
         return Some(reference_refusal(
             reference.span,
             &reference.name,
-            ShadowKind::RouteComponent,
+            ShadowKind::BodyScope,
             route,
         ));
     }
 
     // Any other nested-scope binding is an ordinary local the emitted function
-    // keeps: it shadows the reserved name only inside its own callback/block, and
-    // the template's calls still reach the module-level helper.
+    // keeps: its nearest enclosing function is not `render()`, so the template's
+    // calls still reach the module-level helper.
     None
 }
 
@@ -439,7 +481,7 @@ fn declaration_refusal(span: (u32, u32), name: &str) -> Diagnostic {
 /// - [`ShadowKind::Undeclared`]: the name is declared nowhere, so in the emitted
 ///   template it resolves to the compiler's own helper and renders its source
 ///   text. This is the silent case the rule exists for.
-/// - [`ShadowKind::ModuleScope`] and [`ShadowKind::RouteComponent`]: the name is
+/// - [`ShadowKind::ModuleScope`] and [`ShadowKind::BodyScope`]: the name is
 ///   declared here, so the declaration row already reports the rename; this row
 ///   says the *use* names the shadow, so the agent updates it too rather than only
 ///   the declaration.
@@ -463,11 +505,11 @@ fn reference_refusal(
              This use names a module-level binding the file declares, which collides with the \
              emitted module's own `{name}`. Rename it here and at its declaration.",
         ),
-        ShadowKind::RouteComponent => format!(
+        ShadowKind::BodyScope => format!(
             "`{name}` is one of the names the generated module declares for itself (`{names}`). \
-             This use names the route component itself, which the emitters rebuild rather than \
-             copy, so `{name}` is not a binding in the artifact. Rename the component here and at \
-             its declaration.",
+             This use names a binding the route body declares, and the body is copied into \
+             `render()`, so `{name}` is in scope at the generated call site and shadows the \
+             module's own `{name}` there. Rename the body binding here and at its declaration.",
         ),
     };
     Diagnostic::new(Code::RA014, span, message)
@@ -485,9 +527,10 @@ enum ShadowKind {
     /// Declared at the file's module scope, where the emitter also declares
     /// `render` and its helpers.
     ModuleScope,
-    /// Declared as the route component, which the emitters rebuild from `name`
-    /// and `statements` rather than copy.
-    RouteComponent,
+    /// Declared in the route component's own function scope — the scope the
+    /// emitter copies into `render()`. A `var` hoists here from a nested block, a
+    /// `for` init, or a `try`/`catch`, so the emitted call site reaches it.
+    BodyScope,
 }
 
 #[cfg(test)]
@@ -600,6 +643,95 @@ mod tests {
             d.iter().any(|row| row.code == Code::RA014),
             "an undeclared `render` resolves to the emitted `render()`: {d:?}"
         );
+    }
+
+    /// A `var` in a **nested block** of the route body is hoisted to the
+    /// component's own function scope — the scope the emitter copies into
+    /// `render()` — so the template's `_esc(…)` reaches it. Round 1 judged a
+    /// reference by "is its symbol declared at module scope", which is the wrong
+    /// question for `var`: this emitted a module that rendered `<p>hijacked</p>`
+    /// with no diagnostic, because the nested block is not module scope.
+    ///
+    /// The predicate is now "is the reserved name in scope at the emitted call
+    /// site", i.e. does the reference resolve to a binding whose nearest
+    /// enclosing function is the route component itself.
+    #[test]
+    fn a_var_in_a_nested_block_that_reaches_the_call_site_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const on = true; if (on) { var _esc = (v: unknown) => \"hijacked\"; }\n  return <p>{_esc(\"x\")}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        let row = d
+            .iter()
+            .find(|row| row.code == Code::RA014 && row.message.contains("_esc"))
+            .unwrap_or_else(|| panic!("a hoisted `var` shadows the escaper: {d:?}"));
+        assert!(
+            row.message.contains("body declares"),
+            "the message names the body binding: {}",
+            row.message
+        );
+        assert_eq!(
+            &src[row.span.0 as usize..row.span.1 as usize],
+            "_esc",
+            "the span is the hijacking call: {row:?}"
+        );
+    }
+
+    /// A `for (var …)` initialiser hoists to the function scope just as a nested
+    /// block does. This shape emitted a module that threw at build time
+    /// (`TypeError: _esc is not a function`) while every test in the crate passed.
+    #[test]
+    fn a_var_in_a_for_initialiser_that_reaches_the_call_site_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  for (var _esc = 1; false;) {}\n  return <p>{_esc(\"x\")}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter()
+                .any(|row| row.code == Code::RA014 && row.message.contains("body declares")),
+            "a `var` in a `for` init reaches the call site: {d:?}"
+        );
+    }
+
+    /// A block-scoped `const` in a nested block does **not** reach the call site:
+    /// in the emitted template the reference resolves to nothing, which is the
+    /// silent-helper case the round-1 message already covers. Refusing it stays
+    /// correct, and the reason is the reference, not the declaration.
+    #[test]
+    fn a_nested_block_const_that_does_not_reach_the_call_site_is_still_refused() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  { const _esc = 1; }\n  return <p>{_esc(\"x\")}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter()
+                .any(|row| row.code == Code::RA014
+                    && row.message.contains("nothing in `P` declares it")),
+            "the reference resolves to nothing at the call site: {d:?}"
+        );
+    }
+
+    /// A `var` inside a **nested function** never reaches the emitted call site:
+    /// its nearest enclosing function is that nested function, so the emitted
+    /// module's `_esc` is untouched. Nothing in the markup names it, so the file
+    /// is clean. This is the guard that keeps the hoisting rule from refusing
+    /// every helper that happens to use the name.
+    #[test]
+    fn a_var_in_a_nested_function_that_nothing_references_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  function f() { var _esc = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a nested function's local never reaches render()'s call site: {d:?}"
+        );
+    }
+
+    /// The route component always names something in the emitted module: the
+    /// emitters rebuild it as `export function render()`, so a component named
+    /// `render` is legal. The row an agent sees for a reserved-named component is
+    /// `reachable`'s, which owns the "the component is not a binding in the
+    /// artifact" wording; `emitted_names` must not add a second row for the same
+    /// span.
+    #[test]
+    fn a_reserved_named_route_component_is_named_by_the_reachable_rule() {
+        let src = "\"use static\"\nexport default function render(props: Record<never, never>) { return <p>{render.name}</p> }\n";
+        assert!(crate::analyze::analyze(src, "src/routes/about.page.tsx")
+            .iter()
+            .any(|row| row.code == Code::RA014 && row.message.contains("route's own component")));
     }
 
     /// A component module is not emitted by this milestone, so there is no helper

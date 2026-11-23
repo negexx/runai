@@ -244,18 +244,29 @@ mod tests {
     }
 
     /// A `signal` in a static route, through a non-page path, must not slip past
-    /// `RA010` either — the same gate the registered-name test above covers, on
-    /// the other page-only rule.
+    /// `RA010` either — the same gate the reserved-name test above covers, on the
+    /// other page-only rule. Asserting only `is_err()` would pass on the path
+    /// refusal alone, so this asserts the *path* refusal is what answered: the
+    /// signal never reached `analyze`, because the wrapper stopped first.
     #[test]
     fn a_signal_does_not_emit_through_a_non_page_path() {
         let src = format!(
             "\"use static\"\nimport {{ signal }} from \"runai\"\n{P} {{ const n = signal(0); return <p>{{n()}}</p> }}\n"
         );
-        let result = emit_prerender_checked(&src, "about.tsx");
+        let diagnostics =
+            emit_prerender_checked(&src, "about.tsx").expect_err("a non-page path must not emit");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let row = &diagnostics[0];
+        assert_eq!(row.code, Code::RA014);
         assert!(
-            result.is_err(),
-            "a non-page path must not emit: {:?}",
-            result.ok()
+            row.message.contains("not a page file") && row.message.contains("about.tsx"),
+            "the path gate answers, naming the path: {:?}",
+            row.message
+        );
+        assert!(
+            row.message.contains(".page.tsx"),
+            "the repair names the page suffix: {:?}",
+            row.message
         );
     }
 }

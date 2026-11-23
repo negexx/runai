@@ -61,9 +61,9 @@ fn why(code: Code) -> &'static str {
              decision that controls the 0 KB guarantee."
         }
         Code::RA014 => {
-            "The code covers four families, and each would be wrong silently rather than loudly. \
-             \
-             The JSX constructs it refuses are a capitalized tag or member-expression tag \
+            "The code covers five families, and each would be wrong silently rather than loudly.\
+             \n\n\
+             The first is the JSX constructs it refuses: a capitalized tag or member-expression tag \
              (component inlining comes with a later plan), the runtime's own \
              `<For>`/`<Show>`/`<When>` primitives (their lowering comes with a later plan and is \
              not component inlining), a namespaced tag, a `<this>` tag, JSX inside a `{…}` \
@@ -73,69 +73,70 @@ fn why(code: Code) -> &'static str {
              copy JSX into a JavaScript module where it cannot parse. Module-level JSX is refused \
              only in a file that has a route: a `.tsx` file with no default export is a component \
              module, and a helper there may legitimately hold module-level JSX. The plan's later \
-             milestones lift these one slice at a time. \
-             \
-             Four emit-time shapes join that family because the artifact they would produce is \
-             wrong rather than merely unsupported: children inside a void element, which the HTML \
-             parser would move outside it; a duplicate attribute, which a prerendered page would \
-             resolve to the first value and a hydrated island to the last; an early `return` \
-             before the route's JSX return, which `render()` cannot carry because it returns one \
-             string; and an `async` or generator route component, which both render modes refuse \
-             because they call the component synchronously and use its return value. It is \
-             specifically a generator route component and an `async` one that are refused for the \
-             same reason: an iterator or a promise is not the markup the emitter inserts. \
-             \
-             A fifth name-based family is the generated module's own **reserved** names: \
-             `_esc`, `_attr`, and `render`. A declaration, export name, or reference to one of \
-             them is refused because the emitted module declares those names itself, so a route \
-             binding would shadow a helper the template calls or export `render` twice. \
-             \
-             \
-             An import or re-export the emitted module cannot resolve or write is refused for one \
-             of three reasons. A module other than `\"runai\"` has no bundler yet: each route is \
-             emitted from its own file's text, so a second module can be neither resolved nor \
-             inlined, and the emitted module would not load. The same holds for a re-export \
-             (`export … from \"./x\"`, `export * from \"./x\"`): the emitted file writes one \
-             import or none, so the statement names a module nothing resolves. This lifts when \
-             bundling lands. A re-export whose source *is* `\"runai\"` is refused for a different \
-             reason — the statement is never emitted, so accepting it would drop the author's \
-             statement with no diagnostic — and the repair is `import { owner } from \
+             milestones lift these one slice at a time. Four emit-time shapes join this same first \
+             family because the artifact they would produce is wrong rather than merely \
+             unsupported: children inside a void element, which the HTML parser would move outside \
+             it; a duplicate attribute, which a prerendered page would resolve to the first value \
+             and a hydrated island to the last; an early `return` before the route's JSX return, \
+             which `render()` cannot carry because it returns one string; and an `async` or generator \
+             route component: both modes call the component synchronously and use its return \
+             value, so a generator route component's iterator and an `async` one's promise are not \
+             the markup either mode inserts.\
+             \n\n\
+             An import or re-export the emitted module cannot resolve or write is the second family, \
+             refused for one of three reasons. A module other than `\"runai\"` has no bundler yet: \
+             each route is emitted from its own file's text, so a second module can be neither \
+             resolved nor inlined, and the emitted module would not load. The same \
+             holds for a re-export (`export … from \"./x\"`, `export * from \"./x\"`): the emitted \
+             file writes one import or none, so the statement names a module nothing resolves. \
+             This lifts when bundling lands. A re-export whose source *is* `\"runai\"` is refused \
+             for a different reason — the statement is never emitted, so accepting it would drop \
+             the author's statement with no diagnostic — and the repair is `import { owner } from \
              \"runai\"`, then use or export the written binding. A default (`import runai from \
-             \"runai\"`) or namespace (`import * as \
-             runai from \"runai\"`) import of `\"runai\"` is refused because the island emitter \
-             writes exactly one import, merging the route's named specifiers only; the repair is \
-             to rewrite the declaration as named imports. And the CommonJS spellings TypeScript \
-             allows — `import x = require(\"./x\")` and `export = x` — are refused because type \
-             stripping rewrites them to `require(…)` and `module.exports = …`, which an ES module \
-             does not have. `import type` — and the inline `import { type X }` form — is exempt, \
-             because types are stripped and leave no runtime import behind. \
-             \
+             \"runai\"`) or namespace (`import * as runai from \"runai\"`) import of `\"runai\"` is \
+             refused because the island emitter writes exactly one import, merging the route's \
+             named specifiers only; the repair is to rewrite the declaration as named imports. \
+             And the CommonJS spellings TypeScript allows — `import x = require(\"./x\")` and \
+             `export = x` — are refused because type stripping rewrites them to `require(…)` and \
+             `module.exports = …`, which an ES module does not have. `import type` — and the \
+             inline `import { type X }` form — is exempt, because types are stripped and leave no \
+             runtime import behind.\
+             \n\n\
              The third family is a value the generated module genuinely cannot see, and it has \
              two members only. A `\"runai\"` name, or the route component's own name, used at \
              module scope, in a component-body statement, or in a `\"use static\"` route's markup \
              is refused because the prerender module contains no imports and does not declare the \
-             component, so the repair is the \
-             directive, `\"use island\"`. The route's own parameter in a `\"use static\"` route is \
-             refused because `render()` takes no arguments, so `{props}` or `const x = props` \
-             would be `undefined` at \
-             build time; at **module scope** it is refused in an island too, because no emitter \
-             declares the parameter there either. A `declare` statement is the fourth family: it \
-             is erased before emission, so the binding it introduces never exists in the generated \
-             module, and a route file cannot declare a binding it does not define. A module-level \
-             declaration is deliberately **not** in this family: \
+             component, so the repair is the directive, `\"use island\"`. The route's own parameter \
+             in a `\"use static\"` route is refused because `render()` takes no arguments, so \
+             `{props}` or `const x = props` would be `undefined` at build time; at **module scope** \
+             it is refused in an island too, because no emitter declares the parameter there \
+             either. A module-level declaration is deliberately **not** in this family: \
              module-scope statements are copied into the emitted module above the component (design \
              §7.6 expects module-level state — \"module-scope signals are per-island too, since \
              each island is its own module instance\"), so a module-level `const` the markup names \
              is reachable. A component-body statement's own local is not in this family either: \
-             the statement is copied into the component, so the local exists there. \
-             \
+             the statement is copied into the component, so the local exists there.\
+             \n\n\
+             A `declare` statement is the fourth family: it is erased before emission, so the \
+             binding it introduces never exists in the generated module, and a route file cannot \
+             declare a binding it does not define.\
+             \n\n\
              The parameter list itself is a **shape** the emitters rebuild rather than copy: both \
              write the component as `function <Name>(props)`, so a default, a destructuring \
              pattern, a rest parameter, or a different name is dropped, and everything it binds \
              does not exist in the artifact. That is why `props: P = owner` is refused in an \
              island where `owner` is otherwise a real name — the defect is the dropped signature, \
-             not the reference. \
-             \
+             not the reference.\
+             \n\n\
+             The fifth family is the generated module's own **reserved** names: `_esc`, `_attr`, \
+             and `render`. A declaration, export name, or reference to one of them is refused \
+             because the emitted module declares those names itself, so a route binding would \
+             shadow a helper the template calls or export `render` twice. A `var` makes this \
+             sharper than a name scan suggests: it hoists to the route body's own function scope, \
+             which is the scope the emitter copies into `render()`, so a `var` in a nested block, \
+             a `for` init, or a `try`/`catch` reaches the template's call site even though it is \
+             not written at the top of the body.\
+             \n\n\
              An attribute with an empty expression (`name={}`) is deliberately **not** on this \
              list: that is a parse error, reported as `RA007`, not valid syntax waiting for a later \
              milestone."
@@ -265,6 +266,35 @@ mod tests {
             why.contains(RA009_CONSEQUENCE),
             "the shared sentence is missing from the skill: {why}"
         );
+    }
+
+    /// `RA014`'s prose counts its families, and the count has to match the number
+    /// it lists. Round 1 left it saying "four families" and then naming a
+    /// "fifth", and the fifth clause came before the third and fourth — a linear
+    /// reader met the ordinal out of order, which is the kind of prose an agent
+    /// triages on. Both texts now say five and name the fifth last.
+    #[test]
+    fn ra014_counts_and_orders_its_five_families() {
+        for (what, text) in [
+            ("explain", Code::RA014.explain().to_string()),
+            ("skill", skill_body(Code::RA014)),
+        ] {
+            assert!(text.contains("five families"), "{what}: {text}");
+            assert!(!text.contains("four families"), "{what}: {text}");
+            let third = text
+                .find("third")
+                .unwrap_or_else(|| panic!("{what}: no third: {text}"));
+            let fourth = text
+                .find("fourth")
+                .unwrap_or_else(|| panic!("{what}: no fourth: {text}"));
+            let fifth = text
+                .find("fifth")
+                .unwrap_or_else(|| panic!("{what}: no fifth: {text}"));
+            assert!(
+                third < fifth && fourth < fifth,
+                "{what}: the fifth clause must follow the third and fourth: {text}"
+            );
+        }
     }
 
     /// Task 15 ships this body to users, and the RA014 skill must say which
