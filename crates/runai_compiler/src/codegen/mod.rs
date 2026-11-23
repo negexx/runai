@@ -1,8 +1,10 @@
 //! Code generation: from a lowered route to the module a build writes.
 //!
-//! Two emitters exist across this milestone's tasks: [`prerender`] for a
-//! `"use static"` route, and the island emitter for `"use island"`. Only the
-//! prerender one is here.
+//! Two emitters exist: [`prerender`] for a `"use static"` route, and [`client`]
+//! for a `"use island"` route. The prerender module is self-contained with no
+//! imports; the island module imports the runtime from a URL and mounts into
+//! `#app`, addressing its bindings by marker ordinal rather than by an index path
+//! (see [`client`]'s module docs for why).
 //!
 //! # The checked wrappers are the public API, and that is a deliberate ruling
 //!
@@ -16,14 +18,20 @@
 //! emitter name that does not end in `_checked` would be a path from a source
 //! file to an artifact with no rule pass in between.
 
+pub(crate) mod client;
 pub(crate) mod prerender;
 
-use crate::analyze::entry::analyze;
+use oxc_allocator::Allocator;
+
+use crate::analyze::entry::{analyze, is_page};
+
+use crate::codegen::client::emit_client;
 use crate::codegen::prerender::emit_prerender;
 use crate::diagnostic::{Code, Diagnostic, Severity};
 use crate::ir::lower_route;
-use crate::source::Mode;
+use crate::source::{Mode, parse_tsx};
 
+pub use client::template_html;
 pub use prerender::template_literal_body;
 
 /// The prerender module for one route file, or the diagnostics that stop it.
@@ -104,6 +112,217 @@ pub fn emit_prerender_checked(source: &str, path: &str) -> Result<String, Vec<Di
         )]);
     }
     Ok(emit_prerender(&route))
+}
+
+/// The import list the island module for `source` needs: every `"runai"` name the
+/// file declares, merged with the helpers the artifact calls, sorted and deduped.
+///
+/// This is the one place the list is computed, and it is deliberately *not* inside
+/// [`emit_client`]: the emitter sees only the [`RouteIr`](crate::ir::RouteIr), and
+/// the IR cannot see an import that **only a module statement** uses. A route like
+///
+/// ```tsx
+/// import { signal, effect } from "runai"
+/// const start = signal(5); effect(() => { console.log(start()) })
+/// ```
+///
+/// names `effect` in a module statement and nowhere in the markup, so a
+/// markup-driven list would drop it and the module would throw `ReferenceError` at
+/// load — Task 9's cross-task risk coming due. So the list is merged from
+/// [`runai_imports`] on the **stripped** program — every named specifier the file
+/// declares, whether or not the markup uses it — plus the helpers the artifact
+/// needs (`mount`, `template`, and the used subset of `_setText`/`_setAttr`/`_on`).
+///
+/// # Errors
+///
+/// The full diagnostic list from [`analyze`], located, when the file has errors — the
+/// same list `runai check` reports, so a caller cannot compute imports for a file it
+/// would not emit.
+pub fn client_imports(source: &str) -> Result<Vec<String>, Vec<Diagnostic>> {
+    let stripped = crate::strip::strip_types(source)?;
+    // `analyze` is the gate; a file it refuses gets its diagnostics, not an import
+    // list. It runs on the original source so its spans are the agent's own.
+    // `client_imports` has no path argument (the brief's signature), so the page
+    // gate is the checked wrapper's; here the rules are the file-level ones.
+    let diagnostics = analyze_source(source);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        return Err(diagnostics);
+    }
+
+    let alloc = Allocator::default();
+    let program = parse_tsx(&alloc, &stripped)?;
+    let mut names = import_specifiers(program);
+    if let Ok(route) = lower_route(source) {
+        extend_helpers(&mut names, &route.tree);
+    }
+    Ok(names)
+}
+
+/// Every `"runai"` import specifier the module writes, as **specifier text**
+/// (`owner as who`, or `signal`), plus the always-present `mount` and `template`.
+///
+/// Sorted and deduped. This is the text of the one `import { … }` statement, not
+/// the set of names in scope: an alias's *local* name is what a declaration
+/// collides with, and [`island_reserved_names`] uses that instead. Both read the
+/// same specifier list, so the import statement and the reserved set cannot
+/// disagree about which aliases exist.
+pub(crate) fn import_specifiers(program: &oxc_ast::ast::Program<'_>) -> Vec<String> {
+    let mut names: Vec<String> = crate::analyze::signals::runai_specifiers(program)
+        .into_iter()
+        .filter(|(_, named)| *named)
+        .map(|(specifier, _)| {
+            let (imported, local) = crate::analyze::signals::named_specifier_names(specifier);
+            if imported == local {
+                imported
+            } else {
+                format!("{imported} as {local}")
+            }
+        })
+        .collect();
+    names.push("mount".to_string());
+    names.push("template".to_string());
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The names an island module binds that a route file's own declaration would
+/// collide with, for [`crate::analyze::emitted_names`].
+///
+/// [`crate::ir::ISLAND_LOCALS`] (the emitter's own `_c`, `_a`, `_el`, `_t0`) plus
+/// every **local** name the module imports — `who` for `import { owner as who }`,
+/// because that is the binding in scope, not `owner` — plus the tree-dependent
+/// helpers the artifact calls. Sorted and deduped.
+///
+/// It does **not** run [`analyze`]; [`crate::analyze::entry`] calls it from inside
+/// the analysis pass, so a nested gate would recurse forever. The parse is of the
+/// typed `program` the caller already holds, and the helper extension lowers the
+/// source once — the price of asking "which helpers does the artifact actually
+/// use" rather than reserving a superset.
+pub(crate) fn island_reserved_names(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+) -> Vec<String> {
+    let mut names: Vec<String> = crate::ir::ISLAND_LOCALS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    for (specifier, named) in crate::analyze::signals::runai_specifiers(program) {
+        if named {
+            let (_, local) = crate::analyze::signals::named_specifier_names(specifier);
+            names.push(local);
+        }
+    }
+    names.push("mount".to_string());
+    names.push("template".to_string());
+    if let Ok(route) = lower_route(source) {
+        for helper in client::used_helpers(&route.tree) {
+            names.push(helper.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Append the tree-dependent helpers ([`client::used_helpers`]) to `names`, keeping
+/// it sorted and deduped.
+pub(crate) fn extend_helpers(names: &mut Vec<String>, tree: &crate::ir::IrNode) {
+    for helper in client::used_helpers(tree) {
+        names.push(helper.to_string());
+    }
+    names.sort();
+    names.dedup();
+}
+
+/// The island module for one route file, or the diagnostics that stop it.
+///
+/// The public entry point for a `"use island"` page, mirroring
+/// [`emit_prerender_checked`]: it refuses a path that is not a page, runs
+/// [`analyze`] next (the same list `runai check` reports), refuses a mode that is
+/// not [`Mode::Island`], and only then computes the import list and emits.
+///
+/// # Why the path is checked first
+///
+/// [`analyze`] applies the page-only rules — `RA010`, the reserved-name rule, and
+/// the reachability rule — only when [`is_page`] says the path names a route file.
+/// Folded over a non-page path, this emitter would write an artifact from a file the
+/// analysis deliberately treated as a component module, with none of those gates.
+/// Refusing the path keeps the page boundary as the one definition of "route file".
+///
+/// # Why the mode is checked here
+///
+/// A `"use static"` page is [`emit_prerender_checked`]'s. This module would import
+/// the runtime and mount into `#app` — a JavaScript island for a route that must
+/// ship zero bytes of it. `analyze` accepts a static file (nothing about it is an
+/// error in static mode), so the mode is the one refusal `analyze` cannot make.
+///
+/// # Errors
+///
+/// The full diagnostic list from [`analyze`], plus a path refusal when the file is
+/// not a page and a `Mode` refusal when the route is static. Both are located.
+pub fn emit_client_checked(
+    source: &str,
+    path: &str,
+    runtime_url: &str,
+) -> Result<String, Vec<Diagnostic>> {
+    if !is_page(path) {
+        return Err(vec![located(
+            Diagnostic::new(
+                Code::RA014,
+                (0, 0),
+                format!(
+                    "`{path}` is not a page file: the island emitter writes route files only, \
+                     and the rules a route owes (a mode, the reserved names, the reachable \
+                     values) apply to a page. Give the file a `.page.tsx` name that does not \
+                     start with `_`, or check it as a component module with `runai check`."
+                ),
+            ),
+            source,
+            path,
+        )]);
+    }
+
+    let diagnostics = analyze(source, path);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        return Err(diagnostics);
+    }
+    let route = lower_route(source)?;
+    if route.mode != Mode::Island {
+        return Err(vec![located(
+            Diagnostic::new(
+                Code::RA014,
+                (0, 0),
+                format!(
+                    "`{path}` is a \"use static\" route: the island emitter writes island routes \
+                     only, and this module would import the runtime and mount JavaScript for a \
+                     route that must ship none. Change line 1 to \"use island\", or emit it with \
+                     `emit_prerender_checked`."
+                ),
+            ),
+            source,
+            path,
+        )]);
+    }
+
+    let imports = client_imports(source)?;
+    Ok(emit_client(&route, runtime_url, &imports))
+}
+
+/// [`analyze`] without a path.
+///
+/// `client_imports` takes no path (the brief's signature), and the page-only rules
+/// are gated on [`is_page`]. Called with no path, [`analyze`] would fold those away,
+/// which is correct here: `client_imports` is not the gate — [`emit_client_checked`]
+/// is, and it passes the real path to [`analyze`] itself. This helper exists only so
+/// `client_imports` still refuses a file whose *file-level* rules (parse, JSX,
+/// imports, signals) fail, rather than computing imports for a file that will not be
+/// emitted.
+fn analyze_source(source: &str) -> Vec<Diagnostic> {
+    // A page-shaped path so the page rules also apply when the caller reached us
+    // directly; a real path only ever *adds* refusals, never removes one, and this
+    // function is not the gate.
+    analyze(source, "route.page.tsx")
 }
 
 /// `diagnostic` located against `source` and `path`.

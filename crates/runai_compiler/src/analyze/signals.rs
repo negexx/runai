@@ -446,6 +446,33 @@ pub(crate) struct RunaiImport {
 /// nothing at runtime — types are stripped — so they contribute no binding.
 pub(crate) fn runai_imports(program: &Program<'_>) -> Vec<RunaiImport> {
     let mut imports = Vec::new();
+    for (specifier, named) in runai_specifiers(program) {
+        if !named {
+            continue;
+        }
+        if let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier
+            && let Some(symbol) = specifier.local.symbol_id.get()
+        {
+            imports.push(RunaiImport { symbol, named });
+        }
+    }
+    imports
+}
+
+/// Every value specifier a `"runai"` import declares, as `(specifier, named)`.
+///
+/// The one walk over `"runai"` imports: [`runai_imports`] resolves a specifier to a
+/// symbol for the reachability rule, and the client emitter reads the *text* of the
+/// imported and local names for the one `import` statement it writes. Sharing the
+/// walk means "which specifiers does this file declare" has one answer, so the
+/// symbol-based and text-based consumers cannot disagree.
+///
+/// `named` is `true` for a plain named specifier (aliases included) and `false` for
+/// a default or namespace binding.
+pub(crate) fn runai_specifiers<'a>(
+    program: &'a Program<'a>,
+) -> Vec<(&'a ImportDeclarationSpecifier<'a>, bool)> {
+    let mut found = Vec::new();
     for statement in &program.body {
         let Statement::ImportDeclaration(declaration) = statement else {
             continue;
@@ -460,26 +487,45 @@ pub(crate) fn runai_imports(program: &Program<'_>) -> Vec<RunaiImport> {
             continue;
         };
         for specifier in specifiers {
-            let (local, named) = match specifier {
+            let named = match specifier {
                 ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
                     if specifier.import_kind == ImportOrExportKind::Type {
                         continue;
                     }
-                    (&specifier.local, true)
+                    true
                 }
-                ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
-                    (&specifier.local, false)
-                }
-                ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
-                    (&specifier.local, false)
-                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(_)
+                | ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => false,
             };
-            if let Some(symbol) = local.symbol_id.get() {
-                imports.push(RunaiImport { symbol, named });
-            }
+            found.push((specifier, named));
         }
     }
-    imports
+    found
+}
+
+/// The `(imported, local)` text of a named `"runai"` specifier: the runtime export
+/// the import names, and the binding the file calls it by.
+///
+/// For `import { owner as who } from "runai"` this is `("owner", "who")`: the module
+/// must keep the alias, because the runtime exports `owner` and the code calls
+/// `who`.
+pub(crate) fn named_specifier_names(
+    specifier: &ImportDeclarationSpecifier<'_>,
+) -> (String, String) {
+    match specifier {
+        ImportDeclarationSpecifier::ImportSpecifier(specifier) => (
+            specifier.imported.name().as_str().to_string(),
+            specifier.local.name.as_str().to_string(),
+        ),
+        // Callers pass only the `named` half; a default/namespace binding has no
+        // imported name, so this is unreachable for them.
+        ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
+            (String::new(), specifier.local.name.as_str().to_string())
+        }
+        ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
+            (String::new(), specifier.local.name.as_str().to_string())
+        }
+    }
 }
 
 /// The symbol `call`'s callee identifier resolves to, or `None`.

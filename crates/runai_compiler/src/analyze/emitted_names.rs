@@ -115,14 +115,27 @@ use crate::source::Mode;
 /// Returns an empty list for a file with no route component: nothing is emitted
 /// from such a file, so no name can collide. This mirrors
 /// [`crate::analyze::reachable`], which draws the same boundary.
-pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic> {
+pub fn check_emitted_names(mode: Mode, source: &str, program: &Program<'_>) -> Vec<Diagnostic> {
     let Some(route) = find_route_component(program) else {
         return Vec::new();
     };
     let Some(render) = route_render(program) else {
         return Vec::new();
     };
-    let reserved = reserved_names(mode);
+    let reserved = reserved_names(mode, source, program);
+    let reserved: &[String] = &reserved;
+
+    // Every symbol a `"runai"` import binds. A reference that resolves to one of
+    // these is the **legitimate** import the module writes, not a collision — the
+    // island reserved set includes those names precisely so a *declaration* of one
+    // is refused, but the import's own use must stay legal. `check_declaration` and
+    // `check_scope_bindings` judge the declarations; only this reference walk needs
+    // the exemption.
+    let runai: Vec<oxc_semantic::SymbolId> = crate::analyze::signals::runai_imports(program)
+        .into_iter()
+        .map(|import| import.symbol)
+        .collect();
+    let runai: &[oxc_semantic::SymbolId] = &runai;
 
     // One semantic build for the reference walk, which judges a name by its
     // binding. A type-only reference is filtered there, exactly as
@@ -235,7 +248,9 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
     // [`reference_collision`] asks "is it in scope at the call site" rather than
     // "is it declared at root".
     for reference in references(scoping, |visitor| visitor.visit_expression(render.root)) {
-        if let Some(row) = reference_collision(scoping, &reference, &route, route_scope, reserved) {
+        if let Some(row) =
+            reference_collision(scoping, &reference, &route, route_scope, reserved, runai)
+        {
             diagnostics.push(row);
         }
     }
@@ -243,7 +258,7 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
         for statement in emitted_body_statements(body, return_span) {
             for reference in references(scoping, |visitor| visitor.visit_statement(statement)) {
                 if let Some(row) =
-                    reference_collision(scoping, &reference, &route, route_scope, reserved)
+                    reference_collision(scoping, &reference, &route, route_scope, reserved, runai)
                 {
                     diagnostics.push(row);
                 }
@@ -251,7 +266,9 @@ pub fn check_emitted_names(mode: Mode, program: &Program<'_>) -> Vec<Diagnostic>
         }
     }
     for reference in emitted_reference_roots(program, &route, scoping) {
-        if let Some(row) = reference_collision(scoping, &reference, &route, route_scope, reserved) {
+        if let Some(row) =
+            reference_collision(scoping, &reference, &route, route_scope, reserved, runai)
+        {
             diagnostics.push(row);
         }
     }
@@ -283,9 +300,22 @@ fn reference_collision(
     reference: &crate::analyze::reachable::Reference,
     route: &crate::analyze::ComponentInfo<'_>,
     route_scope: oxc_semantic::ScopeId,
-    reserved: &[&str],
+    reserved: &[String],
+    runai: &[oxc_semantic::SymbolId],
 ) -> Option<Diagnostic> {
-    if !reserved.contains(&reference.name.as_str()) {
+    if !reserved.iter().any(|name| name == &reference.name) {
+        return None;
+    }
+
+    // A reference that resolves to a `"runai"` import is the legitimate binding the
+    // module writes, not a shadow of it. This arm is island-only in practice: the
+    // island reserved set includes `signal`, `mount`, and the helpers because a
+    // *declaration* of one must be refused, but the import's own use must stay
+    // legal. `check_declaration`/`check_scope_bindings` judge the declarations.
+    if reference
+        .symbol
+        .is_some_and(|symbol| runai.contains(&symbol))
+    {
         return None;
     }
 
@@ -297,6 +327,7 @@ fn reference_collision(
             &reference.name,
             ShadowKind::Undeclared,
             route,
+            reserved,
         ));
     };
 
@@ -313,6 +344,7 @@ fn reference_collision(
             &reference.name,
             ShadowKind::ModuleScope,
             route,
+            reserved,
         ));
     }
 
@@ -326,6 +358,7 @@ fn reference_collision(
             &reference.name,
             ShadowKind::BodyScope,
             route,
+            reserved,
         ));
     }
 
@@ -387,7 +420,7 @@ fn check_scope_bindings(
     route_scope: oxc_semantic::ScopeId,
     route: &crate::analyze::ComponentInfo<'_>,
     render: &crate::analyze::jsx::RouteRender<'_>,
-    reserved: &[&str],
+    reserved: &[String],
     out: &mut Vec<Diagnostic>,
 ) {
     let params = render.params.span;
@@ -399,7 +432,8 @@ fn check_scope_bindings(
         return;
     };
     for name in reserved {
-        let Some(symbol) = scoping.get_binding(route_scope, oxc_ast::ast::Ident::from(*name))
+        let Some(symbol) =
+            scoping.get_binding(route_scope, oxc_ast::ast::Ident::from(name.as_str()))
         else {
             continue;
         };
@@ -445,7 +479,11 @@ fn check_scope_bindings(
             if (span.start, span.end) == route.name_span {
                 continue;
             }
-            out.push(scope_binding_refusal((span.start, span.end), name));
+            out.push(scope_binding_refusal(
+                (span.start, span.end),
+                name,
+                reserved,
+            ));
         }
     }
 }
@@ -478,33 +516,40 @@ fn declarations_of(
 /// The repair is the rename the declaration row already gives, and the reason is
 /// the **hoist**: a `var` reaches this scope from a nested block even when the
 /// file never mentions it, so "nothing references it" is not a defence.
-fn scope_binding_refusal(span: (u32, u32), name: &str) -> Diagnostic {
+fn scope_binding_refusal(span: (u32, u32), name: &str, reserved: &[String]) -> Diagnostic {
     Diagnostic::new(
         Code::RA014,
         span,
         format!(
             "`{name}` is one of the names the generated module declares for itself (`{names}`). \
              This binding is declared in the route component's own scope, which the emitter copies \
-             into `render()`, so the template's `{name}(…)` call reaches it instead of the \
-             generated helper. A `var` reaches this scope from any nested block, `for` init, or \
-             `try`/`catch`, even when nothing references it. Rename `{name}`.",
-            names = crate::ir::PRERENDER_NAMES.join("`, `"),
+             into the generated component, so the template's `{name}(…)` call reaches it instead \
+             of the generated helper. A `var` reaches this scope from any nested block, `for` \
+             init, or `try`/`catch`, even when nothing references it. Rename `{name}`.",
+            names = reserved.join("`, `"),
         ),
     )
 }
 
 /// The names the module for `mode` declares for itself.
 ///
-/// Today only the prerender module exists, so only `Static` has a list. The
-/// island module is Task 11's, and returning an empty list is the honest answer
-/// until that emitter is written: refusing `render` in an island page would be a
-/// false positive, because the island module does not necessarily declare it. Task
-/// 11 fills this arm in and, per the plan, adds the island set to the same
-/// constant — so this stays one function rather than a second rule.
-fn reserved_names(mode: Mode) -> &'static [&'static str] {
+/// For `Static` it is the fixed [`crate::ir::PRERENDER_NAMES`]. For `Island` it is
+/// [`crate::ir::ISLAND_LOCALS`] (`_c`, `_a`, `_el`, `_t0`) plus every import
+/// specifier the module **will actually write**, which is data rather than a
+/// constant: it depends on the route, so the merged import list is passed in.
+/// [`crate::codegen::island_reserved_names`] computes it from this same program, so
+/// "the module imports a name" and "a declaration of that name is refused" read one
+/// specifier list. The "is the name in scope at the emitted call site" predicate
+/// below is unchanged; only the name set grows.
+///
+/// `source` is only read by the island arm, for the tree-dependent helpers.
+fn reserved_names(mode: Mode, source: &str, program: &Program<'_>) -> Vec<String> {
     match mode {
-        Mode::Static => crate::ir::PRERENDER_NAMES,
-        Mode::Island => &[],
+        Mode::Static => crate::ir::PRERENDER_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        Mode::Island => crate::codegen::island_reserved_names(source, program),
     }
 }
 
@@ -515,7 +560,7 @@ fn reserved_names(mode: Mode) -> &'static [&'static str] {
 /// this walk cannot check a statement the module omits, nor skip one it carries.
 fn check_part(
     part: &crate::ir::EmittedModulePart<'_, '_>,
-    reserved: &[&str],
+    reserved: &[String],
     out: &mut Vec<Diagnostic>,
 ) {
     match part {
@@ -565,7 +610,7 @@ fn emitted_reference_roots<'a>(
 /// binding, so they are declarations here. A type alias and an interface are
 /// erased by `strip_types` and are skipped, which is the false positive this rule
 /// must never make.
-fn check_declaration(statement: &Statement<'_>, reserved: &[&str], out: &mut Vec<Diagnostic>) {
+fn check_declaration(statement: &Statement<'_>, reserved: &[String], out: &mut Vec<Diagnostic>) {
     match statement {
         Statement::VariableDeclaration(declaration) => {
             for declarator in &declaration.declarations {
@@ -660,11 +705,11 @@ fn check_declaration(statement: &Statement<'_>, reserved: &[&str], out: &mut Vec
 fn refuse_if_reserved(
     name: &str,
     span: oxc_span::Span,
-    reserved: &[&str],
+    reserved: &[String],
     out: &mut Vec<Diagnostic>,
 ) {
-    if reserved.contains(&name) {
-        out.push(declaration_refusal((span.start, span.end), name));
+    if reserved.iter().any(|reserved_name| reserved_name == name) {
+        out.push(declaration_refusal((span.start, span.end), name, reserved));
     }
 }
 
@@ -679,7 +724,7 @@ fn refuse_if_reserved(
 /// `export const render = 1` is reported by [`check_declaration`] as a
 /// declaration, and this function reports its local name too — the same span, so
 /// `analyze`'s dedup keeps one row.
-fn check_export_names(statement: &Statement<'_>, reserved: &[&str], out: &mut Vec<Diagnostic>) {
+fn check_export_names(statement: &Statement<'_>, reserved: &[String], out: &mut Vec<Diagnostic>) {
     let Statement::ExportNamedDeclaration(exported) = statement else {
         return;
     };
@@ -689,7 +734,7 @@ fn check_export_names(statement: &Statement<'_>, reserved: &[&str], out: &mut Ve
             ModuleExportName::IdentifierReference(identifier) => identifier.name.as_str(),
             ModuleExportName::StringLiteral(literal) => literal.value.as_str().unwrap_or(""),
         };
-        if reserved.contains(&exported_name) {
+        if reserved.iter().any(|name| name == exported_name) {
             out.push(Diagnostic::new(
                 Code::RA014,
                 (specifier.span.start, specifier.span.end),
@@ -704,7 +749,7 @@ fn check_export_names(statement: &Statement<'_>, reserved: &[&str], out: &mut Ve
 }
 
 /// `RA014` for a declaration that binds a reserved name.
-fn declaration_refusal(span: (u32, u32), name: &str) -> Diagnostic {
+fn declaration_refusal(span: (u32, u32), name: &str, reserved: &[String]) -> Diagnostic {
     Diagnostic::new(
         Code::RA014,
         span,
@@ -712,7 +757,7 @@ fn declaration_refusal(span: (u32, u32), name: &str) -> Diagnostic {
             "`{name}` is one of the names the generated module declares for itself (`{names}`), \
              so a declaration here would shadow it and the template's call would reach the \
              wrong binding. Rename `{name}`.",
-            names = crate::ir::PRERENDER_NAMES.join("`, `"),
+            names = reserved.join("`, `"),
         ),
     )
 }
@@ -734,14 +779,15 @@ fn reference_refusal(
     name: &str,
     kind: ShadowKind,
     route: &crate::analyze::ComponentInfo<'_>,
+    reserved: &[String],
 ) -> Diagnostic {
-    let names = crate::ir::PRERENDER_NAMES.join("`, `");
+    let names = reserved.join("`, `");
     let message = match kind {
         ShadowKind::Undeclared => format!(
             "`{name}` is one of the names the generated module declares for itself (`{names}`), \
              and nothing in `{route}` declares it, so in the emitted template it resolves to the \
-             compiler's own helper or to `render()` and renders their source text. Declare the \
-             value under a different name.",
+             compiler's own helper and renders its source text. Declare the value under a \
+             different name.",
             route = route.display_name(),
         ),
         ShadowKind::ModuleScope => format!(
@@ -751,9 +797,9 @@ fn reference_refusal(
         ),
         ShadowKind::BodyScope => format!(
             "`{name}` is one of the names the generated module declares for itself (`{names}`). \
-             This use names a binding the route body declares, and the body is copied into \
-             `render()`, so `{name}` is in scope at the generated call site and shadows the \
-             module's own `{name}` there. Rename the body binding here and at its declaration.",
+             This use names a binding the route body declares, and the body is copied into the \
+             generated component, so `{name}` is in scope at the generated call site and shadows \
+             the module's own `{name}` there. Rename the body binding here and at its declaration.",
         ),
     };
     Diagnostic::new(Code::RA014, span, message)
@@ -1435,6 +1481,84 @@ mod tests {
             &src[d[0].span.0 as usize..d[0].span.1 as usize],
             "_esc",
             "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    // --- The island reserved set (Task 11, Step 4) ---------------------------
+
+    /// An island module declares `signal`, `mount`, `template`, the helpers it
+    /// uses, and its own `_el`/`_a`/`_t0`/`_c`. A route file that declares one of
+    /// those names would shadow the import or the emitter local, so it is `RA014`.
+    #[test]
+    fn island_reserved_names_are_refused_for_each_shape() {
+        for (src, name) in [
+            // A module-level `const mount` collides with the import the module
+            // writes (`Identifier 'mount' has already been declared`).
+            (
+                "\"use island\"\nconst mount = 1\nexport default function P(props: Record<never, never>) { return <p>{mount}</p> }\n",
+                "mount",
+            ),
+            // A module-level `const signal` beside the `signal` import.
+            (
+                "\"use island\"\nimport { signal } from \"runai\"\nconst signal = 1\nexport default function P(props: Record<never, never>) { return <p>{signal}</p> }\n",
+                "signal",
+            ),
+            // A body `const _a` collides with the emitter's marker list.
+            (
+                "\"use island\"\nexport default function P(props: Record<never, never>) { const _a = 1; return <p>{_a}</p> }\n",
+                "_a",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            assert!(
+                d.iter().any(
+                    |row| row.code == Code::RA014 && row.message.contains(&format!("`{name}`"))
+                ),
+                "{name}: the reserved name is refused and named: {d:?}"
+            );
+        }
+    }
+
+    /// The same names are legal in a **static** route except the prerender set:
+    /// a static module has no import and no `_el`, so `mount`/`signal`/`_a` are
+    /// ordinary names there.
+    #[test]
+    fn island_reserved_names_are_legal_in_a_static_route() {
+        for src in [
+            "\"use static\"\nconst mount = 1\nexport default function P(props: Record<never, never>) { return <p>{mount}</p> }\n",
+            "\"use static\"\nconst signal = 1\nexport default function P(props: Record<never, never>) { return <p>{signal}</p> }\n",
+            "\"use static\"\nexport default function P(props: Record<never, never>) { const _a = 1; return <p>{_a}</p> }\n",
+        ] {
+            assert!(
+                crate::analyze::analyze(src, "src/routes/about.page.tsx").is_empty(),
+                "an island name is legal in a static route: {src}"
+            );
+        }
+    }
+
+    /// A name the route **never imports** is not reserved — refusing `derived` on a
+    /// page that does not import it would be a false positive on a legal route. The
+    /// reserved set is data (the merged import list), not a fixed superset.
+    #[test]
+    fn a_name_the_route_does_not_import_is_not_refused() {
+        // `derived` is not imported, so a body local of that name is legal.
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { const derived = 1; return <p>{derived}</p> }\n";
+        assert!(
+            crate::analyze::analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "a name the module does not import is not reserved"
+        );
+    }
+
+    /// The positive control for the test above: import `derived` and a body local of
+    /// the same name **is** refused, because the module now writes that import.
+    #[test]
+    fn an_imported_name_is_refused_even_when_only_the_import_uses_it() {
+        let src = "\"use island\"\nimport { derived } from \"runai\"\nexport default function P(props: Record<never, never>) { const derived = 1; return <p>{derived}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d[0].code, Code::RA014, "{d:?}");
+        assert!(
+            d.iter().any(|row| row.message.contains("`derived`")),
+            "the message names it: {d:?}"
         );
     }
 }

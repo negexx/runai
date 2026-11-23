@@ -146,19 +146,107 @@ pub(crate) fn emit_prerender(route: &RouteIr) -> String {
 /// rather than silently producing `<br>x`, but no release path drops a node.
 pub fn template_literal_body(node: &IrNode) -> String {
     let mut out = String::new();
-    write_node(node, &mut out);
+    write_node::<PrerenderSites>(node, &mut out);
     out
 }
 
-/// [`template_literal_body`] for one node, appending to `out`.
-fn write_node(node: &IrNode, out: &mut String) {
+/// The three dynamic sites of a template, as one emitter writes them.
+///
+/// The element, text, and static-attribute writing is identical between the
+/// prerender and island emitters — same void handling, same entity policy, same
+/// template-literal escaping — so it lives in **one** walk, [`write_node`], which
+/// delegates only the dynamic sites here. Prerender interpolates
+/// `${_esc(…)}`/`${_attr(…)}`; the island emitter writes a `<!>` marker and
+/// addresses it by ordinal. Copying the walk instead would let the two drift on
+/// the one thing that must never drift: the markup both emitters produce.
+pub(crate) trait TemplateSites {
+    /// An `Expr` child, at its position among its siblings.
+    fn expr(expr: &str, out: &mut String);
+
+    /// Whether an `Attr`/`Event` binding is written **inside** the opening tag.
+    ///
+    /// Prerender: `true` — `${_attr("class", …)}` is part of the start tag.
+    /// Island: `false` — an attribute is not a child, so the marker that stands
+    /// for it is written after `>` (as the element's first children) and the walk
+    /// calls [`Self::marker`] once per binding instead.
+    fn attrs_in_tag() -> bool;
+
+    /// One `Attr` binding, written in-tag when [`Self::attrs_in_tag`] is `true`.
+    fn attr(name: &str, expr: &str, out: &mut String);
+
+    /// One `Event` binding, same calling rule as [`Self::attr`].
+    fn event(name: &str, expr: &str, out: &mut String);
+
+    /// A `<!>` marker, for the island emitter's binding sites.
+    ///
+    /// Only the island emitter calls this, and only when [`Self::attrs_in_tag`]
+    /// is `false`: an attribute or event marker is emitted as the element's first
+    /// children, in binding order, before any child markers. Prerender's
+    /// implementation is `unreachable!` by construction — its [`Self::expr`] and
+    /// [`Self::attr`] write text, never a marker.
+    fn marker(out: &mut String);
+}
+
+/// [`TemplateSites`] for the `"use static"` template literal.
+///
+/// An expression is `${_esc(expr)}` and a dynamic attribute is `${_attr(…)}`,
+/// both interpolated into the template literal. A marker is never written.
+pub(crate) struct PrerenderSites;
+
+impl TemplateSites for PrerenderSites {
+    fn expr(expr: &str, out: &mut String) {
+        out.push_str("${_esc(");
+        out.push_str(expr);
+        out.push_str(")}");
+    }
+
+    fn attrs_in_tag() -> bool {
+        true
+    }
+
+    fn attr(name: &str, expr: &str, out: &mut String) {
+        out.push_str("${_attr(\"");
+        out.push_str(name);
+        out.push_str("\", ");
+        out.push_str(expr);
+        out.push_str(")}");
+    }
+
+    // A `"use static"` route cannot carry a handler: `RA010` refuses every `on*`
+    // handler, so this arm is unreachable through the checked emitter. There is no
+    // HTML spelling of `onClick={fn}` that keeps the expression, and dropping it
+    // silently is what this comment exists to prevent — so a debug build panics,
+    // and a release build writes nothing for a construct the analysis already
+    // refused.
+    //
+    // The guard that keeps this unreachable lives in a *different* walk
+    // (`analyze::rules::check_static_mode`, which RA010 is raised from), so a later
+    // narrowing of RA010 — say, permitting a handler on a static element — turns
+    // this arm into silent attribute loss rather than a compile error. Any such
+    // change has to revisit this arm in the same edit.
+    fn event(_name: &str, _expr: &str, _out: &mut String) {
+        debug_assert!(
+            false,
+            "an event binding reached the prerender emitter: RA010 refuses a handler in a \
+             `\"use static\"` route, so analysis should have stopped this file"
+        );
+    }
+
+    fn marker(_out: &mut String) {
+        debug_assert!(
+            false,
+            "the prerender emitter writes no marker: `_esc(...)` and `_attr(...)` carry the \
+             dynamic sites, so `attrs_in_tag` is true and `marker` is never called"
+        );
+    }
+}
+
+/// [`write_node`] for one node, appending to `out`, with the dynamic sites
+/// delegated to `S`.
+pub(crate) fn write_node<S: TemplateSites>(node: &IrNode, out: &mut String) {
     match node {
         IrNode::Text(text) => escape_literal(text, out),
-        IrNode::Expr(expr) => {
-            out.push_str("${_esc(");
-            out.push_str(expr);
-            out.push_str(")}");
-        }
+        IrNode::Expr(expr) => S::expr(expr, out),
         IrNode::Element {
             tag,
             static_attrs,
@@ -183,41 +271,29 @@ fn write_node(node: &IrNode, out: &mut String) {
                 out.push('"');
             }
 
-            for binding in bindings {
-                match binding {
-                    Binding::Attr { name, expr } => {
-                        out.push_str("${_attr(\"");
-                        out.push_str(name);
-                        out.push_str("\", ");
-                        out.push_str(expr);
-                        out.push_str(")}");
-                    }
-                    // A `"use static"` route cannot carry a handler: `RA010`
-                    // refuses every `on*` handler, so this arm is unreachable
-                    // through the checked emitter. There is no HTML spelling of
-                    // `onClick={fn}` that keeps the expression, and dropping it
-                    // silently is what this comment exists to prevent — so a
-                    // debug build panics, and a release build writes nothing for
-                    // a construct the analysis already refused.
-                    //
-                    // The guard that keeps this unreachable lives in a *different*
-                    // walk (`analyze::rules::check_static_mode`, which RA010 is
-                    // raised from), so a later narrowing of RA010 — say,
-                    // permitting a handler on a static element — turns this arm
-                    // into silent attribute loss rather than a compile error. Any
-                    // such change has to revisit this arm in the same edit.
-                    Binding::Event { .. } => {
-                        debug_assert!(
-                            false,
-                            "an event binding reached the prerender emitter: RA010 refuses a \
-                             handler in a `\"use static\"` route, so analysis should have \
-                             stopped this file"
-                        );
+            if S::attrs_in_tag() {
+                for binding in bindings {
+                    match binding {
+                        Binding::Attr { name, expr } => S::attr(name, expr, out),
+                        Binding::Event { name, expr } => S::event(name, expr, out),
                     }
                 }
             }
 
             out.push('>');
+
+            // The island emitter writes one marker per attribute or event binding
+            // as the element's first children, in binding order, before any child
+            // marker. An attribute has no position among children, so a marker is
+            // the only place to put it — and the ordinal contract depends on this
+            // order being exactly the binding walk's.
+            if !S::attrs_in_tag() {
+                for binding in bindings {
+                    match binding {
+                        Binding::Attr { .. } | Binding::Event { .. } => S::marker(out),
+                    }
+                }
+            }
 
             let void = VOID_ELEMENTS.contains(&tag.as_str());
             if void {
@@ -228,7 +304,7 @@ fn write_node(node: &IrNode, out: &mut String) {
             }
 
             for child in children {
-                write_node(child, out);
+                write_node::<S>(child, out);
             }
 
             if !void {

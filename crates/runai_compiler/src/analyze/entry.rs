@@ -145,7 +145,7 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
         // question ("does this name collide with the emitter's own?") and reads
         // the shared reserved list, not the module's bindings.
         diagnostics.extend(crate::analyze::emitted_names::check_emitted_names(
-            mode, program,
+            mode, source, program,
         ));
     }
 

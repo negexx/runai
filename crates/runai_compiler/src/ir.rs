@@ -136,9 +136,20 @@ pub(crate) const VOID_ELEMENTS: &[&str] = &[
 /// a helper added without a rule (or a rule for a helper that no longer exists)
 /// fails there rather than shipping a shadowing hole.
 ///
-/// Task 11 adds the island module's own names to the same list, so the rule is
-/// written once and gains data rather than a second walk.
+/// The island module's own names are [`ISLAND_LOCALS`], kept separate because they
+/// are a different emitter's locals; the island set a route owes also includes
+/// every import specifier the module writes, which is data, not a constant.
 pub const PRERENDER_NAMES: &[&str] = &["_esc", "_attr", "render"];
+
+/// The names an **island** module declares for itself, independent of the route.
+///
+/// The island emitter's own locals: `_c` (the marker collector), `_a` (the marker
+/// list), `_el` (the cloned fragment), and `_t0` (the hoisted template). They are
+/// deliberately prefixed so a route's own `el`, `a`, or `t0` cannot collide — Task
+/// 11's renaming ruling. [`crate::analyze::emitted_names`] reserves these **plus**
+/// every import specifier the module actually writes, which is data rather than a
+/// constant: it depends on the route.
+pub const ISLAND_LOCALS: &[&str] = &["_c", "_a", "_el", "_t0"];
 
 /// A lowered route file: its rendering mode, its component name, the
 /// component's own statements, the file's module-level statements, and its
@@ -616,7 +627,7 @@ impl<'s> Lowerer<'s> {
     /// rather than this one.
     fn root(&self, root: &'s Expression<'s>) -> Result<IrNode, Vec<Diagnostic>> {
         match root {
-            Expression::JSXElement(element) => self.element(element),
+            Expression::JSXElement(element) => self.element(element, &[]),
             Expression::JSXFragment(fragment) => Err(vec![unsupported(
                 fragment.span,
                 "a fragment as the route's returned JSX",
@@ -629,7 +640,18 @@ impl<'s> Lowerer<'s> {
     }
 
     /// One JSX element.
-    fn element(&self, element: &'s JSXElement<'s>) -> Result<IrNode, Vec<Diagnostic>> {
+    ///
+    /// `ancestors` is the tag of every enclosing element, outermost first — the
+    /// same stack [`crate::analyze::jsx::check_jsx`] keeps — so the reparse rules
+    /// ([`crate::analyze::jsx::parent_child_refusal`] and
+    /// [`crate::analyze::jsx::ancestor_refusal`]) can be repeated here as the
+    /// invariant the analysis first enforces. A caller that skips the analysis gets
+    /// a diagnostic rather than a template the browser will reshape.
+    fn element(
+        &self,
+        element: &'s JSXElement<'s>,
+        ancestors: &[String],
+    ) -> Result<IrNode, Vec<Diagnostic>> {
         // The one tag rule, shared with `check_jsx`: `<div>` is a DOM element,
         // anything else has no DOM lowering and this milestone cannot inline it.
         // `check_jsx` reports the refusal first; this is the invariant that keeps
@@ -643,6 +665,26 @@ impl<'s> Lowerer<'s> {
             )]
         })?;
         let name = tag.to_string();
+
+        // The reparse refusals, repeated as invariants. `check_jsx` reports them
+        // first; sharing the messages means a caller that skips analysis sees the
+        // same words, not a second rule.
+        if let Some(parent) = ancestors.last()
+            && let Some(message) = crate::analyze::jsx::parent_child_refusal(parent, &name)
+        {
+            return Err(vec![reparse_invariant(element.span, message)]);
+        }
+        if let Some(message) = crate::analyze::jsx::ancestor_refusal(&name, ancestors) {
+            return Err(vec![reparse_invariant(element.span, message)]);
+        }
+        if let Some(message) = crate::analyze::jsx::text_refusal(&name) {
+            let fostered = element.children.iter().any(|child| {
+                matches!(child, JSXChild::Text(text) if !text.value.as_str().trim().is_empty())
+            });
+            if fostered {
+                return Err(vec![reparse_invariant(element.span, message)]);
+            }
+        }
 
         let mut static_attrs: Vec<(String, String)> = Vec::new();
         let mut bindings: Vec<Binding> = Vec::new();
@@ -697,11 +739,15 @@ impl<'s> Lowerer<'s> {
             }
         }
 
+        let mut nested = ancestors.to_vec();
+        nested.push(name.clone());
+        let children = self.children(&element.children, &nested)?;
+
         Ok(IrNode::Element {
             tag: name,
             static_attrs,
             bindings,
-            children: self.children(&element.children)?,
+            children,
         })
     }
 
@@ -710,7 +756,16 @@ impl<'s> Lowerer<'s> {
     /// A nested element keeps its own `bindings`; a fragment contributes no node
     /// of its own, so its children are spliced here with the same list: that is
     /// what `<div><><b/></></div>` rendering exactly `<div><b/></div>` means.
-    fn children(&self, children: &'s [JSXChild<'s>]) -> Result<Vec<IrNode>, Vec<Diagnostic>> {
+    ///
+    /// `ancestors` is the enclosing tag stack, passed through unchanged to a child
+    /// element and to a spliced fragment's children — a fragment adds no tag to the
+    /// ancestry, exactly as [`crate::analyze::jsx::check_jsx`] keeps the two in
+    /// step.
+    fn children(
+        &self,
+        children: &'s [JSXChild<'s>],
+        ancestors: &[String],
+    ) -> Result<Vec<IrNode>, Vec<Diagnostic>> {
         let mut nodes = Vec::new();
 
         for child in children {
@@ -720,9 +775,9 @@ impl<'s> Lowerer<'s> {
                         nodes.push(IrNode::Text(text));
                     }
                 }
-                JSXChild::Element(element) => nodes.push(self.element(element)?),
+                JSXChild::Element(element) => nodes.push(self.element(element, ancestors)?),
                 JSXChild::Fragment(fragment) => {
-                    nodes.extend(self.children(&fragment.children)?);
+                    nodes.extend(self.children(&fragment.children, ancestors)?);
                 }
                 JSXChild::ExpressionContainer(container) => {
                     // `{}` and `{/* a comment */}` both parse to an empty
@@ -901,6 +956,18 @@ fn unlowerable_root(span: Span) -> Diagnostic {
         "cannot lower a root that is not JSX: return exactly one element from the route \
          component",
     )
+}
+
+/// A markup shape the HTML parser would rewrite, repeated as lowering's invariant.
+///
+/// The message is [`crate::analyze::jsx::parent_child_refusal`],
+/// [`crate::analyze::jsx::ancestor_refusal`], or
+/// [`crate::analyze::jsx::text_refusal`]'s — the same words `check_jsx` reports, so a
+/// caller that skipped analysis sees one rule, not two. The spans here index the
+/// **stripped** source, but the checked emitters run `check_jsx` on the original
+/// first, so an agent's first signal is the analysis's.
+fn reparse_invariant(span: Span, message: String) -> Diagnostic {
+    Diagnostic::new(Code::RA014, (span.start, span.end), message)
 }
 
 #[cfg(test)]

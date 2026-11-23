@@ -64,6 +64,34 @@
 //! module-level JSX declaration is legal and this milestone simply does not emit
 //! that module.
 //!
+//! # `RA014`: markup the HTML parser would reshape
+//!
+//! The island emitter writes markup as HTML **text**, so the browser's parser
+//! rebuilds the tree — and for these shapes it does not rebuild the tree the
+//! author wrote. [`reparse_refusal`], [`parent_child_refusal`],
+//! [`ancestor_refusal`], and [`text_refusal`] refuse them, because the emitter
+//! cannot fix a shape the parser rewrites:
+//!
+//! - `<p>` containing a block element — the parser closes the paragraph, so the
+//!   child becomes a sibling;
+//! - `<table>` containing anything but `caption`/`colgroup`/`thead`/`tbody`/
+//!   `tfoot`/`tr`, or bare text — the parser fosters it out of the table;
+//! - `<thead>`/`<tbody>`/`<tfoot>` containing anything but `<tr>`, `<tr>`
+//!   anything but `<td>`/`<th>`, `<colgroup>` anything but `<col>`, `<select>`
+//!   anything but `<option>`/`<optgroup>`, `<ul>`/`<ol>` anything but `<li>`,
+//!   `<dl>` anything but `<dt>`/`<dd>` — each is moved out or wrapped;
+//! - `<a>` inside `<a>`, `<form>` inside `<form>` — the parser splits them;
+//! - `<li>` outside `<ul>`/`<ol>`, `<dt>`/`<dd>` outside `<dl>` — a stray entry
+//!   with no list to belong to;
+//! - **in an island**, a dynamic binding inside a text-only element (`script`,
+//!   `style`, `title`, `textarea`, `template`, …) — the `<!>` marker the emitter
+//!   needs is swallowed as text or moved into a fragment the marker walker never
+//!   reaches, so `_a[k]` would address the wrong site.
+//!
+//! They are repeated by [`crate::ir::lower_route`] as invariants, the way
+//! [`dom_tag`] is, so a caller that skips the analysis gets a diagnostic rather
+//! than a template the browser will reshape.
+//!
 //! [`RouteIr::statements`]: crate::ir::RouteIr::statements
 //! [`RouteIr::module_statements`]: crate::ir::RouteIr::module_statements
 //!
@@ -142,6 +170,256 @@ const INLINE_TAGS: &[&str] = &[
     "sub", "sup", "time", "u",
 ];
 
+/// The block-level start tags the HTML parser closes an open `<p>` for.
+///
+/// A `<p>` cannot contain a block element: the parser ends the paragraph at the
+/// block start tag, so the child becomes the paragraph's **sibling** and the
+/// parsed DOM is not the tree the author wrote. `<p><p>`, `<p><div>`, and
+/// `<p><table>` are all the same defect. This is the one content model that is
+/// a *deny*-list rather than an allow-list — `<p>` may contain any phrasing
+/// element or text — so it lives here as its own constant, not inline in the
+/// rule that reads it.
+pub(crate) const BLOCK_IN_P: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "details",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "ul",
+];
+
+/// Parents whose content model the HTML parser enforces by moving, splitting, or
+/// closing nodes — so the parsed DOM would not be the tree the author wrote.
+///
+/// `None` means "any child this milestone can emit". `Some(&[])` is the `<p>`
+/// case, whose children are governed by [`BLOCK_IN_P`] rather than an
+/// allow-list.
+///
+/// One table, read by [`JsxChecker`]'s nesting rule and repeated by
+/// [`crate::ir::lower_route`] as an invariant, the way [`dom_tag`] is shared: a
+/// caller that skips the analysis gets a diagnostic rather than a template the
+/// browser will reshape.
+pub(crate) fn reparse_refusal(tag: &str) -> Option<&'static [&'static str]> {
+    match tag {
+        "p" => Some(&[]), // no block-level children; see BLOCK_IN_P
+        "table" => Some(&["caption", "colgroup", "thead", "tbody", "tfoot", "tr"]),
+        "thead" | "tbody" | "tfoot" => Some(&["tr"]),
+        "tr" => Some(&["td", "th"]),
+        "colgroup" => Some(&["col"]),
+        "select" => Some(&["option", "optgroup"]),
+        "optgroup" => Some(&["option"]),
+        "ul" | "ol" => Some(&["li"]),
+        "dl" => Some(&["dt", "dd"]),
+        _ => None,
+    }
+}
+
+/// Elements whose content the HTML parser reads as **raw text** or **RCDATA**,
+/// or keeps in a separate fragment.
+///
+/// A `<!>` marker inside one of these is not a comment: `script` and `style`
+/// read it as literal text, `textarea` and `title` read RCDATA the same way, and
+/// `template` puts its children in a `.content` fragment the island's
+/// `TreeWalker` never descends into. In every case the marker count or its
+/// position in the cloned fragment differs from what the emitter wrote, so the
+/// `_a[k]` ordinal would address the wrong site — or `undefined`. An island
+/// therefore refuses a **binding** inside one of these; a static template may
+/// still hold one, because it interpolates a string and never places a marker.
+pub(crate) const MARKER_HOSTILE: &[&str] = &[
+    "script",
+    "style",
+    "title",
+    "textarea",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "plaintext",
+    "template",
+];
+
+/// The tag of a plain DOM element, or `None` for anything that is not one.
+///
+/// The nesting rules are about real HTML tags, so a capitalized or namespaced name
+/// — refused elsewhere by [`dom_tag`] — yields `None` here rather than a second
+/// diagnostic.
+fn element_tag<'a>(element: &'a JSXElement<'a>) -> Option<&'a str> {
+    match &element.opening_element.name {
+        JSXElementName::Identifier(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Why `child` may not be a **direct child** of `parent`, or `None` when the
+/// parser keeps the tree the author wrote.
+///
+/// Returns the full message: the parent, the child, what the parser does, and the
+/// legal repair. It is shared by [`check_jsx`] and [`crate::ir::lower_route`] so a
+/// caller that skips analysis gets the same refusal the analysis would have
+/// produced.
+pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> {
+    // `<p>` is the deny-list case: a block-level child closes the paragraph.
+    if parent == "p" {
+        if BLOCK_IN_P.contains(&child) {
+            return Some(format!(
+                "`<p>` cannot contain `<{child}>`: the HTML parser closes the paragraph at a \
+                 block-level child, so `<{child}>` becomes a sibling of the `<p>` and the page \
+                 renders a different shape than you wrote. Move `<{child}>` out of the `<p>`, or \
+                 use a `<span>` if its content is inline."
+            ));
+        }
+        return None;
+    }
+
+    let allowed = reparse_refusal(parent)?;
+    if allowed.is_empty() || allowed.contains(&child) {
+        return None;
+    }
+
+    // Each family says what the parser does with a child it does not accept, so
+    // the repair is specific rather than a generic "use the right tag".
+    let message = match parent {
+        "table" => format!(
+            "`<table>` cannot contain `<{child}>`: the HTML parser moves a non-table child out of \
+             the table, so it is fostered before the `<table>` and the page renders a different \
+             shape. Put `<{child}>` outside the `<table>`, and use `<tr>` with `<td>` or `<th>` \
+             for rows and cells."
+        ),
+        "thead" | "tbody" | "tfoot" => format!(
+            "`<{parent}>` cannot contain `<{child}>`: the HTML parser only accepts `<tr>` inside \
+             `<{parent}>`, so it relocates `<{child}>` and the page renders a different shape. Use \
+             `<tr>` here, and move `<{child}>` outside the `<table>`."
+        ),
+        "tr" => format!(
+            "`<tr>` cannot contain `<{child}>`: the HTML parser only accepts `<td>` or `<th>` inside \
+             `<tr>`, so it moves `<{child}>` out and the page renders a different shape. Use `<td>` \
+             or `<th>` for the cell, and move `<{child}>` outside the row."
+        ),
+        "colgroup" => format!(
+            "`<colgroup>` cannot contain `<{child}>`: the HTML parser only accepts `<col>` inside \
+             `<colgroup>`, so it moves `<{child}>` out and the page renders a different shape. Use \
+             `<col>` here, and move `<{child}>` outside the `<colgroup>`."
+        ),
+        "select" => format!(
+            "`<select>` cannot contain `<{child}>`: the HTML parser only accepts `<option>` or \
+             `<optgroup>` inside `<select>`, so it moves `<{child}>` out and the page renders a \
+             different shape. Use `<option>` or `<optgroup>` here, and move `<{child}>` outside the \
+             `<select>`."
+        ),
+        "optgroup" => format!(
+            "`<optgroup>` cannot contain `<{child}>`: the HTML parser only accepts `<option>` inside \
+             `<optgroup>`, so it moves `<{child}>` out and the page renders a different shape. Use \
+             `<option>` here, and move `<{child}>` outside the `<optgroup>`."
+        ),
+        "ul" | "ol" => format!(
+            "`<{parent}>` cannot contain `<{child}>`: a list holds `<li>` children, so the HTML \
+             parser treats `<{child}>` as an item wrapper and the page renders a different shape. \
+             Put `<{child}>` inside an `<li>`, or move it outside the `<{parent}>`."
+        ),
+        "dl" => format!(
+            "`<dl>` cannot contain `<{child}>`: a description list holds `<dt>` and `<dd>` children, \
+             so the HTML parser treats `<{child}>` as an entry and the page renders a different \
+             shape. Put `<{child}>` inside a `<dt>` or `<dd>`, or move it outside the `<dl>`."
+        ),
+        // `p` is handled above; this arm is unreachable for any other tag because
+        // `reparse_refusal` returns a list only for the tags above.
+        _ => return None,
+    };
+    Some(message)
+}
+
+/// Why bare text may not be a **direct child** of `parent`, or `None`.
+///
+/// Only the table family fosters text: `<table>text` parses with the text moved
+/// *before* the table. A `<ul>`, `<select>`, or `<dl>` keeps a text child where it
+/// is, so refusing text there would reject a page that renders as written.
+pub(crate) fn text_refusal(parent: &str) -> Option<String> {
+    match parent {
+        "table" => Some(
+            "`<table>` cannot contain bare text: the HTML parser fosters text out of a table, so it \
+             renders before the `<table>` and the page renders a different shape. Put the text \
+             inside a `<td>` or `<th>` cell, or in another element outside the table."
+                .to_string(),
+        ),
+        "thead" | "tbody" | "tfoot" => Some(format!(
+            "`<{parent}>` cannot contain bare text: the HTML parser fosters text out of a table \
+             section, so it renders outside the `<{parent}>` and the page renders a different shape. \
+             Put the text inside a `<td>` or `<th>` cell."
+        )),
+        "tr" => Some(
+            "`<tr>` cannot contain bare text: the HTML parser fosters text out of a row, so it \
+             renders outside the `<tr>` and the page renders a different shape. Put the text inside \
+             a `<td>` or `<th>` cell."
+                .to_string(),
+        ),
+        "colgroup" => Some(
+            "`<colgroup>` cannot contain bare text: a `<colgroup>` holds only `<col>` elements, so \
+             the HTML parser moves text out and the page renders a different shape. Remove the text, \
+             or move it outside the `<colgroup>`."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Why `tag` may not appear under `ancestors`, or `None`.
+///
+/// The three ancestor rules: `<a>` inside `<a>`, `<form>` inside `<form>`, and a
+/// list/description item with no list parent — `<li>` outside `<ul>`/`<ol>`,
+/// `<dt>`/`<dd>` outside `<dl>`. The parser splits nested anchors and nested forms
+/// into siblings; a stray list item has no list to belong to.
+pub(crate) fn ancestor_refusal(tag: &str, ancestors: &[String]) -> Option<String> {
+    let inside = |name: &str| ancestors.iter().any(|ancestor| ancestor == name);
+    match tag {
+        "a" if inside("a") => Some(
+            "`<a>` cannot contain `<a>`: the HTML parser closes the outer anchor at the inner one, \
+             so the inner `<a>` becomes a sibling and the page renders a different shape. Use a \
+             `<span>` for the inner content, or move the inner anchor out of the outer one."
+                .to_string(),
+        ),
+        "form" if inside("form") => Some(
+            "`<form>` cannot contain `<form>`: the HTML parser drops the nested form, so its content \
+             renders without a form and the page renders a different shape. Move the inner `<form>` \
+             out of the outer one."
+                .to_string(),
+        ),
+        "li" if !ancestors.is_empty() && !inside("ul") && !inside("ol") => Some(
+            "`<li>` must be inside a `<ul>` or `<ol>`: outside a list it has no list to belong to, \
+             so the parser renders a stray item. Wrap the `<li>` in a `<ul>` or `<ol>`, or use a \
+             `<div>` if it is not a list item."
+                .to_string(),
+        ),
+        "dt" | "dd" if !ancestors.is_empty() && !inside("dl") => Some(format!(
+            "`<{tag}>` must be inside a `<dl>`: a description term or value only belongs to a \
+             description list, so outside one the parser renders a stray entry. Wrap the `<{tag}>` \
+             in a `<dl>`, or use a `<div>` if it is not part of a description list."
+        )),
+        _ => None,
+    }
+}
+
 /// The fix every `RA007` whitespace diagnostic carries.
 ///
 /// Pinned verbatim by the task brief. [`Code::RA007`]'s canonical `fix_template`
@@ -167,9 +445,20 @@ pub const SPACE_FIX: &str = "Put both on one line, or write {\" \"} where you wa
 /// module with no route is not emitted by this milestone at all, and a
 /// module-level JSX helper there is legal.
 pub fn check_jsx(program: &Program, source: &str) -> Vec<Diagnostic> {
+    // The marker-hostile rule is island-only: a static template interpolates a
+    // string, never a `<!>` marker, so a binding in a text-only element is fine
+    // there. A snippet with no directive is not an island (`detect_mode` errs),
+    // which is the right default — those tests exercise fragments of markup, not
+    // route modes.
+    let island = matches!(
+        crate::source::detect_mode(program, source),
+        Ok(crate::source::Mode::Island)
+    );
     let mut checker = JsxChecker {
         source,
         diagnostics: Vec::new(),
+        ancestors: Vec::new(),
+        island,
     };
 
     // The route's render is a separate question from "which elements exist".
@@ -190,6 +479,18 @@ pub fn check_jsx(program: &Program, source: &str) -> Vec<Diagnostic> {
 struct JsxChecker<'s> {
     source: &'s str,
     diagnostics: Vec<Diagnostic>,
+    /// The tag of every element currently open, outermost first.
+    ///
+    /// Maintained by [`JsxChecker::visit_jsx_element`] around the recursive walk
+    /// so the ancestor rules — `<a>` inside `<a>`, `<form>` inside `<form>`,
+    /// `<li>` outside a list — can be asked at any depth. It is the element
+    /// stack, not a span list, because the rules are about tags and the nearest
+    /// enclosing parent, not positions.
+    ancestors: Vec<String>,
+    /// Whether the file is an island, which decides the marker-hostile rule: a
+    /// `"use static"` template interpolates a string and never places a `<!>`
+    /// marker, so only an island can be broken by a binding in a text-only element.
+    island: bool,
 }
 
 impl JsxChecker<'_> {
@@ -291,8 +592,21 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
         self.void_with_children(element);
         self.attributes(element);
         self.duplicate_attributes(element);
+        self.nesting(element);
         self.children(&element.children);
-        oxc_ast_visit::walk::walk_jsx_element(self, element);
+
+        // Keep the open-element stack accurate around the recursive walk: push
+        // before descending so a child sees this element as its parent, pop after.
+        // A non-HTML tag (a component, a namespaced name) is pushed too, so the
+        // ancestor rules see the real ancestry; `element_tag` only gates the
+        // rules that compare tags, and a component is never one of those tags.
+        if let Some(tag) = element_tag(element) {
+            self.ancestors.push(tag.to_string());
+            oxc_ast_visit::walk::walk_jsx_element(self, element);
+            self.ancestors.pop();
+        } else {
+            oxc_ast_visit::walk::walk_jsx_element(self, element);
+        }
     }
 
     fn visit_jsx_fragment(&mut self, fragment: &JSXFragment<'a>) {
@@ -463,6 +777,58 @@ impl JsxChecker<'_> {
             }
 
             self.diagnostics.push(space_ambiguity(text.span));
+        }
+    }
+
+    /// The reparse refusals: a shape the HTML parser would rewrite.
+    ///
+    /// Three checks for one element: its **parent/child** tag pair, a non-blank
+    /// **text** child in a table family element, and its **ancestors** (a nested
+    /// anchor or form, or a stray list item). Each is `RA014` — the file parses;
+    /// this is the compiler declining markup whose parsed DOM would differ from
+    /// what the author wrote, which the island emitter cannot fix because it emits
+    /// HTML text the browser re-parses.
+    ///
+    /// The messages come from [`parent_child_refusal`], [`text_refusal`], and
+    /// [`ancestor_refusal`], shared with [`crate::ir::lower_route`] so a caller
+    /// that skips the analysis gets the same words rather than a different rule.
+    fn nesting(&mut self, element: &JSXElement<'_>) {
+        let Some(tag) = element_tag(element) else {
+            return;
+        };
+
+        // The parent is the innermost open element, if any. The route root has no
+        // parent, so a root `<p>`, `<table>`, or `<li>` is never the parent/child
+        // rule's business here — only its children are.
+        if let Some(parent) = self.ancestors.last()
+            && let Some(message) = parent_child_refusal(parent, tag)
+        {
+            self.diagnostics.push(reshaped(element.span, message));
+        }
+        if let Some(message) = ancestor_refusal(tag, &self.ancestors) {
+            self.diagnostics.push(reshaped(element.span, message));
+        }
+
+        // A text child is refused only by the table family, where the parser
+        // fosters it. Whitespace-only text is not content — an indented `<table>`
+        // has such children — so it is not refused.
+        if let Some(message) = text_refusal(tag) {
+            let fostered = element.children.iter().any(|child| {
+                matches!(child, JSXChild::Text(text) if !text.value.as_str().trim().is_empty())
+            });
+            if fostered {
+                self.diagnostics.push(reshaped(element.span, message));
+            }
+        }
+
+        // A binding inside a text-only / raw-text / fragment element breaks the
+        // island's marker ordinal: the parser reads the `<!>` as text (script,
+        // style, title, textarea) or moves it into a fragment the TreeWalker never
+        // reaches (template), so `_a[k]` addresses the wrong site. Island-only: a
+        // static template interpolates a string, never a marker.
+        if self.island && MARKER_HOSTILE.contains(&tag) && element_has_binding(element) {
+            self.diagnostics
+                .push(marker_hostile_refusal(element.span, tag));
         }
     }
 }
@@ -1070,6 +1436,87 @@ fn unsupported(span: Span, construct: &str, repair: &str) -> Diagnostic {
     )
 }
 
+/// The `RA014` for a markup shape the HTML parser would rewrite.
+///
+/// `message` is already a full sentence naming the parent, the child, what the
+/// parser does, and the repair — it comes from [`parent_child_refusal`],
+/// [`text_refusal`], or [`ancestor_refusal`], shared with lowering. Unlike
+/// [`unsupported`], it does not take a "cannot lower X yet" prefix: this is not an
+/// unimplemented construct but markup that means something other than it says, and
+/// the message's own opening clause is the construct.
+fn reshaped(span: Span, message: String) -> Diagnostic {
+    Diagnostic::new(Code::RA014, (span.start, span.end), message)
+}
+
+/// Whether `element` carries any dynamic binding: an attribute or event binding,
+/// or an `Expr` child (recursively, or as a bare expression).
+///
+/// This is the test the marker-hostile rule needs: only a **binding** inside a
+/// text-only element puts a marker where the parser will not keep it as a comment.
+/// Static text is fine — it is written verbatim either way.
+fn element_has_binding(element: &JSXElement<'_>) -> bool {
+    for attribute in &element.opening_element.attributes {
+        if let JSXAttributeItem::Attribute(attribute) = attribute
+            && matches!(
+                attribute.value.as_ref(),
+                Some(JSXAttributeValue::ExpressionContainer(_))
+            )
+            && !matches!(
+                attribute.value.as_ref(),
+                Some(JSXAttributeValue::ExpressionContainer(container))
+                    if matches!(container.expression, JSXExpression::EmptyExpression(_))
+            )
+        {
+            return true;
+        }
+    }
+    element.children.iter().any(child_has_binding)
+}
+
+/// Whether `child` is a bare expression, or an element that itself carries a
+/// binding. Static text and plain elements do not.
+fn child_has_binding(child: &JSXChild<'_>) -> bool {
+    match child {
+        JSXChild::ExpressionContainer(container) => {
+            !matches!(container.expression, JSXExpression::EmptyExpression(_))
+        }
+        JSXChild::Element(element) => element_has_binding(element),
+        // A fragment's children are spliced into the text-only element, so a
+        // binding inside one is the same defect; a spread is refused elsewhere.
+        JSXChild::Fragment(fragment) => fragment.children.iter().any(child_has_binding),
+        JSXChild::Text(_) | JSXChild::Spread(_) => false,
+    }
+}
+
+/// The `RA014` for a binding inside a text-only element an island cannot place a
+/// marker in.
+fn marker_hostile_refusal(span: Span, tag: &str) -> Diagnostic {
+    let reason = match tag {
+        "script" | "style" => {
+            "the browser reads the contents of `<script>` and `<style>` as literal text, so the \
+             `<!>` marker the island needs to address this binding is swallowed as text"
+        }
+        "title" | "textarea" => {
+            "`<title>` and `<textarea>` read their contents as RCDATA, so the `<!>` marker the \
+             island needs to address this binding is swallowed as text"
+        }
+        _ => {
+            "the browser parses this element's contents into a fragment the island's marker \
+             walker does not reach"
+        }
+    };
+    Diagnostic::new(
+        Code::RA014,
+        (span.start, span.end),
+        format!(
+            "`<{tag}>` cannot contain a dynamic binding here: {reason}, so the island would wire \
+             the wrong node. Write the value as static text, or move it into an attribute on the \
+             element (`<{tag}>` with no children and a plain attribute), or bind it on a sibling \
+             element that holds normal content."
+        ),
+    )
+}
+
 /// The `RA014` for JSX in a body statement that lowering copies verbatim.
 ///
 /// The construct and repair are shared with [`crate::ir::lower_route`], so the
@@ -1620,6 +2067,180 @@ mod tests {
             d[0].message.contains("one string"),
             "the message says render() returns one string: {}",
             d[0].message
+        );
+    }
+
+    // --- The reparse refusals (Task 11, Step 0) ------------------------------
+    //
+    // The emitted template is HTML text, so the browser's parser rebuilds the
+    // tree. For these shapes it does not rebuild the tree the author wrote: it
+    // closes a `<p>` at a block child, moves a `<div>` out of a `<table>`, splits
+    // nested anchors, and so on. The island emitter cannot fix a shape the
+    // browser rewrites, so the analyzer refuses it. Every one of these is
+    // `check []` before Task 11 — the RED this group is written against.
+
+    /// A block element inside `<p>`: the parser closes the paragraph at the block
+    /// start tag, so the div becomes a sibling and the page renders a different
+    /// shape. The message must name both tags and say "sibling".
+    #[test]
+    fn a_block_element_inside_a_paragraph_is_ra014() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>a<div>b</div></p> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<p>`"),
+            "names the parent: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("`<div>`"),
+            "names the child: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("sibling"),
+            "says sibling: {}",
+            d[0].message
+        );
+    }
+
+    /// A `<div>` inside `<table>` is fostered out of the table entirely: it lands
+    /// *before* the table, not inside it.
+    #[test]
+    fn a_table_may_contain_rows_but_not_a_div() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <table><div>x</div><tr><td>y</td></tr></table> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<table>`"),
+            "names the parent: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("`<div>`"),
+            "names the child: {}",
+            d[0].message
+        );
+    }
+
+    /// Bare text directly in a `<table>` is fostered before the table.
+    #[test]
+    fn bare_text_inside_a_table_is_ra014() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <table>text</table> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("foster"),
+            "the message says the parser fosters text: {}",
+            d[0].message
+        );
+    }
+
+    /// The parser closes the open anchor at a nested `<a>`, so the inner one
+    /// becomes a sibling.
+    #[test]
+    fn an_anchor_inside_an_anchor_is_ra014() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <a href=\"/x\"><a href=\"/y\">z</a></a> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<a>`"),
+            "names the tag: {}",
+            d[0].message
+        );
+    }
+
+    /// A nested `<p>` also splits: the parser closes the first paragraph.
+    #[test]
+    fn a_nested_paragraph_is_ra014() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p><p>z</p></p> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<p>`"),
+            "names the tags: {}",
+            d[0].message
+        );
+    }
+
+    /// A `<li>` outside `<ul>`/`<ol>` has no list to belong to.
+    #[test]
+    fn a_list_item_must_have_a_list_parent() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <div><li>x</li></div> }\n";
+        let d = check(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`<li>`"),
+            "names the tag: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("`<ul>`"),
+            "names the list: {}",
+            d[0].message
+        );
+    }
+
+    /// The shapes the parser rebuilds faithfully stay clean. A route root may be
+    /// `p` — the rule is about CHILDREN, not the root tag.
+    #[test]
+    fn the_legal_shapes_stay_clean() {
+        for src in [
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <ul><li>a</li><li>b</li></ul> }\n",
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <table><tbody><tr><td>x</td></tr></tbody></table> }\n",
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <p><span>a</span> and <b>b</b></p> }\n",
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <dl><dt>a</dt><dd>b</dd></dl> }\n",
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <select><option>a</option></select> }\n",
+            // A route root may be `p`: the rule is about CHILDREN, not the root tag.
+            "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>plain</p> }\n",
+        ] {
+            let alloc = oxc_allocator::Allocator::default();
+            let program = crate::source::parse_tsx(&alloc, src).unwrap();
+            assert!(check_jsx(program, src).is_empty(), "{src}");
+        }
+    }
+
+    /// A **binding inside a text-only element** is `RA014` in an island: `script`
+    /// and `style` read the `<!>` marker as literal text, `title` and `textarea`
+    /// read it as RCDATA, and `template` puts it in a fragment the island's
+    /// TreeWalker never descends into — so the marker count or its order differs
+    /// from what the emitter wrote and `_a[k]` addresses the wrong site.
+    ///
+    /// A static route is unaffected (its template interpolates a string, never a
+    /// marker), so the rule is island-only. The control below is that same binding
+    /// in a `"use static"` route, which stays clean.
+    #[test]
+    fn a_binding_inside_a_text_only_element_is_ra014_in_an_island() {
+        for src in [
+            "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const c = signal(\"x\"); return <style>{c()}</style> }\n",
+            "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const c = signal(\"x\"); return <script>{c()}</script> }\n",
+            "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const c = signal(\"x\"); return <textarea>{c()}</textarea> }\n",
+            "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const c = signal(\"x\"); return <div><template>{c()}</template></div> }\n",
+        ] {
+            let d = check(src);
+            assert_eq!(d.len(), 1, "{src}: {d:?}");
+            assert_eq!(d[0].code, Code::RA014, "{src}");
+            assert!(
+                d[0].message.contains("marker") || d[0].message.contains("text"),
+                "{src}: the message says why: {}",
+                d[0].message
+            );
+        }
+
+        // The control: the same binding in a static route is clean — a static
+        // template interpolates a string and never places a marker.
+        let static_src = "\"use static\"\nexport default function P(props: Record<never, never>) { const c = \"x\"; return <style>{c}</style> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = crate::source::parse_tsx(&alloc, static_src).unwrap();
+        assert!(
+            check_jsx(program, static_src).is_empty(),
+            "a static template may hold a binding in a text-only element"
         );
     }
 }
