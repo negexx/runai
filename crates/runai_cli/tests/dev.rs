@@ -466,6 +466,77 @@ fn a_future_mtime_does_not_rebuild_on_every_request() {
     );
 }
 
+/// N-D: a future mtime on a **directory** must be clamped too. The marker folded only
+/// file mtimes, while the comparison reads every directory's own mtime, so a future-dated
+/// directory was "changed" forever and every page request ran a full rebuild — measured
+/// as `built_at` moving on 5 of 6 request pairs.
+#[test]
+fn a_future_directory_mtime_does_not_rebuild_on_every_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+
+    let routes = tmp.path().join("src/routes");
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::File::open(&routes)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+
+    assert_eq!(http(port, "GET", "/").0, 200, "the first request rebuilds");
+    let first = built_at(port);
+    for pair in 1..=6 {
+        assert_eq!(http(port, "GET", "/").0, 200);
+        let next = built_at(port);
+        assert_eq!(
+            first, next,
+            "a future directory mtime rebuilt on every request \
+             (build stamp moved {first} -> {next} by pair {pair})"
+        );
+    }
+}
+
+/// N-D's other half: folding directory mtimes into the marker must not switch the
+/// directory comparison off. A rename touches only the parent directory — no file mtime
+/// changes — so it is the narrowest proof that a normally-touched directory still rebuilds.
+#[test]
+fn renaming_a_route_rebuilds() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    std::fs::write(
+        tmp.path().join("src/routes/gone.page.tsx"),
+        route_body("moved"),
+    )
+    .unwrap();
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(http(port, "GET", "/gone/").0, 200);
+
+    settle();
+    std::fs::rename(
+        tmp.path().join("src/routes/gone.page.tsx"),
+        tmp.path().join("src/routes/moved.page.tsx"),
+    )
+    .unwrap();
+
+    assert_eq!(http(port, "GET", "/").0, 200, "the rebuild must publish");
+    assert_eq!(
+        http(port, "GET", "/moved/").0,
+        200,
+        "a renamed route must be served at its new path"
+    );
+    assert_eq!(
+        http(port, "GET", "/gone/").0,
+        404,
+        "a renamed route must stop being served at the old path"
+    );
+}
+
 /// Fold: a browser must not serve a cached pre-edit page after a rebuild.
 #[test]
 fn every_response_is_no_store() {

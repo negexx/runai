@@ -1414,9 +1414,10 @@ fn newer(path: &Path, since: SystemTime) -> bool {
 /// A *future* mtime is deliberately reported as newer here — the file was still touched
 /// after the last build from the build's point of view, and skipping it would serve a
 /// stale page. What stops that from rebuilding forever is not this comparison but
-/// [`Server::rebuild_locked`], which moves its marker to `max(now, newest mtime)` after
-/// building: a mtime in the future is then covered by the marker instead of staying ahead
-/// of it permanently.
+/// [`Server::rebuild_locked`], which moves its marker to `max(start, newest mtime at
+/// start)` **before** each build: a mtime in the future is then covered by the marker
+/// instead of staying ahead of it permanently. Stamping before the build, not after, is
+/// what keeps a file edited *during* the build newer than the marker.
 fn is_newer(modified: std::io::Result<SystemTime>, since: SystemTime) -> bool {
     match modified {
         Ok(modified) => modified > since,
@@ -1438,7 +1439,13 @@ fn newest_modified(root: &Path) -> SystemTime {
 }
 
 /// [`newest_modified`] for a directory tree, folding into `newest`.
+///
+/// Each directory's **own** mtime is folded alongside its files, mirroring
+/// [`directory_changed`]. Without it the marker can never cover a directory touched in the
+/// future, and the comparison reads that mtime on every request: a future-dated `src/routes`
+/// rebuilt once per page request, forever.
 fn newest_of(dir: &Path, newest: &mut SystemTime) {
+    *newest = (*newest).max(modified_or_epoch(dir));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1680,9 +1687,41 @@ mod tests {
         );
     }
 
+    /// N-D: a future mtime on a **directory** must be covered too. `changed_since` reads
+    /// every directory's own mtime; the marker folded only file mtimes, so a future-dated
+    /// directory was permanently newer and every request rebuilt. The two functions must
+    /// fold the same set.
+    #[test]
+    fn a_future_directory_mtime_is_covered_by_a_clamped_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let routes = tmp.path().join(SRC).join("routes");
+        std::fs::create_dir_all(&routes).unwrap();
+        std::fs::write(routes.join("index.page.tsx"), "x").unwrap();
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        std::fs::File::open(&routes)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        let marker = SystemTime::now().max(newest_modified(tmp.path()));
+        assert_eq!(
+            marker, future,
+            "the marker must cover a future directory mtime, or `changed_since` sees it forever"
+        );
+        assert!(
+            !changed_since(tmp.path(), marker),
+            "a future directory mtime must not look newer than the marker derived from it"
+        );
+    }
+
     /// NEW-C, as a unit: the marker must be derived from the sources that existed when the
     /// build **started**, so a file written during the build is newer than it. Measuring
     /// the newest mtime after the build covered that edit permanently.
+    ///
+    /// The write is separated from the marker by the same 1100 ms the integration tests
+    /// use in their `settle` helper: on a 1-second-granularity filesystem a shorter gap
+    /// truncates the write's mtime to at or before the marker, and the test fails for a
+    /// reason that has nothing to do with the code under test.
     #[test]
     fn a_file_written_during_a_build_stays_newer_than_the_marker() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1695,7 +1734,7 @@ mod tests {
         let marker = started.max(newest_modified(tmp.path()));
 
         // The build runs; the user saves the file while it does.
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(1100));
         std::fs::write(&route, "after").unwrap();
 
         assert!(
