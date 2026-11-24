@@ -159,8 +159,8 @@ impl Code {
                  and asking it to run while it is already running does not loop: the runtime \
                  throws `effect cycle: an effect wrote a signal it reads` (and a wave limit throws \
                  when effects keep invalidating each other). A write of the value the signal \
-                 already holds notifies nobody — the setter returns early — so it neither re-runs \
-                 nor throws."
+                 already holds never notifies anyone — the setter bails out first — so it neither \
+                 re-runs nor throws."
             }
             Code::RA006 => {
                 "A component's props parameter is missing an explicit type annotation, or the \
@@ -301,8 +301,7 @@ impl Code {
             Code::RA014 => {
                 "For an import or re-export, inline the value or import it from `\"runai\"`; a \
                  re-export whose source is `\"runai\"` becomes `import { owner } from \"runai\"` \
-                 with the name used here, not exported, because the generated module already \
-                 exports its own names; a \
+                 with the name used here; a \
                  default or namespace `\"runai\"` import is not a form the emitted module writes, \
                  so rewrite it as named imports; write `import x = require(…)` as an `import`, and \
                  `export =` as `export default` or a named export. For a `declare` statement, \
@@ -873,8 +872,13 @@ mod tests {
                 "the RA002 {what} must name the throw (`{RA002_THROWS}`): {text}"
             );
             assert!(
-                text.to_ascii_lowercase().contains("does not"),
-                "the RA002 {what} must say the same-value write does not notify: {text}"
+                text.contains("returns early")
+                    || text.contains("before notifying")
+                    || text.contains("notifies nobody")
+                    || text.contains("never notifies")
+                    || text.contains("bails out"),
+                "the RA002 {what} must name the same-value early return (the setter short-circuits \
+                 before notifying), not merely contain a negation: {text}"
             );
         }
     }

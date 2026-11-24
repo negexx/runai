@@ -321,8 +321,8 @@ pub(crate) fn is_page(path: &str) -> bool {
 ///   statement is still excluded from the artifact, so accepting it would drop
 ///   the author's statement with no diagnostic. The repair names the form an
 ///   island can write — `import { owner } from "runai"`, then use the written
-///   binding; exporting it would be a duplicate export, because the island module
-///   already exports every specifier it imports.
+///   binding here. The emitter writes no export of its own, so there is nothing
+///   to duplicate: the refusal is about the dropped statement, not the export.
 ///
 /// **The two CommonJS spellings TypeScript allows are refused too**, because
 /// [`crate::strip::strip_types`] rewrites them into JavaScript that a `.mjs`
@@ -422,16 +422,15 @@ fn check_import(
 /// excluded from `module_statements` (an emitted module writes one import or
 /// none), so if it were also accepted here the author's statement would vanish
 /// from the artifact with no diagnostic — silent data loss, which is worse than
-/// a wrong render. The message names the legal rewrite, which an island can
-/// actually perform: `import { owner } from "runai"` and then use the written
-/// binding, not export it — the island module already exports every specifier it
-/// imports, so re-exporting one is a duplicate export. `export * from "runai"` has no specifier list an emitter
-/// could write, so the same refusal applies.
+/// a wrong render. That is the *whole* reason: the emitter writes no export of
+/// its own, so there is nothing to duplicate. The message names the legal
+/// rewrite, which an island can actually perform — `import { owner } from
+/// "runai"` and then use the written binding here. `export * from "runai"` has no
+/// specifier list an emitter could write, so the same refusal applies.
 ///
 /// The repair therefore differs by source: a foreign module's value has to be
-/// written here, while a `"runai"` value is imported here and used, not exported,
-/// because the island module already exports every specifier it writes. No repair says "move the statement", which is not
-/// something either emitter can do.
+/// written here, while a `"runai"` value is imported here and used. No repair
+/// says "move the statement", which is not something either emitter can do.
 fn check_reexport(module: &oxc_ast::ast::StringLiteral<'_>, source: &str) -> Option<Diagnostic> {
     let written =
         raw_text(source, module.span).unwrap_or_else(|| module.value.as_str().unwrap_or(""));
@@ -455,8 +454,7 @@ fn check_reexport(module: &oxc_ast::ast::StringLiteral<'_>, source: &str) -> Opt
         (module.span.start, module.span.end),
         format!(
             "{reason} Write the value in this file, or import it from `\"{PRIMITIVE_SOURCE}\"` and \
-             use the written binding here. Do not export it: the generated module already exports \
-             its own names, so an export of an imported one is a duplicate export."
+             use the written binding here."
         ),
     ))
 }

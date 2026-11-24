@@ -25,8 +25,20 @@
 //!   verbatim (`skill_body` cannot drift from it — pinned elsewhere);
 //! - the **instruction half** of every per-site `message` the rules compose
 //!   (everything after the first `": "`, or the whole message when there is
-//!   none), driven through [`crate::analyze::analyze`] *and* through the shared
-//!   refusal composers that lower-level callers use;
+//!   none), driven through [`crate::analyze::analyze`];
+//! - every shared refusal composer, called directly over a tag domain **derived**
+//!   from the tables themselves ([`crate::analyze::jsx::CONTENT_MODEL`],
+//!   [`crate::analyze::jsx::BLOCK_IN_P`], [`crate::analyze::jsx::MARKER_HOSTILE`],
+//!   [`crate::analyze::jsx::REQUIRED_ANCESTORS`],
+//!   [`crate::analyze::jsx::SELF_CLOSING`], [`crate::ir::VOID_ELEMENTS`]), so a
+//!   new tag with a new sentence is covered the day it is added — that claim is
+//!   kept by construction, not by a hand-written copy;
+//! - every repair **literal at an `unsupported(…)` call site** in `jsx.rs`,
+//!   `ir.rs`, `entry.rs`, and `emitted_names.rs`, read from those files' own
+//!   source. `unsupported()` takes its construct and repair from the caller, so
+//!   this is the only way an `ir.rs`-only arm (one no fixture reaches) is scanned;
+//! - every repair driven through `lower_route` directly, which is the path that
+//!   does **not** run `analyze`;
 //! - the per-site directive repairs, which must name no line at all.
 //!
 //! Not covered, deliberately: prose (`explain`, a skill's `## Why it is an
@@ -35,12 +47,22 @@
 //! uppercase name there is a symbol, not an instruction. `codegen`'s two
 //! emitter-mode refusals and `build.rs`'s JSON-schema error are outside the
 //! analysis pipeline; they are asserted directly where they live.
+//!
+//! **One refusal has no reachable fixture**: an attribute with an empty expression
+//! (`name={}`). Oxc rejects it as a parse error ("JSX attributes must only be
+//! assigned a non-empty expression"), so it is `RA007` and never reaches analysis
+//! or lowering. Its repair is a named constant
+//! ([`crate::analyze::jsx::EMPTY_ATTRIBUTE_REPAIR`]) scanned by the composer test,
+//! and the call-site scan below would catch a literal if one were written, so the
+//! arm is covered without a fixture that cannot exist.
 
 #[cfg(test)]
 mod tests {
     use crate::analyze;
     use crate::analyze::jsx::{
-        BODY_JSX_REPAIR, JSX_IN_EXPRESSION_REPAIR, MODULE_JSX_REPAIR, SPREAD_CHILD_REPAIR,
+        BLOCK_IN_P, BODY_JSX_REPAIR, CONTENT_MODEL, FRAGMENT_ROOT_REPAIR, JSX_ATTRIBUTE_REPAIR,
+        JSX_IN_EXPRESSION_REPAIR, MARKER_HOSTILE, MODULE_JSX_REPAIR, REQUIRED_ANCESTORS,
+        SCRIPT_SUPPORTING, SELF_CLOSING, SPREAD_ATTRIBUTE_REPAIR, SPREAD_CHILD_REPAIR,
         ancestor_refusal, marker_hostile_message, parent_child_refusal, self_closing_refusal,
         text_refusal,
     };
@@ -415,71 +437,67 @@ mod tests {
         check_all(fixtures);
     }
 
+    /// Every tag the refusal tables can name, derived — never hand-listed.
+    ///
+    /// The doc claim this module makes ("a new tag with a new interpolated
+    /// sentence is covered the day it is added") is only true if the composer
+    /// corpus is the tables themselves. A hand-written list is a second copy that
+    /// silently stops covering the day someone adds a row, so this function reads
+    /// [`CONTENT_MODEL`], [`BLOCK_IN_P`], [`MARKER_HOSTILE`], [`REQUIRED_ANCESTORS`],
+    /// [`SELF_CLOSING`], and [`VOID_ELEMENTS`] and unions them. Adding a tag to any
+    /// table adds it here with no edit.
+    fn refusal_tags() -> Vec<&'static str> {
+        let mut tags: Vec<&'static str> = Vec::new();
+        for (parent, children) in CONTENT_MODEL {
+            tags.push(parent);
+            tags.extend(*children);
+        }
+        tags.extend(BLOCK_IN_P);
+        tags.extend(MARKER_HOSTILE);
+        for (tag, closes, _) in SELF_CLOSING {
+            tags.push(tag);
+            tags.extend(*closes);
+        }
+        for (tag, parents) in REQUIRED_ANCESTORS {
+            tags.push(tag);
+            tags.extend(*parents);
+        }
+        tags.extend(VOID_ELEMENTS);
+        tags.extend(SCRIPT_SUPPORTING);
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    /// Every parent whose content a refusal composer constrains, derived.
+    ///
+    /// [`CONTENT_MODEL`]'s keys, plus `<p>` (whose content model is the
+    /// [`BLOCK_IN_P`] deny-list rather than a table row), plus the table family
+    /// [`text_refusal`] speaks about — those are `CONTENT_MODEL` keys already, so
+    /// the union is the keys plus `p`.
+    fn refusal_parents() -> Vec<&'static str> {
+        let mut parents: Vec<&'static str> =
+            CONTENT_MODEL.iter().map(|(parent, _)| *parent).collect();
+        parents.push("p");
+        parents.sort_unstable();
+        parents.dedup();
+        parents
+    }
+
     /// The shared refusal composers, called directly with every tag their tables
     /// list. A fixture-driven corpus only reaches the arms its fixtures happen to
-    /// select; these loops are exhaustive over the tag lists, so a new tag with a
-    /// new interpolated sentence is covered the day it is added.
+    /// select; these loops are exhaustive over the derived tag lists, so a new tag
+    /// with a new interpolated sentence is covered the day it is added.
+    ///
+    /// The domain is **derived** ([`refusal_tags`], [`refusal_parents`]), not
+    /// hand-listed. That is what makes the module doc's claim true rather than
+    /// aspirational: a second, hand-written list would be the defect this test
+    /// exists to prevent, one indirection out.
     #[test]
     fn every_shared_refusal_composer_is_instruction_clean() {
-        // Every tag either side of a nesting rule can name, plus every void and
-        // marker-hostile element.
-        let tags: &[&str] = &[
-            "p",
-            "div",
-            "span",
-            "a",
-            "form",
-            "li",
-            "dt",
-            "dd",
-            "ul",
-            "ol",
-            "dl",
-            "table",
-            "thead",
-            "tbody",
-            "tfoot",
-            "tr",
-            "td",
-            "th",
-            "caption",
-            "colgroup",
-            "col",
-            "select",
-            "option",
-            "optgroup",
-            "figure",
-            "figcaption",
-            "fieldset",
-            "legend",
-            "details",
-            "summary",
-            "button",
-            "nobr",
-            "h1",
-            "h2",
-            "h6",
-            "script",
-            "style",
-            "title",
-            "textarea",
-            "noscript",
-            "template",
-        ];
-        let parents: &[&str] = &[
-            "p", "table", "thead", "tbody", "tfoot", "tr", "colgroup", "select", "optgroup", "ul",
-            "ol", "menu", "dl",
-        ];
-        let ancestors = [
-            "div".to_string(),
-            "ul".to_string(),
-            "a".to_string(),
-            "form".to_string(),
-            "select".to_string(),
-            "dl".to_string(),
-            "table".to_string(),
-            "tbody".to_string(),
-        ];
+        let tags = refusal_tags();
+        let parents = refusal_parents();
+        let ancestors: Vec<String> = tags.iter().map(|tag| (*tag).to_string()).collect();
 
         let mut checked = 0;
         let mut check = |what: &str, message: &str| {
@@ -493,8 +511,8 @@ mod tests {
             checked += 1;
         };
 
-        for parent in parents {
-            for child in tags {
+        for parent in parents.iter().copied() {
+            for child in tags.iter().copied() {
                 if let Some(message) = parent_child_refusal(parent, child) {
                     check("parent/child refusal", &message);
                 }
@@ -503,32 +521,31 @@ mod tests {
                 }
             }
         }
-        for tag in tags {
-            for parent in parents {
+        for tag in tags.iter().copied() {
+            for parent in &parents {
                 let path = vec![parent.to_string()];
                 if let Some(message) = self_closing_refusal(tag, &path) {
                     check("self-closing refusal", &message);
                 }
             }
-            for tag in tags {
-                if let Some(message) = ancestor_refusal(tag, &ancestors) {
-                    check("ancestor refusal", &message);
-                }
+            if let Some(message) = ancestor_refusal(tag, &ancestors) {
+                check("ancestor refusal", &message);
             }
-            if crate::ir::VOID_ELEMENTS.contains(tag) {
-                let path = vec!["div".to_string()];
-                if let Some(message) = parent_child_refusal("div", tag) {
-                    check("void element", &message);
-                }
-                let _ = path;
+            if VOID_ELEMENTS.contains(&tag)
+                && let Some(message) = parent_child_refusal("div", tag)
+            {
+                check("void element", &message);
             }
-            if crate::analyze::jsx::MARKER_HOSTILE.contains(tag) {
+            if MARKER_HOSTILE.contains(&tag) {
                 check("marker-hostile refusal", &marker_hostile_message(tag));
             }
         }
         for message in [
             JSX_IN_EXPRESSION_REPAIR,
             SPREAD_CHILD_REPAIR,
+            SPREAD_ATTRIBUTE_REPAIR,
+            JSX_ATTRIBUTE_REPAIR,
+            FRAGMENT_ROOT_REPAIR,
             BODY_JSX_REPAIR,
             MODULE_JSX_REPAIR,
             crate::analyze::jsx::SPACE_FIX,
@@ -605,10 +622,13 @@ mod tests {
                 "\"use island\"\nexport default function P(props: Record<never, never>) { return <main><b/></main> }\n",
             ),
             (
-                // The repair's half-sentence used to be "use or export the written
-                // binding". The "export" half lands in a second RA014, because the
-                // island module already exports every import specifier it writes, so
-                // re-exporting one is a duplicate export. "Use it" compiles.
+                // The repair's old half-sentence was "use or export the written
+                // binding". The "export" half was refused, but not because of a
+                // duplicate: the emitter writes no export of its own, so
+                // `export { wrapped }` of a local value builds and appears in the
+                // artifact. The export of a *runtime import* is a separate refusal
+                // (an export statement of a runtime import is not written either),
+                // so "use it here" stays the one reachable form.
                 "runai re-export",
                 "\"use island\"\nexport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\n",
                 "\"use island\"\nimport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{String(owner)}</p> }\n",
@@ -634,6 +654,232 @@ mod tests {
                 "{what}: applying the repair verbatim lands in another refusal: {repaired:?}"
             );
         }
+    }
+
+    /// The **export** half of the `"runai"` re-export repair: an island can import
+    /// the binding, and the artifact carries an ordinary local export.
+    ///
+    /// This control exists because a round-2 message claimed the generated module
+    /// already exports every import specifier, so exporting one is a duplicate
+    /// export. Both halves were false: `import { owner } from "runai"; const
+    /// wrapped = owner; export { wrapped }` builds, and the emitted module contains
+    /// `export { wrapped };`. The claim is now deleted; this test keeps it from
+    /// coming back in either direction:
+    ///
+    /// 1. `export { owner }` of a *runtime* import is still one refusal, and its
+    ///    message must not claim a duplicate export;
+    /// 2. an ordinary local export is accepted, and the artifact carries it — the
+    ///    "the emitter never exports" claim cannot be re-derived from this code.
+    #[test]
+    fn the_runai_reexport_repair_does_not_claim_a_duplicate_export() {
+        let exporting_import = "\"use island\"\nimport { owner } from \"runai\"\nexport { owner }\nexport default function P(props: Record<never, never>) { return <p/> }\n";
+        let diagnostics = analyze::analyze(exporting_import, PAGE);
+        let ra014: Vec<&crate::diagnostic::Diagnostic> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::RA014)
+            .collect();
+        assert_eq!(
+            ra014.len(),
+            1,
+            "the export of a runtime import is one refusal: {diagnostics:?}"
+        );
+        let message = &ra014[0].message;
+        for false_claim in ["duplicate export", "already exports `owner`", "cannot load"] {
+            assert!(
+                !message.contains(false_claim),
+                "the message invents `{false_claim}`; the emitter exports nothing of its own: \
+                 {message}"
+            );
+        }
+
+        // The legal form, applied by hand: a local value is exported, the module
+        // builds, and the export is in the artifact.
+        let local_export = "\"use island\"\nimport { owner } from \"runai\"\nconst wrapped = owner\nexport { wrapped }\nexport default function P(props: Record<never, never>) { return <p/> }\n";
+        let diagnostics = analyze::analyze(local_export, PAGE);
+        assert!(
+            diagnostics.is_empty(),
+            "an ordinary local export is legal: {diagnostics:?}"
+        );
+        let module = crate::codegen::emit_client_checked(local_export, PAGE, "/assets/runtime.js")
+            .unwrap_or_else(|diagnostics| panic!("the module must build: {diagnostics:?}"));
+        assert!(
+            module.contains("export { wrapped };"),
+            "the emitter must carry the local export, not drop it: {module}"
+        );
+        assert!(
+            !module.contains("export { owner }"),
+            "the emitter writes no export of an import specifier of its own: {module}"
+        );
+    }
+
+    /// Every repair `lowering` composes, reached through `lower_route` itself.
+    ///
+    /// `lower_route` is the emitters' entry point and **does not run `analyze`**,
+    /// so each of these fixtures takes the `ir.rs` path — `ir.rs`'s `unsupported()`,
+    /// which takes the construct and repair from its caller. That is the path an
+    /// analysis-only corpus cannot prove anything about: an `ir.rs` call site added
+    /// with its own literal would be invisible here if the fixture went through
+    /// `analyze` instead.
+    ///
+    /// The one arm with **no** reachable fixture is the empty attribute expression
+    /// (`name={}`): Oxc rejects it as a parse error ("JSX attributes must only be
+    /// assigned a non-empty expression"), so it is unreachable from any file, not
+    /// merely lowering-only. It is covered instead as a constant
+    /// ([`EMPTY_ATTRIBUTE_REPAIR`]) and by the source scan below, because a fixture
+    /// for it cannot be written — see `no_repair_literal_at_a_call_site_is_unscanned`.
+    #[test]
+    fn lowerings_own_repairs_are_instruction_clean() {
+        let fixtures: &[(&str, &str)] = &[
+            (
+                "spread attribute",
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <div {...rest}/> }\n",
+            ),
+            (
+                "JSX-valued attribute",
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <div title=<b/>/> }\n",
+            ),
+            (
+                "spread child",
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <div>{...items}</div> }\n",
+            ),
+            (
+                "JSX in an expression",
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <div>{ok ? <b/> : null}</div> }\n",
+            ),
+            (
+                "fragment root",
+                "\"use island\"\nexport default function P(props: Record<never, never>) { return <><b/></> }\n",
+            ),
+        ];
+        for (what, src) in fixtures {
+            let errors = crate::ir::lower_route(src)
+                .err()
+                .unwrap_or_else(|| panic!("{what}: lowering must refuse this fixture"));
+            for diagnostic in &errors {
+                assert_instruction_clean(what, &diagnostic.code, &diagnostic.message);
+            }
+        }
+    }
+
+    /// Every repair literal written **at a call site** in `jsx.rs` or `ir.rs` is
+    /// instruction-clean, and every `unsupported(…)` repair argument is either a
+    /// named constant or a clean literal.
+    ///
+    /// This is the control the fixture corpus cannot be: it reads the two files'
+    /// own source, so a repair added at an `ir.rs` call site — including one arm no
+    /// fixture can reach — is scanned the day it is written. `unsupported()` takes
+    /// its repair from the caller, so "the scan reaches that path" has to be a
+    /// statement about the call sites, not about whichever fixtures exist.
+    ///
+    /// A conservative scan: it looks for string literals that immediately follow
+    /// `unsupported(`'s argument list, which is the one shape a repair takes at a
+    /// call site. Constants (the identifiers `SPREAD_ATTRIBUTE_REPAIR`, …) are not
+    /// literals and are covered by the composer test; a literal introduced at a
+    /// call site would be caught here.
+    #[test]
+    fn no_repair_literal_at_a_call_site_is_unscanned() {
+        let sources = [
+            ("analyze/jsx.rs", include_str!("analyze/jsx.rs")),
+            ("ir.rs", include_str!("ir.rs")),
+            ("analyze/entry.rs", include_str!("analyze/entry.rs")),
+            (
+                "analyze/emitted_names.rs",
+                include_str!("analyze/emitted_names.rs"),
+            ),
+        ];
+
+        let mut checked = 0;
+        for (file, source) in sources {
+            for (at, literal) in repair_literals_at_call_sites(source) {
+                if let Some((_, token)) = instruction_bracket(&literal) {
+                    panic!(
+                        "{file}: a repair literal at byte {at} asks the agent to type `{token}` \
+                         but is not a scanned constant: {literal}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 4,
+            "the scan found {checked} repair literals; the call-site shape changed and the scan \
+             is now vacuous"
+        );
+    }
+
+    /// The string-literal **repair** arguments written inline at an `unsupported(…)`
+    /// call site in `source`, with the byte offset of the literal's opening quote.
+    ///
+    /// Only the third argument (the repair) is examined: the first is a span and
+    /// the second is the construct, and a construct such as
+    /// `"an attribute whose value is itself JSX (`name=<Bar />`)"` legitimately
+    /// carries a bracketed *symbol* — that is naming, not an instruction, which is
+    /// the split the module doc states.
+    ///
+    /// Deliberately textual: the shapes to find are the ones a type cannot
+    /// enumerate — a literal typed at one call site. The parser is small and its
+    /// failure mode is "found nothing", which the caller's count assertion turns
+    /// into a test failure rather than silent passage.
+    fn repair_literals_at_call_sites(source: &str) -> Vec<(usize, String)> {
+        let mut found = Vec::new();
+        let call = "unsupported(";
+        let mut search = 0usize;
+        while let Some(offset) = source[search..].find(call) {
+            let args_start = search + offset + call.len();
+            search = args_start;
+
+            // Split the argument list at top-level commas, ignoring delimiters
+            // inside a string literal and escapes. Rust's own lexer is not
+            // available here, so the string state is tracked explicitly.
+            let mut args: Vec<(usize, usize)> = Vec::new();
+            let mut depth = 0usize;
+            let mut arg_start = args_start;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (index, ch) in source[args_start..].char_indices() {
+                let absolute = args_start + index;
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => {
+                        if depth == 0 {
+                            args.push((arg_start, absolute));
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    ',' if depth == 0 => {
+                        args.push((arg_start, absolute));
+                        arg_start = absolute + 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(&(start, end)) = args.get(2) else {
+                continue;
+            };
+            let raw = &source[start..end];
+            let leading = raw.len() - raw.trim_start().len();
+            let arg = raw.trim();
+            if arg.starts_with('"') && arg.ends_with('"') && arg.len() > 2 {
+                // Unescape the small set the scanner needs; the predicate only
+                // cares about `<` and ASCII letters.
+                let literal = arg[1..arg.len() - 1].replace("\\\"", "\"");
+                found.push((start + leading, literal));
+            }
+        }
+        found
     }
 
     /// The same rule applied to the spread-child repair specifically, because it

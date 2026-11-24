@@ -143,6 +143,25 @@ pub(crate) const VOID_ELEMENTS: &[&str] = &[
 /// every import specifier the module writes, which is data, not a constant.
 pub const PRERENDER_NAMES: &[&str] = &["_esc", "_attr", "render"];
 
+/// The names the **prerendered** module *exports*, as opposed to binds.
+///
+/// Only `render` is both declared and exported: `_esc` and `_attr` are
+/// module-scope `const`s the template calls, and the island module exports nothing
+/// of the compiler's at all (its only exports are the route's own, sliced from the
+/// source). So only exporting `render` is a *duplicate export*; exporting any
+/// other reserved name exports a binding the artifact owns but does not export.
+/// The distinction is a constant because a message that asserted "duplicate
+/// export" for `_esc` was a shipped false diagnostic.
+pub const PRERENDER_EXPORTS: &[&str] = &["render"];
+
+/// The names the **island** module exports of its own: none.
+///
+/// The island emitter writes one import, the helpers, the template, the module
+/// statements, the component, and the `mount` call. Nothing it writes is an export
+/// of the compiler's, so an export of a reserved name there is a collision with
+/// the module's bindings, never a duplicate export.
+pub const ISLAND_EXPORTS: &[&str] = &[];
+
 /// The names an **island** module declares for itself, independent of the route.
 ///
 /// The island emitter's own locals: `_c` (the marker collector), `_a` (the marker
@@ -643,8 +662,7 @@ impl<'s> Lowerer<'s> {
             Expression::JSXFragment(fragment) => Err(vec![unsupported(
                 fragment.span,
                 "a fragment as the route's returned JSX",
-                "Return exactly one element instead, wrapping the fragment's children in \
-                 `<main>…</main>` or whichever parent suits the page.",
+                crate::analyze::jsx::FRAGMENT_ROOT_REPAIR,
             )]),
             // `route_render` only returns JSX, so this is unreachable.
             other => Err(vec![unlowerable_root(other.span())]),
@@ -720,7 +738,7 @@ impl<'s> Lowerer<'s> {
                 return Err(vec![unsupported(
                     attribute.span(),
                     "a spread attribute (`{...expr}`)",
-                    "Write the attributes it carries out one at a time, or remove the spread.",
+                    crate::analyze::jsx::SPREAD_ATTRIBUTE_REPAIR,
                 )]);
             };
 
@@ -741,7 +759,7 @@ impl<'s> Lowerer<'s> {
                             vec![unsupported(
                                 container.span,
                                 "an attribute with an empty expression (`name={}`)",
-                                "Give the attribute a value, e.g. `name={value}`.",
+                                crate::analyze::jsx::EMPTY_ATTRIBUTE_REPAIR,
                             )]
                         })?
                         .to_string();
@@ -757,8 +775,7 @@ impl<'s> Lowerer<'s> {
                     return Err(vec![unsupported(
                         other.span(),
                         "an attribute whose value is itself JSX (`name=<Bar />`)",
-                        "Pass the element as a child instead: write it between the element's \
-                         tags, e.g. `<div><b>…</b></div>`, because an attribute holds a value.",
+                        crate::analyze::jsx::JSX_ATTRIBUTE_REPAIR,
                     )]);
                 }
             }

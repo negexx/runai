@@ -75,8 +75,8 @@ fn why(code: Code) -> &'static str {
              running, and the runtime does not loop: it throws `effect cycle: an effect wrote a \
              signal it reads`, and after 100 waves of effects invalidating each other it throws \
              the cycle error instead of spinning. Writing back the value the signal already holds \
-             is not even a notification — the setter returns before notifying — so it does not \
-             re-run the effect and cannot throw. An effect that reads nothing cannot re-run at \
+             is not even a notification — the setter bails out before notifying — so it never \
+             re-runs the effect and cannot throw. An effect that reads nothing cannot re-run at \
              all, so the write there is a one-shot side effect — still not a derived value, and \
              still the wrong place for it."
         }
@@ -175,8 +175,7 @@ fn why(code: Code) -> &'static str {
              This lifts when bundling lands. A re-export whose source *is* `\"runai\"` is refused \
              for a different reason — the statement is never emitted, so accepting it would drop \
              the author's statement with no diagnostic — and the repair is `import { owner } from \
-             \"runai\"`, then use the written binding. Not export it: the generated module already \
-             exports its own names, so re-exporting an imported one would be a duplicate export. \
+             \"runai\"`, then use the written binding here. \
              A default (`import runai from \
              \"runai\"`) or namespace (`import * as runai from \"runai\"`) import of `\"runai\"` is \
              refused because the island emitter writes exactly one import, merging the route's \

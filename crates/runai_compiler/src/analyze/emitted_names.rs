@@ -13,6 +13,13 @@
 //! function P() { return <p>{_esc("x")}</p> } // an undeclared `_esc` resolves to ours
 //! ```
 //!
+//! `render` is the **one** reserved name the artifact also exports
+//! ([`crate::ir::PRERENDER_EXPORTS`]), so exporting it is the only case that is a
+//! genuine duplicate export. Exporting `_esc` or `_attr`, or any reserved name in
+//! an island — which exports nothing of the compiler's ([`crate::ir::ISLAND_EXPORTS`])
+//! — collides with a name the module reserves without duplicating an export, and
+//! the two messages say which.
+//!
 //! The last one is the sharpest: an undeclared `_esc` in the template resolves to
 //! the compiler's own helper and renders its **source text**, silently. That is
 //! why a reference is refused, not only a declaration.
@@ -23,7 +30,8 @@
 //!    ([`crate::ir::emitted_module_parts`]) or an emitted body statement
 //!    ([`crate::ir::emitted_body_statements`]) whose bound name is reserved;
 //! 2. an **export specifier** (`export { x as render }`) whose *exported* name is
-//!    reserved — the emitted module already exports `render`. `export const
+//!    reserved — the emitted module already exports `render`, so exporting it is a
+//!    duplicate. `export const
 //!    render = …` is shape 1's declaration and 2's name in one statement, and one
 //!    row is enough;
 //! 3. a **reference** to a reserved name, in the markup, the body, or the module
@@ -177,7 +185,7 @@ pub fn check_emitted_names(mode: Mode, source: &str, program: &Program<'_>) -> V
     // (including the declarators a multi-declarator route statement leaves
     // behind), and an emitted body statement.
     for part in emitted_module_parts(program, &route) {
-        check_part(&part, reserved, &mut diagnostics);
+        check_part(&part, reserved, mode, &mut diagnostics);
     }
     if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
         for statement in emitted_body_statements(body, return_span) {
@@ -561,6 +569,7 @@ fn reserved_names(mode: Mode, source: &str, program: &Program<'_>) -> Vec<String
 fn check_part(
     part: &crate::ir::EmittedModulePart<'_, '_>,
     reserved: &[String],
+    mode: Mode,
     out: &mut Vec<Diagnostic>,
 ) {
     match part {
@@ -570,7 +579,7 @@ fn check_part(
             // exports a reserved name without declaring one; `export const
             // render` is caught by the declaration walk, so the specifier walk
             // reports only the shapes that declare nothing reserved.
-            check_export_names(statement, reserved, out);
+            check_export_names(statement, reserved, mode, out);
         }
         crate::ir::EmittedModulePart::Declarators { declarators, .. } => {
             for declarator in declarators {
@@ -716,15 +725,26 @@ fn refuse_if_reserved(
 /// Refuse every **exported** name in `statement` that is reserved.
 ///
 /// Only the exported name matters: `const x = 1; export { x as render }` exports
-/// `render` without binding it, and the emitted module's own `export function
-/// render()` would then be a duplicate export — a syntax error. A local name is
-/// shape 1's question, so a specifier whose local and exported names are both
-/// ordinary is ignored.
+/// `render` without binding it. A local name is shape 1's question, so a
+/// specifier whose local and exported names are both ordinary is ignored.
+///
+/// The reason differs by name, and asserting one reason for both was a shipped
+/// false diagnostic: only `render` is a name the artifact both declares and
+/// **exports**, so only exporting it is a duplicate export. `_esc` and `_attr` in
+/// a prerender module, and every name the island module binds, are bindings the
+/// artifact owns but does not export — exporting one would export the compiler's
+/// binding rather than a value this file defines. The message says which, so a fix
+/// is never refused for a duplicate that does not exist.
 ///
 /// `export const render = 1` is reported by [`check_declaration`] as a
 /// declaration, and this function reports its local name too — the same span, so
 /// `analyze`'s dedup keeps one row.
-fn check_export_names(statement: &Statement<'_>, reserved: &[String], out: &mut Vec<Diagnostic>) {
+fn check_export_names(
+    statement: &Statement<'_>,
+    reserved: &[String],
+    mode: Mode,
+    out: &mut Vec<Diagnostic>,
+) {
     let Statement::ExportNamedDeclaration(exported) = statement else {
         return;
     };
@@ -734,17 +754,32 @@ fn check_export_names(statement: &Statement<'_>, reserved: &[String], out: &mut 
             ModuleExportName::IdentifierReference(identifier) => identifier.name.as_str(),
             ModuleExportName::StringLiteral(literal) => literal.value.as_str().unwrap_or(""),
         };
-        if reserved.iter().any(|name| name == exported_name) {
-            out.push(Diagnostic::new(
-                Code::RA014,
-                (specifier.span.start, specifier.span.end),
-                format!(
-                    "the generated module already exports `{exported_name}` itself, so exporting \
-                     `{exported_name}` here is a duplicate export and the module cannot load. \
-                     Export it under a different name."
-                ),
-            ));
+        if !reserved.iter().any(|name| name == exported_name) {
+            continue;
         }
+        let owns_export = match mode {
+            Mode::Static => crate::ir::PRERENDER_EXPORTS.contains(&exported_name),
+            Mode::Island => crate::ir::ISLAND_EXPORTS.contains(&exported_name),
+        };
+        let message = if owns_export {
+            format!(
+                "the generated module exports `{exported_name}` of its own, so exporting \
+                 `{exported_name}` here would export `{exported_name}` twice and the module cannot \
+                 load. Export it under a different name."
+            )
+        } else {
+            format!(
+                "`{exported_name}` is one of the names the generated module reserves for itself \
+                 (`{names}`), so exporting it here would export that name rather than a value this \
+                 file defines. Export a value this file declares instead.",
+                names = reserved.join("`, `")
+            )
+        };
+        out.push(Diagnostic::new(
+            Code::RA014,
+            (specifier.span.start, specifier.span.end),
+            message,
+        ));
     }
 }
 
@@ -838,23 +873,54 @@ mod tests {
     /// The module would export `render` twice: once by its own `export function
     /// render()`, once by this alias. The row is at the specifier, which is the
     /// statement to edit — the local `x` is fine and needs no rename.
+    ///
+    /// `render` is the **one** reserved name the artifact also exports, so it is
+    /// the only name whose export is a true duplicate; the message must say so,
+    /// while an export of any other reserved name must not claim it.
     #[test]
     fn an_export_alias_named_render_is_ra014() {
         let src = "\"use static\"\nconst x = 1\nexport { x as render }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
         let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
         assert!(
             d.iter().any(|diagnostic| diagnostic.code == Code::RA014
-                && diagnostic.message.contains("already exports")),
+                && diagnostic.message.contains("exports `render` of its own")),
             "{d:?}"
         );
         let row = d
             .iter()
-            .find(|diagnostic| diagnostic.message.contains("already exports"))
+            .find(|diagnostic| diagnostic.message.contains("twice"))
             .unwrap();
         assert_eq!(
             &src[row.span.0 as usize..row.span.1 as usize],
             "x as render",
             "the span is the specifier to rewrite: {row:?}"
+        );
+    }
+
+    /// The false statement F1 removed, pinned from the other side: exporting a
+    /// reserved name that is **not** `render` collides with a binding, it does not
+    /// duplicate an export. `_attr` is declared in a prerender module but never
+    /// exported, so a message claiming a duplicate export for it would be false —
+    /// the same defect as the removed `"runai"` re-export clause.
+    #[test]
+    fn a_reserved_export_other_than_render_claims_no_duplicate() {
+        let src = "\"use static\"\nconst x = 1\nexport { x as _attr }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        let row = d
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::RA014)
+            .unwrap_or_else(|| panic!("exporting `_attr` must be refused: {d:?}"));
+        for false_claim in ["duplicate export", "twice", "cannot load"] {
+            assert!(
+                !row.message.contains(false_claim),
+                "exporting `_attr` is not a duplicate export: {}",
+                row.message
+            );
+        }
+        assert!(
+            row.message.contains("reserves for itself"),
+            "the reason names the collision with the module's binding: {}",
+            row.message
         );
     }
 

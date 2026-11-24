@@ -198,6 +198,17 @@ const RUNTIME: &[(&str, &str)] = &[
     ),
 ];
 
+/// The repair for an attribute with an empty expression (`name={}`), used by
+/// lowering.
+///
+/// **Unreachable from a source file**: Oxc rejects `name={}` as a parse error
+/// ("JSX attributes must only be assigned a non-empty expression"), so `RA007`
+/// reports it and neither analysis nor lowering ever sees the arm. The text is a
+/// constant rather than a call-site literal anyway, so the instruction scan covers
+/// it: a lowering-only repair that no fixture can reach must not be the one place
+/// a `<…>` placeholder can hide.
+pub(crate) const EMPTY_ATTRIBUTE_REPAIR: &str = "Give the attribute a value, e.g. `name={value}`.";
+
 /// The repair for JSX inside a `{…}` expression, shared with lowering.
 ///
 /// Every construct it tells the agent to write must be one this milestone
@@ -218,6 +229,35 @@ pub(crate) const JSX_IN_EXPRESSION_REPAIR: &str = "Move the JSX into the returne
 /// answers: write each value as an ordinary child, or drop the spread.
 pub(crate) const SPREAD_CHILD_REPAIR: &str =
     "Write the values out as ordinary children, one element per value, or remove the spread.";
+
+/// The repair for a spread attribute (`{...rest}`), shared with lowering.
+///
+/// A spread cannot be expanded without knowing what it holds, and the repair
+/// inventing a binding (`<div id={rest.id}>`) was wrong twice: the binding need
+/// not exist, and it is not what the spread carries. It now asks for the
+/// attributes themselves, one at a time.
+pub(crate) const SPREAD_ATTRIBUTE_REPAIR: &str =
+    "Write the attributes it carries out one at a time, or remove the spread.";
+
+/// The repair for an attribute whose value is JSX (`name=<b/>`), shared with
+/// lowering.
+///
+/// It must name markup this milestone compiles: the earlier text used
+/// `<Parent>`/`<Bar>`, which are capitalized tags and therefore components the
+/// analyzer refuses — a repair that lands in another refusal. Lowercase tags are
+/// DOM elements, so the example uses one.
+pub(crate) const JSX_ATTRIBUTE_REPAIR: &str = "Pass the element as a child instead: write it \
+     between the element's tags, e.g. `<div><b>…</b></div>`, because an attribute holds a value.";
+
+/// The repair for a JSX fragment as the route's returned markup, shared with
+/// lowering.
+///
+/// The IR's root is one node and both emitters write one root, so a fragment
+/// there has no parent to be spliced into. The repair names a lowercase parent
+/// (`<main>`), which is a DOM element; a capitalized name would be a component
+/// the same file refuses.
+pub(crate) const FRAGMENT_ROOT_REPAIR: &str = "Return exactly one element instead, wrapping the \
+     fragment's children in `<main>…</main>` or whichever parent suits the page.";
 
 /// Elements that flow inline with their neighbours, so a dropped space is
 /// visible. Everything else is block-level: a newline around it is layout, not
@@ -323,18 +363,29 @@ pub(crate) const BLOCK_IN_P: &[&str] = &[
 /// One table, read by [`parent_child_refusal`] and therefore by [`check_jsx`] and
 /// [`crate::ir::lower_route`] alike, so the refusal and its message cannot
 /// disagree about which children a parent permits.
+pub(crate) const CONTENT_MODEL: &[(&str, &[&str])] = &[
+    ("ul", &["li"]),
+    ("ol", &["li"]),
+    ("menu", &["li"]),
+    ("dl", &["dt", "dd", "div"]),
+    ("select", &["option", "optgroup"]),
+    ("optgroup", &["option"]),
+    (
+        "table",
+        &["caption", "colgroup", "thead", "tbody", "tfoot", "tr"],
+    ),
+    ("thead", &["tr"]),
+    ("tbody", &["tr"]),
+    ("tfoot", &["tr"]),
+    ("tr", &["td", "th"]),
+    ("colgroup", &["col"]),
+];
+
 pub(crate) fn content_model(parent: &str) -> Option<&'static [&'static str]> {
-    match parent {
-        "ul" | "ol" | "menu" => Some(&["li"]),
-        "dl" => Some(&["dt", "dd", "div"]),
-        "select" => Some(&["option", "optgroup"]),
-        "optgroup" => Some(&["option"]),
-        "table" => Some(&["caption", "colgroup", "thead", "tbody", "tfoot", "tr"]),
-        "thead" | "tbody" | "tfoot" => Some(&["tr"]),
-        "tr" => Some(&["td", "th"]),
-        "colgroup" => Some(&["col"]),
-        _ => None,
-    }
+    CONTENT_MODEL
+        .iter()
+        .find(|(tag, _)| *tag == parent)
+        .map(|(_, model)| *model)
 }
 
 /// The tags that are legal in every content model above because they are
@@ -348,7 +399,7 @@ pub(crate) fn content_model(parent: &str) -> Option<&'static [&'static str]> {
 /// `<table><colgroup><script></script><col></colgroup></table>` parses as
 /// `(table (colgroup) (script) (colgroup (col)))`. Allowing it there would accept
 /// markup whose tree the parser changes.
-const SCRIPT_SUPPORTING: &[&str] = &["script", "template"];
+pub(crate) const SCRIPT_SUPPORTING: &[&str] = &["script", "template"];
 
 /// Whether `child` is one of `parent`'s permitted children.
 ///
@@ -604,6 +655,7 @@ pub(crate) fn parent_child_refusal(parent: &str, child: &str) -> Option<String> 
 /// The `stop` field names the boundary by scope: `Some(SCOPE_*)` for a set of
 /// tags, `None` for the *special element* walk the list rows use, and
 /// [`Scan::Innermost`] for the rows that only look at the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scan {
     /// Walk the stack inward-out; stop at the first special element that is not
     /// `address`, `div`, or `p` (parse5's `listItemStartTagInBody`).
@@ -614,43 +666,56 @@ pub(crate) enum Scan {
     Innermost,
 }
 
+/// parse5's scope sets (`open-element-stack.js`), plus `select` in the two flow
+/// sets only. The in-select insertion mode discards every start tag but its own
+/// children, so a `<p>`/`<a>`/`<nobr>`/`<button>` above a `<select>` is never
+/// closed by a tag inside it: the inner element is discarded, and claiming a
+/// "sibling" would be false. `select` is **not** added to
+/// [`SCOPE_TABLE`]: verified against parse5, a `<td>` inside `<td><select>`
+/// still closes the outer cell, so the table rows must keep walking past it.
+pub(crate) const SCOPE_HTML: &[&str] = &[
+    "applet", "caption", "html", "marquee", "object", "table", "td", "template", "th", "select",
+];
+pub(crate) const SCOPE_BUTTON: &[&str] = &[
+    "applet", "caption", "html", "marquee", "object", "table", "td", "template", "th", "button",
+    "select",
+];
+pub(crate) const SCOPE_TABLE: &[&str] = &["table", "template"];
+const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+
 /// Tags that close an open element of the same kind; see [`Scan`].
 ///
 /// One table, read by [`self_closing_refusal`] and therefore by
 /// [`crate::ir::lower_route`] too, so the analysis and the lowering cannot
-/// disagree about which nesting the parser would split.
-pub(crate) fn self_closing_refusal_for(tag: &str) -> Option<(&'static [&'static str], Scan)> {
-    const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
-    // parse5's scope sets (open-element-stack.js), plus `select` in the two
-    // flow sets only. The in-select insertion mode discards every start tag but
-    // its own children, so a `<p>`/`<a>`/`<nobr>`/`<button>` above a `<select>`
-    // is never closed by a tag inside it: the inner element is discarded, and
-    // claiming a "sibling" would be false. `select` is **not** added to
-    // [`SCOPE_TABLE`]: verified against parse5, a `<td>` inside `<td><select>`
-    // still closes the outer cell, so the table rows must keep walking past it.
-    const SCOPE_HTML: &[&str] = &[
-        "applet", "caption", "html", "marquee", "object", "table", "td", "template", "th", "select",
-    ];
-    const SCOPE_BUTTON: &[&str] = &[
-        "applet", "caption", "html", "marquee", "object", "table", "td", "template", "th",
-        "button", "select",
-    ];
-    const SCOPE_TABLE: &[&str] = &["table", "template"];
+/// disagree about which nesting the parser would split. `SELF_CLOSING` is the
+/// single source the tag list is derived from, so a tag added here is covered by
+/// `instruction.rs`'s composer scan the day it is added.
+pub(crate) const SELF_CLOSING: &[(&str, &[&str], Scan)] = &[
+    ("li", &["li"], Scan::Special),
+    ("dt", &["dt", "dd"], Scan::Special),
+    ("dd", &["dt", "dd"], Scan::Special),
+    ("p", &["p"], Scan::Scope(SCOPE_BUTTON)),
+    ("a", &["a"], Scan::Scope(SCOPE_HTML)),
+    ("nobr", &["nobr"], Scan::Scope(SCOPE_HTML)),
+    ("button", &["button"], Scan::Scope(SCOPE_HTML)),
+    ("td", &["td", "th"], Scan::Scope(SCOPE_TABLE)),
+    ("th", &["td", "th"], Scan::Scope(SCOPE_TABLE)),
+    ("tr", &["tr"], Scan::Scope(SCOPE_TABLE)),
+    ("option", &["option"], Scan::Innermost),
+    ("optgroup", &["option", "optgroup"], Scan::Innermost),
+    ("h1", HEADINGS, Scan::Innermost),
+    ("h2", HEADINGS, Scan::Innermost),
+    ("h3", HEADINGS, Scan::Innermost),
+    ("h4", HEADINGS, Scan::Innermost),
+    ("h5", HEADINGS, Scan::Innermost),
+    ("h6", HEADINGS, Scan::Innermost),
+];
 
-    match tag {
-        "li" => Some((&["li"], Scan::Special)),
-        "dt" | "dd" => Some((&["dt", "dd"], Scan::Special)),
-        "p" => Some((&["p"], Scan::Scope(SCOPE_BUTTON))),
-        "a" => Some((&["a"], Scan::Scope(SCOPE_HTML))),
-        "nobr" => Some((&["nobr"], Scan::Scope(SCOPE_HTML))),
-        "button" => Some((&["button"], Scan::Scope(SCOPE_HTML))),
-        "td" | "th" => Some((&["td", "th"], Scan::Scope(SCOPE_TABLE))),
-        "tr" => Some((&["tr"], Scan::Scope(SCOPE_TABLE))),
-        "option" => Some((&["option"], Scan::Innermost)),
-        "optgroup" => Some((&["option", "optgroup"], Scan::Innermost)),
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some((HEADINGS, Scan::Innermost)),
-        _ => None,
-    }
+pub(crate) fn self_closing_refusal_for(tag: &str) -> Option<(&'static [&'static str], Scan)> {
+    SELF_CLOSING
+        .iter()
+        .find(|(name, _, _)| *name == tag)
+        .map(|(_, closes, scan)| (*closes, *scan))
 }
 
 /// The tags parse5 treats as *special*, for the [`Scan::Special`] walk.
@@ -897,21 +962,31 @@ pub(crate) fn text_refusal(parent: &str) -> Option<String> {
 ///
 /// Shared by [`check_jsx`] and [`crate::ir::lower_route`], like
 /// [`content_model`], so the two cannot disagree about a legal position.
+pub(crate) const REQUIRED_ANCESTORS: &[(&str, &[&str])] = &[
+    ("td", &["tr"]),
+    ("th", &["tr"]),
+    // A row needs a table section, or a table (the parser inserts the
+    // section itself, which the marker scheme survives: the marker stays
+    // inside the row).
+    ("tr", &["table", "thead", "tbody", "tfoot"]),
+    ("caption", &["table"]),
+    ("colgroup", &["table"]),
+    ("col", &["table"]),
+    ("thead", &["table"]),
+    ("tbody", &["table"]),
+    ("tfoot", &["table"]),
+    ("option", &["select", "datalist"]),
+    ("optgroup", &["select", "datalist"]),
+    ("figcaption", &["figure"]),
+    ("legend", &["fieldset"]),
+    ("summary", &["details"]),
+];
+
 pub(crate) fn required_ancestors(tag: &str) -> Option<&'static [&'static str]> {
-    match tag {
-        "td" | "th" => Some(&["tr"]),
-        // A row needs a table section, or a table (the parser inserts the
-        // section itself, which the marker scheme survives: the marker stays
-        // inside the row).
-        "tr" => Some(&["table", "thead", "tbody", "tfoot"]),
-        "caption" | "colgroup" | "col" => Some(&["table"]),
-        "thead" | "tbody" | "tfoot" => Some(&["table"]),
-        "option" | "optgroup" => Some(&["select", "datalist"]),
-        "figcaption" => Some(&["figure"]),
-        "legend" => Some(&["fieldset"]),
-        "summary" => Some(&["details"]),
-        _ => None,
-    }
+    REQUIRED_ANCESTORS
+        .iter()
+        .find(|(name, _)| *name == tag)
+        .map(|(_, parents)| *parents)
 }
 
 /// The refusal for `tag` under ancestors that do not include one it requires.
@@ -1179,8 +1254,7 @@ impl JsxChecker<'_> {
             Expression::JSXFragment(fragment) => self.diagnostics.push(unsupported(
                 fragment.span,
                 "a fragment as the route's returned JSX",
-                "Return exactly one element instead, wrapping the fragment's children in \
-                 `<main>…</main>` or whichever parent suits the page.",
+                FRAGMENT_ROOT_REPAIR,
             )),
             // `route_render` sees through parentheses, so a JSX element is the
             // only other shape it can return.
@@ -1249,7 +1323,7 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
         self.diagnostics.push(unsupported(
             attribute.span,
             "a spread attribute (`{...expr}`)",
-            "Write the attributes it carries out one at a time, or remove the spread.",
+            SPREAD_ATTRIBUTE_REPAIR,
         ));
         oxc_ast_visit::walk::walk_jsx_spread_attribute(self, attribute);
     }
@@ -1364,8 +1438,7 @@ impl JsxChecker<'_> {
                 self.diagnostics.push(unsupported(
                     value.span(),
                     "an attribute whose value is itself JSX (`name=<Bar />`)",
-                    "Pass the element as a child instead: write it between the element's tags, \
-                     e.g. `<div><b>…</b></div>`, because an attribute holds a value.",
+                    JSX_ATTRIBUTE_REPAIR,
                 ));
             }
         }
