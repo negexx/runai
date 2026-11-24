@@ -8,9 +8,14 @@
 mod build;
 mod check;
 
-/// One usage line, printed for an unknown subcommand and for a bad flag. Kept here
+/// One usage block, printed for an unknown subcommand and for a bad flag. Kept here
 /// so every entry point that refuses an argument prints the same text.
-pub const USAGE: &str = "usage: runai [--version | check [--json] [path] | build [--out dist]]";
+///
+/// The second line documents where `build`'s single-writer lock lives. Two invocations
+/// with different `TMPDIR`s therefore take different locks — an assumption stated in the
+/// text rather than a silent hole.
+pub const USAGE: &str = "usage: runai [--version | check [--json] [path] | build [--out dist]]\n\
+     `build` takes a lock in the system temp directory ($TMPDIR) keyed by the output path";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

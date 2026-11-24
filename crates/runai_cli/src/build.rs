@@ -69,18 +69,22 @@
 //! builds deleting each other's scratch mid-run.
 //!
 //! At the start of every build, leftover scratch directories are swept **only** when
-//! they carry [`OWNER`] *and* nobody holds its lock: the marker is an OS file lock, so
-//! "marked" means "ours" and "unlocked" means "its build is gone". Any other directory
-//! is ignored — a name this tool generates is not evidence that its contents belong to
-//! this tool, and refusing the build over one was what created both wedges. The previous
-//! release's fixed `<out>.tmp` is additionally swept when empty, because an empty
-//! directory has nothing to lose and a failed marker write leaves exactly that.
+//! they carry [`OWNER`] (or, for a tree killed after the last route write, [`STAMP`])
+//! *and* nobody holds the marker's lock: "marked" means "ours" and "unlocked" means
+//! "its build is gone". Any other directory is ignored — a name this tool generates is
+//! not evidence that its contents belong to this tool, and refusing the build over one
+//! was what created both wedges. The previous release's fixed `<out>.tmp` is
+//! additionally swept when empty, because an empty directory has nothing to lose and a
+//! failed marker write leaves exactly that.
 //!
 //! The rename dance that publishes `<out>` is not atomic step-by-step, so the whole run
-//! holds one OS file lock keyed by the resolved `--out` ([`lock_build`]). Concurrent
-//! builds queue instead of interleaving; the kernel drops the lock when a process dies,
-//! so a killed build cannot wedge the next one. The scratch names stay unique so two
-//! builds can assemble at the same time without sharing a directory.
+//! holds one OS file lock keyed by the resolved `--out` ([`lock_build`]). [`resolve_out`]
+//! resolves the argument **once**, so `dist`, `./dist` and `nodir/../dist` are one lock
+//! and one tree rather than three. Concurrent builds queue instead of interleaving, and
+//! the wait is bounded ([`LOCK_TIMEOUT`]) so a `^Z`'d or looping build produces one clear
+//! failure instead of an indefinite silent hang. The kernel drops the lock when a process
+//! dies, so a killed build cannot wedge the next one. The scratch names stay unique so
+//! two builds can assemble at the same time without sharing a directory.
 //!
 //! Each build's own scratch is removed by [`Scratch`]'s `Drop` on every failure path,
 //! so a normal failure leaves nothing behind; a killed build leaves a marked directory
@@ -270,12 +274,31 @@ pub fn run(args: &[String]) -> i32 {
         }
     }
 
-    let out = PathBuf::from(out.unwrap_or(DEFAULT_OUT));
+    let raw = out.unwrap_or(DEFAULT_OUT).to_string();
 
-    // `--out` is a name, so it must name a directory the build may own. `""`, `.`
-    // and `..` are usage errors, and so is a directory that already holds source
-    // files the build did not write: `runai build --out src` used to publish over
-    // the sources and delete them. See [`refuse_out`].
+    // `--out` is a name, so it must name a directory the build may own. `""`, `.` and
+    // `..` are usage errors, checked on the argument as typed (resolving `.` would land
+    // on a directory that exists and read as legitimate).
+    if let Err(message) = refuse_degenerate(Path::new(&raw)) {
+        eprintln!("error: {message}");
+        eprintln!("{USAGE}");
+        return 2;
+    }
+
+    // Resolve the output **once**, here, and use the result for the lock key and for
+    // every write. Equivalent spellings (`dist`, `./dist`, `nodir/../dist`) then name
+    // one path everywhere: the lock agrees, and so does the tree. See [`resolve_out`].
+    let out = match resolve_out(&raw) {
+        Ok(out) => out,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
+
+    // A directory that already holds source files the build did not write is also
+    // refused: `runai build --out src` used to publish over the sources and delete
+    // them. See [`refuse_out`].
     if let Err(message) = refuse_out(&out) {
         eprintln!("error: {message}");
         eprintln!("{USAGE}");
@@ -349,23 +372,15 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Refuse an `--out` value that must not be published over.
+/// Refuse the `--out` values that name the working tree, its parent, or nothing.
 ///
-/// `""`, `.` and `..` are refused by name. A path inside the source tree is refused
-/// whether or not it exists yet, because `--out src/dist` is a build that writes into
-/// `src/`. An existing directory is refused when it holds any `*.tsx` file the build
-/// did not write: that is the project's own source, and `runai build --out src` used to
-/// rename it aside and delete it. Everything else is left to [`publish`]'s stamp gate,
-/// which refuses to replace a non-empty directory that is not a previous build without
-/// deleting anything. A directory that does not exist yet, or is empty, is otherwise
-/// acceptable.
-fn refuse_out(out: &Path) -> Result<(), String> {
+/// Checked on the argument **as typed**, before resolution: `.` and `..` resolve to
+/// directories that exist, so a resolved value would read as legitimate.
+fn refuse_degenerate(out: &Path) -> Result<(), String> {
     let text = out.to_string_lossy();
     if text.is_empty() {
         return Err("`--out` needs a directory: it was empty".to_string());
     }
-    // Checked on the raw text before any resolution: `.` and `..` resolve to
-    // directories that exist, but the message a user needs is about the argument.
     let last = out
         .components()
         .next_back()
@@ -375,6 +390,85 @@ fn refuse_out(out: &Path) -> Result<(), String> {
         return Err(format!(
             "`--out {text}` is not a build directory: it is the working tree or its parent"
         ));
+    }
+    Ok(())
+}
+
+/// Resolve `--out` to one absolute path, folding `.` and `..` **lexically** in the part
+/// that does not exist.
+///
+/// The lock key and every write must agree on one spelling, or two invocations that
+/// name the same directory take two locks and their publish sequences interleave —
+/// observable as `dist.old exists but is not a previous build`. Keying on
+/// `nearest_existing(parent).canonicalize()` handled `dist` vs `./dist` and missed
+/// `nodir/../dist`: with no existing ancestor it fell back to the literal parent.
+///
+/// The right split is per component. The longest prefix that exists is canonicalized
+/// (so a symlinked project directory still resolves to one real path); the remaining
+/// components are folded on paper, with `..` popping the previous component and `.`
+/// dropped. Nothing is canonicalized that does not exist, and the result need not
+/// exist — [`Scratch::create`] creates it.
+fn resolve_out(raw: &str) -> Result<PathBuf, String> {
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot resolve `--out {raw}`: {error}"))?
+            .join(path)
+    };
+
+    // Split at the longest prefix that exists, so lexical folding never crosses a
+    // symlink the OS would resolve differently. Working on components (not repeated
+    // `pop`) is what handles `nodir/../dist`: `Path::file_name` is `None` for `..`, so a
+    // `pop`-based walk stops on the `..` and then canonicalizes a path that cannot exist.
+    let components: Vec<std::ffi::OsString> =
+        joined.iter().map(|part| part.to_os_string()).collect();
+    let mut split = components.len();
+    let mut base = None;
+    while split > 0 {
+        let candidate: PathBuf = components[..split].iter().collect();
+        if candidate.exists() {
+            base = Some(candidate);
+            break;
+        }
+        split -= 1;
+    }
+    let base = base.ok_or_else(|| format!("cannot resolve `--out {raw}`: no existing ancestor"))?;
+    let mut resolved = base
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve `--out {raw}`: {error}"))?;
+
+    // Fold the non-existent remainder lexically: `.` is dropped and `..` pops, so the
+    // result is the path the OS would produce if every directory existed.
+    for component in &components[split..] {
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component);
+    }
+
+    Ok(resolved)
+}
+
+/// Refuse an `--out` value that must not be published over.
+///
+/// `""`, `.` and `..` are refused by name (see [`refuse_degenerate`]). A path inside the
+/// source tree is refused whether or not it exists yet, because `--out src/dist` is a
+/// build that writes into `src/`. An existing directory is refused when it holds any
+/// `*.tsx` file the build did not write: that is the project's own source, and `runai
+/// build --out src` used to rename it aside and delete it. Everything else is left to
+/// [`publish`]'s stamp gate, which refuses to replace a non-empty directory that is not a
+/// previous build without deleting anything. A directory that does not exist yet, or is
+/// empty, is otherwise acceptable.
+fn refuse_out(out: &Path) -> Result<(), String> {
+    let text = out.to_string_lossy();
+    if text.is_empty() {
+        return Err("`--out` needs a directory: it was empty".to_string());
     }
 
     if let Some(source_root) = inside_sources(out) {
@@ -447,22 +541,24 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
 ///
 /// - named like our scratch, carrying [`OWNER`], and **not locked** — a killed build of
 ///   ours: remove;
-/// - named like our scratch, carrying [`OWNER`], and **locked** — a build running right
-///   now (possibly a concurrent one in this very process): leave it alone. Sweeping a
-///   peer's live scratch is precisely how round 3 made `build & build` delete each
-///   other's tree;
-/// - named like our scratch with no marker — nothing says it is ours: leave it. A
-///   directory killed between `mkdir` and the marker write is indistinguishable from
-///   somebody else's, and refusing the build over a name this tool generates was what
-///   wedged every build after one interrupted one, first in round 2 and again in round
-///   3. It is harmless: it cannot block a build;
+/// - named like our scratch, carrying [`OWNER`] or [`STAMP`], and **locked** by a live
+///   build — a build running right now (possibly a concurrent one in this very
+///   process): leave it alone. Sweeping a peer's live scratch is precisely how round 3
+///   made `build & build` delete each other's tree;
+/// - named like our scratch with neither marker nor stamp — nothing says it is ours:
+///   leave it. A directory killed between `mkdir` and the marker write is
+///   indistinguishable from somebody else's, and refusing the build over a name this
+///   tool generates was what wedged every build after one interrupted one, first in
+///   round 2 and again in round 3. It is harmless: it cannot block a build;
 /// - the previous release's fixed `<out>.tmp` — remove when it is empty (nothing to
-///   lose; a failed marker write leaves exactly that) or marked and unlocked; otherwise
+///   lose; a failed marker write leaves exactly that) or ours and unlocked; otherwise
 ///   leave it;
 /// - anything else — not named like scratch at all: untouched.
 ///
 /// The only failure is an unreadable directory, because a later build would then be
-/// building beside garbage while claiming success.
+/// building beside garbage while claiming success. A candidate that *vanishes* between
+/// `read_dir` and a probe is a peer sweeping it, which is not a failure: it is reported
+/// as `None` and the sweep continues, exactly as the removal below tolerates `NotFound`.
 fn sweep_scratch(out: &Path) -> Result<(), String> {
     let parent = match out.parent().filter(|p| !p.as_os_str().is_empty()) {
         Some(parent) => parent,
@@ -483,20 +579,32 @@ fn sweep_scratch(out: &Path) -> Result<(), String> {
             continue;
         };
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            // A peer removed the candidate between `read_dir` and here: not ours to
+            // sweep, and not a reason to fail the build.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
         if !file_type.is_dir() {
             continue;
         }
 
-        // Only a marked directory whose owner is gone is certainly ours. The previous
-        // scheme's fixed name is additionally safe to remove when empty, because an
-        // empty directory holds nothing that could belong to someone else — and a
-        // failed marker write leaves exactly that.
+        // Remove only what is certainly ours and certainly abandoned. "Ours" is the
+        // lifetime marker [`OWNER`] or the completeness stamp [`STAMP`]: a build killed
+        // between assembling and publishing leaves a stamped tree whose marker may be
+        // missing, and that tree is ours too (it is the M1 orphan — without the stamp
+        // arm it survived every later build forever). "Abandoned" is the marker being
+        // unlocked; a stamped tree with no marker file at all cannot be locked by
+        // anyone, so it is abandoned by construction.
         let removable = match kind {
-            ScratchKind::Legacy => is_empty(&path)? || (is_owned(&path) && is_abandoned(&path)?),
-            ScratchKind::Unique => is_owned(&path) && is_abandoned(&path)?,
+            ScratchKind::Legacy => match is_empty(&path)? {
+                // Vanished mid-sweep.
+                None => continue,
+                Some(true) => true,
+                Some(false) => is_ours(&path) && is_abandoned(&path)?,
+            },
+            ScratchKind::Unique => is_ours(&path) && is_abandoned(&path)?,
         };
         if !removable {
             continue;
@@ -553,6 +661,20 @@ enum ScratchKind {
     Unique,
 }
 
+/// Whether `dir` is certainly a directory this build created, by either lifetime
+/// marker: [`OWNER`] (written before any content, removed only from the published tree)
+/// or [`STAMP`] (written last, and only into a tree this build assembled).
+///
+/// The stamp arm is not redundant. A build killed in the window between the last route
+/// write and [`publish`] leaves a tree carrying the stamp and — on any release that
+/// unlinked the marker early — no marker at all. Such a tree is complete and ours, and
+/// the only thing that could recognize it was the stamp. Removing the marker only from
+/// the published tree closes that window, but a sweep keyed on one marker alone would
+/// turn any future early unlink back into an invisible orphan.
+fn is_ours(dir: &Path) -> bool {
+    is_owned(dir) || is_stamped(dir)
+}
+
 /// Whether `dir` carries the ownership marker — the sign that this build created it.
 ///
 /// A **non-empty** [`OWNER`] is the marker: the build locks the file first and only then
@@ -572,18 +694,29 @@ fn is_owned(dir: &Path) -> bool {
 ///
 /// A build holds the lock for its whole lifetime, so "the lock is free" means the build
 /// that created the tree is gone and the directory may be swept. A tree from before the
-/// lock existed has no marker file at all, which [`is_owned`] already excludes.
+/// lock existed has no marker file at all; that is only consulted after [`is_ours`]
+/// accepted it on the stamp, and a marker that does not exist cannot be locked by
+/// anyone, so such a tree is abandoned by construction. The build no longer unlinks the
+/// marker before publishing (see [`assemble_into`]), so a live tree always has a marker
+/// to probe here.
 ///
 /// `try_lock` is granted to exactly one handle system-wide, including a second handle in
 /// the same process, which is what lets two concurrent builds in one process see each
 /// other. The probe handle is dropped immediately; the lock belongs to the owning build.
 fn is_abandoned(dir: &Path) -> Result<bool, String> {
     let marker = dir.join(OWNER);
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&marker)
-        .map_err(|error| format!("cannot read {}: {error}", marker.display()))?;
+    {
+        Ok(file) => file,
+        // No marker file, or the whole candidate vanished between our probes: nothing
+        // can hold a lock on it, so it is abandoned. The sweep tolerates the vanished
+        // case by itself; a peer's removal is never a failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(format!("cannot read {}: {error}", marker.display())),
+    };
     match file.try_lock() {
         // We got it, so nobody else holds it: the tree is abandoned. Dropping `file`
         // releases it again, which is required — the sweep is about to delete it.
@@ -599,12 +732,20 @@ fn is_stamped(dir: &Path) -> bool {
 
 /// Whether `dir` has no entries.
 ///
+/// Whether `dir` has no entries, or `None` when it has vanished.
+///
 /// An unreadable directory is a failure rather than a guess: assuming it is empty
-/// would delete something nobody could inspect.
-fn is_empty(dir: &Path) -> Result<bool, String> {
-    let mut entries = std::fs::read_dir(dir)
-        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
-    Ok(entries.next().is_none())
+/// would delete something nobody could inspect. A directory that *disappeared* between
+/// the caller's decision and this probe is a peer's removal, which is not a failure —
+/// `None` lets the caller continue instead of exiting `1` over a directory that is
+/// already gone.
+fn is_empty(dir: &Path) -> Result<Option<bool>, String> {
+    let mut entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+    };
+    Ok(Some(entries.next().is_none()))
 }
 
 /// The first `*.tsx` file under `dir`, recursively, or `None`.
@@ -1197,8 +1338,8 @@ impl Scratch {
     }
 
     /// Disarm the guard: the tree has been renamed into place, so there is nothing to
-    /// remove. The lock file is scratch bookkeeping and is cleared before publishing —
-    /// see [`assemble_into`] — so it never reaches `<out>`.
+    /// remove. The marker file is scratch bookkeeping and is cleared by [`publish`]
+    /// from the published tree — see [`assemble_into`] — so it never stays in `<out>`.
     fn consumed(mut self) {
         self.armed = false;
     }
@@ -1341,18 +1482,14 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
         &format!("runai {} build\n", runai_compiler::VERSION),
     )?;
 
-    // The ownership marker has done its job and is not part of the site: the published
-    // tree carries the completeness stamp only. It is unlinked *after* the stamp is
-    // written, so a crash in this window leaves a tree that is still recognisably ours
-    // either way; removed before it would reopen the unclaimed-leftover window. The
-    // lock handle outlives the unlink (it is held until `Scratch` drops), and an open
-    // but unlinked marker is invisible to [`sweep_scratch`], which only looks at names
-    // on disk.
-    let owner = tmp.join(OWNER);
-    if owner.exists() {
-        std::fs::remove_file(&owner)
-            .map_err(|error| format!("cannot clear {}: {error}", owner.display()))?;
-    }
+    // The ownership marker is deliberately NOT removed here. It is written before any
+    // route content and covers the whole scratch lifetime, and only [`publish`] removes
+    // it — from the *published* tree, after the rename. Unlinking it here used to open a
+    // window no sweep could see: a kill after this point left a tree that was STAMPED
+    // (complete) but UNMARKED (not ours, by [`sweep_scratch`]'s unique-name rule), so it
+    // survived every later build forever. The marker must outlive the rename for the
+    // lifetime invariant to hold: killed anywhere, the tree is marked and unlocked, which
+    // is exactly the shape the sweep removes.
 
     Ok(())
 }
@@ -1510,50 +1647,106 @@ fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
 /// by the resolved output path keeps two builds of the same `--out` in one lock while a
 /// build of a different `--out` proceeds independently, and leaves the project clean.
 ///
+/// `out` is already resolved by [`resolve_out`] at argument time — absolute, with `.`
+/// and `..` folded — so this hashes one canonical spelling per directory. That is what
+/// makes `dist`, `./dist` and `nodir/../dist` one lock instead of three; the earlier
+/// parent-plus-name key fell back to the literal parent when no ancestor existed and
+/// let exactly that pair race.
+///
 /// The key is `DefaultHasher` over the resolved path. Two builds of this binary agree on
 /// it, which is all locking requires; a hash change between releases would only mean
 /// two different releases do not queue with each other.
 fn build_lock_path(out: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
 
-    // Key on the resolved *parent* plus the final name, so `dist` and `./dist` are one
-    // lock (`dist` need not exist yet) while `dist` and `other` are two. Canonicalizing
-    // `<out>` itself would fail before the first build and key every output of a fresh
-    // project to the same lock, serializing builds that share nothing.
-    let name = out
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| out.to_string_lossy().into_owned());
-    let parent = match out.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(parent) => nearest_existing(parent)
-            .and_then(|existing| existing.canonicalize().ok())
-            .unwrap_or_else(|| parent.to_path_buf()),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
-
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    parent.to_string_lossy().hash(&mut hasher);
-    name.hash(&mut hasher);
+    out.to_string_lossy().hash(&mut hasher);
     std::env::temp_dir().join(format!("runai-build-{:016x}.lock", hasher.finish()))
 }
 
+/// How long to wait for the per-`<out>` lock before failing the build.
+///
+/// The lock is held across the whole run, including every prerender — i.e. across user
+/// code. A build stopped with `SIGSTOP` or looping forever in a static module would
+/// therefore block every later build *silently and forever* if this were a blocking
+/// `lock()`. A bounded wait turns that into one clear failure; the builds it does admit
+/// still queue.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to sleep between lock attempts.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Hold the build lock for the lifetime of the returned guard.
 ///
-/// Blocks until any other build of the same `<out>` finishes. The kernel releases the
-/// lock when the process ends, so a killed build does not wedge the next one; there is
-/// no stale-lock/heal logic because there is nothing to go stale.
+/// Waits up to [`LOCK_TIMEOUT`] for any other build of the same `<out>` to finish, then
+/// fails with a message naming both the output and the lock path. A hung build with no
+/// output is worse than a clear failure: the alternative — a blocking `lock()` — hangs
+/// forever behind a `^Z`'d or looping build and says nothing.
+///
+/// The kernel releases the lock when the process ends, so a killed build does not wedge
+/// the next one; there is no stale-lock/heal logic because there is nothing to go stale.
+///
+/// If the lock file cannot be created in the temp directory (missing or unwritable
+/// `TMPDIR`), a fallback beside the output is used so the build still serializes, and
+/// the error from both locations is reported naming each path — a lock failure must
+/// never be an unattributable "cannot lock".
 fn lock_build(out: &Path) -> Result<std::fs::File, String> {
     let path = build_lock_path(out);
-    let file = std::fs::OpenOptions::new()
+    let file = match open_lock(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            let fallback = sibling(out, "lock");
+            match open_lock(&fallback) {
+                Ok(file) => return acquire(file, out, &fallback),
+                Err(fallback_error) => {
+                    return Err(format!(
+                        "cannot open the build lock {}: {error} (and the fallback {}: \
+                         {fallback_error})",
+                        path.display(),
+                        fallback.display()
+                    ));
+                }
+            }
+        }
+    };
+    acquire(file, out, &path)
+}
+
+/// Open (creating if needed) a lock file.
+fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
-        .map_err(|error| format!("cannot open the build lock {}: {error}", path.display()))?;
-    file.lock()
-        .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
-    Ok(file)
+        .open(path)
+}
+
+/// Take an exclusive lock on `file`, retrying for up to [`LOCK_TIMEOUT`].
+fn acquire(file: std::fs::File, out: &Path, path: &Path) -> Result<std::fs::File, String> {
+    let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "another `runai build` is publishing `{}`: waited {}s for the lock \
+                         at {} and gave up. If no build is running, a previous one was \
+                         stopped (^Z, a debugger) or is looping in a route module; end it \
+                         and build again.",
+                        out.display(),
+                        LOCK_TIMEOUT.as_secs(),
+                        path.display()
+                    ));
+                }
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(format!("cannot lock {}: {error}", path.display()));
+            }
+        }
+    }
 }
 
 /// Publish a complete `scratch` tree as `out`, keeping the previous `out` on failure.
@@ -1595,9 +1788,11 @@ fn publish(scratch: Scratch, out: &Path) -> Result<(), Failure> {
     // The stamp gate comes first so a refusal happens before anything is removed.
     // An *empty* unstamped directory is allowed: there is no content to destroy, and
     // `mkdir dist && runai build` is a normal CI shape. Anything with content and no
-    // stamp is not a build and is refused.
+    // stamp is not a build and is refused. A directory that vanished between `exists`
+    // and this probe is empty for our purposes: there is nothing to destroy.
     let had_previous = out.exists();
-    if had_previous && !out.join(STAMP).is_file() && !is_empty(out).map_err(Failure::Build)? {
+    let empty = is_empty(out).map_err(Failure::Build)?.unwrap_or(true);
+    if had_previous && !out.join(STAMP).is_file() && !empty {
         return Err(Failure::Refused(not_a_build(out)));
     }
 
@@ -1645,6 +1840,18 @@ fn publish(scratch: Scratch, out: &Path) -> Result<(), Failure> {
         // The new tree is live; a stale backup is untidy, not a reason to fail a
         // build that already succeeded.
         let _ = std::fs::remove_dir_all(&backup);
+    }
+
+    // Now, and only now, the ownership marker is cleared — from the published tree.
+    // It covered the whole scratch lifetime (see [`assemble_into`]), so a kill at any
+    // earlier point leaves a tree the next build's sweep recognises as ours; the
+    // published site, however, must carry the completeness stamp only. This is the last
+    // step so a failure here cannot strand `<out>.old`: the tree is already published.
+    let owner = out.join(OWNER);
+    if owner.exists() {
+        std::fs::remove_file(&owner).map_err(|error| {
+            Failure::Build(format!("cannot clear {}: {error}", owner.display()))
+        })?;
     }
 
     Ok(())
@@ -1896,6 +2103,86 @@ mod tests {
         assert!(full.join("keep/notes.md").is_file());
     }
 
+    // M1: a build killed between the last route write and `publish` leaves a tree with
+    // the stamp (complete) and — on the pre-fix code — no marker, because the marker was
+    // unlinked one call too early. `sweep_scratch`'s unique-name arm required the marker,
+    // so that tree was invisible and survived every later build forever. The stamp is
+    // part of "ours" now.
+    #[test]
+    fn sweep_removes_an_abandoned_stamped_scratch_with_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let orphan = dir.path().join("dist.tmp.999.0");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(STAMP), "runai 0.1.0 build\n").unwrap();
+        std::fs::write(orphan.join("index.html"), "complete tree\n").unwrap();
+
+        sweep_scratch(&out).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "a stamped, unlocked scratch tree with no marker is ours: it must be swept"
+        );
+    }
+
+    // A directory with neither marker nor stamp is not ours: never deleted, and not a
+    // reason to fail either. Same predicate, the other direction.
+    #[test]
+    fn sweep_keeps_a_scratch_named_directory_with_neither_marker_nor_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let foreign = dir.path().join("dist.tmp.999.0");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("keep.txt"), "mine\n").unwrap();
+
+        sweep_scratch(&out).unwrap();
+
+        assert!(foreign.join("keep.txt").is_file());
+    }
+
+    // A peer may remove a candidate between `read_dir` and the probe. That is not a
+    // failure — the removal path already tolerates `NotFound` — so the sweep continues
+    // instead of exiting the whole build with status 1.
+    #[test]
+    fn sweep_tolerates_a_candidate_removed_by_a_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        // Probes on the missing path directly: this is what `sweep_scratch` does once a
+        // peer has already won the race for a candidate it saw in `read_dir`.
+        let gone = dir.path().join("dist.tmp.999.0");
+        assert_eq!(
+            is_empty(&gone).unwrap(),
+            None,
+            "a vanished directory is not a read error"
+        );
+        assert!(
+            is_abandoned(&gone).unwrap(),
+            "a vanished candidate is abandoned, not a failure"
+        );
+    }
+
+    // M3: the lock wait is bounded, so a held lock fails the second build with a message
+    // naming the output and the lock path — never a silent infinite hang.
+    #[test]
+    fn a_held_lock_is_reported_after_the_timeout_and_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let held = lock_build(&out).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = lock_build(&out).expect_err("a held lock must not be reacquired");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= LOCK_TIMEOUT && elapsed < LOCK_TIMEOUT + std::time::Duration::from_secs(5),
+            "the wait must be bounded by {LOCK_TIMEOUT:?}: {elapsed:?}"
+        );
+        assert!(error.contains("dist"), "{error}");
+        assert!(error.contains("runai-build-"), "{error}");
+        assert!(error.contains("another `runai build`"), "{error}");
+        drop(held);
+        assert!(lock_build(&out).is_ok(), "the lock is free again");
+    }
+
     // The lock is what makes the publish sequence single-writer. Two handles on the
     // same output must not both hold it, and it lives outside the tree being published.
     #[test]
@@ -1976,16 +2263,50 @@ mod tests {
     }
 
     // The degenerate `--out` values are usage errors before any resolution, because
-    // resolving `.` would land on a directory that does exist.
+    // resolving `.` would land on a directory that does exist. Checked by
+    // `refuse_degenerate`, which `run` calls on the argument as typed; `refuse_out`
+    // then sees the resolved path.
     #[test]
     fn degenerate_out_values_are_refused_by_name() {
         for out in ["", ".", ".."] {
-            assert!(refuse_out(Path::new(out)).is_err(), "{out:?}");
+            assert!(refuse_degenerate(Path::new(out)).is_err(), "{out:?}");
         }
         // A path whose last component is `..` is the same shape. `dist/.` is not:
         // `Path` normalizes it to `dist`, which is a legitimate target.
-        assert!(refuse_out(Path::new("dist/..")).is_err());
+        assert!(refuse_degenerate(Path::new("dist/..")).is_err());
         assert_eq!(Path::new("dist/."), Path::new("dist"));
+    }
+
+    // M2: equivalent spellings of one output must resolve to one path, because that
+    // path is the lock key AND the write target. `nearest_existing(parent)` missed
+    // `nodir/../dist` (no ancestor existed, so it fell back to the literal parent),
+    // which is how two builds of one directory took two locks and interleaved.
+    //
+    // Absolute spellings, so the assertion does not depend on the test process's
+    // working directory (other tests run in parallel in it).
+    #[test]
+    fn equivalent_out_spellings_resolve_to_one_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let expected = base.join("dist");
+
+        for raw in [
+            "dist",
+            "./dist",
+            "nodir/../dist",
+            "sub/../dist",
+            "nodir/deeper/../../dist",
+            "./nodir/../dist",
+        ] {
+            let resolved = resolve_out(&base.join(raw).to_string_lossy()).unwrap();
+            assert_eq!(resolved, expected, "{raw}");
+        }
+        // A nested path that does not exist yet folds the same way.
+        assert_eq!(
+            resolve_out(&base.join("sub/out").to_string_lossy()).unwrap(),
+            base.join("sub/out")
+        );
     }
 
     // A non-existent directory and a stamped one are both acceptable; the stamp is

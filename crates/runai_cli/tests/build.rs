@@ -119,6 +119,42 @@ fn static_route(text: &str) -> String {
     )
 }
 
+/// A static route that busy-waits for `millis` inside `render`, so a build can be
+/// observed while it holds the output lock. The loop is in the route body, so it runs
+/// inside the prerender child — i.e. **after** the lock is taken and the scratch
+/// directory exists.
+fn slow_route(millis: u64) -> String {
+    format!(
+        "\"use static\"\nexport default function P(props: Record<never, never>) {{\n\
+         const until = Date.now() + {millis};\n\
+         while (Date.now() < until) {{}}\n\
+         return <p>slow</p>\n}}\n"
+    )
+}
+
+/// Whether `root` holds a scratch directory of this build's naming scheme.
+fn has_scratch(root: &Path) -> bool {
+    std::fs::read_dir(root)
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("dist.tmp.")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Kills and reaps the child on drop, including when the test panics, so a slow build
+/// under test cannot outlive its assertions.
+struct Kill(std::process::Child);
+
+impl Drop for Kill {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Every file under `root`, relative, sorted — the tree a rebuild must not change.
 fn tree(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
@@ -887,4 +923,162 @@ fn a_reserved_name_and_a_route_diagnostic_are_both_reported() {
         "the reserved name must be reported: {stderr}"
     );
     assert!(!tmp.path().join("dist").exists());
+}
+
+// M1, the missing test: a build killed between `assemble_into` and `publish` leaves
+// its scratch directory STAMPED but (on the pre-fix code) UNMARKED, because the
+// ownership marker was unlinked before publishing. `sweep_scratch`'s unique-name arm
+// required the marker, so that tree was invisible to every later build and stayed on
+// disk forever — the reviewer reproduced `dist.tmp.999.0` surviving every build.
+//
+// The marker must cover the whole scratch lifetime: written before any content and
+// unlinked only from the PUBLISHED tree, after the rename. A stamped-only leftover is
+// therefore ours and is swept.
+#[test]
+fn a_stamped_but_unmarked_scratch_left_by_a_kill_before_publish_is_swept() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("rebuilt"));
+
+    // Exactly the window M1 names: a complete tree — stamp AND content — with no marker.
+    let leftover = tmp.path().join("dist.tmp.999.0");
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::write(leftover.join(".runai-build"), "runai 0.1.0 build\n").unwrap();
+    std::fs::write(leftover.join("index.html"), "abandoned complete tree\n").unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        !leftover.exists(),
+        "a stamped scratch tree with no marker is ours and must be swept, not orphaned"
+    );
+    assert!(tmp.path().join("dist/index.html").is_file());
+    assert!(tmp.path().join("dist/.runai-build").is_file());
+}
+
+// The other side of the same predicate: neither marker nor stamp says nothing about
+// who owns the directory, so it is neither deleted nor a reason to fail. Scratch names
+// are unique per build, so an unrecognised directory cannot be in this build's way.
+#[test]
+fn a_scratch_named_directory_with_neither_marker_nor_stamp_survives_a_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("hi"));
+
+    let foreign = tmp.path().join("dist.tmp.999.0");
+    std::fs::create_dir_all(foreign.join("keep")).unwrap();
+    std::fs::write(foreign.join("keep/notes.md"), "mine\n").unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("keep/notes.md")).unwrap(),
+        "mine\n",
+        "a directory that is not ours must survive the build"
+    );
+    assert!(tmp.path().join("dist/index.html").is_file());
+}
+
+// M2: the lock is keyed by the RESOLVED output path, so equivalent spellings of one
+// directory must agree. `dist` and `./dist` already did; `nodir/../dist` did not,
+// because the lock fell back to the LITERAL parent when no ancestor existed. Two
+// different locks let the publish sequences interleave, which surfaced as
+// `dist.old exists but is not a previous build`.
+//
+// All three spellings are one path, so all three builds must succeed and leave one
+// complete tree.
+#[test]
+fn equivalent_out_spellings_share_one_lock_and_all_publish() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("home"));
+    let root = tmp.path().to_path_buf();
+
+    // A barrier so the three builds collide deliberately rather than by luck.
+    const BUILDS: usize = 3;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(BUILDS));
+    let handles: Vec<_> = ["dist", "./dist", "nodir/../dist"]
+        .into_iter()
+        .map(|spelling| {
+            let dir = root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                (spelling, run(&["build", "--out", spelling], &dir))
+            })
+        })
+        .collect();
+    let results: Vec<(&str, Output)> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+
+    for (spelling, result) in &results {
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "`--out {spelling}`: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(
+        tree(&root.join("dist")),
+        vec![".runai-build", "index.html"],
+        "one complete tree, whichever build published last"
+    );
+    assert!(!root.join("nodir").exists(), "`nodir/../dist` is `dist`");
+}
+
+// M3: the lock is bounded. A blocking `lock()` with no timeout means a build stopped
+// with SIGSTOP, or one looping forever in a user's static module, hangs every later
+// build silently and forever. The second build must fail at about five seconds with a
+// message naming the output and the lock path.
+#[test]
+fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &slow_route(30_000));
+
+    let mut first = Kill(
+        Command::new(env!("CARGO_BIN_EXE_runai"))
+            .args(["build", "--out", "dist"])
+            .current_dir(tmp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Wait until the build is demonstrably holding the lock: it takes the lock before
+    // creating scratch, so a scratch directory means the lock is ours.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !has_scratch(tmp.path()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first build never got as far as taking the lock"
+        );
+        assert!(
+            first.0.try_wait().unwrap().is_none(),
+            "the first build exited instead of holding the lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let started = std::time::Instant::now();
+    let second = run(&["build", "--out", "dist"], tmp.path());
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(second.status.code(), Some(1), "{stderr}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(12),
+        "the second build must fail fast, not wait for the first: {elapsed:?}"
+    );
+    assert!(
+        stderr.contains("dist") && stderr.contains("runai-build-"),
+        "the message must name the output and the lock path: {stderr}"
+    );
+    assert!(
+        stderr.contains("another `runai build`"),
+        "the message must say another build holds it: {stderr}"
+    );
+    let _ = first.0.kill();
 }
