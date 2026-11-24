@@ -34,6 +34,7 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{ImportDeclarationSpecifier, ImportOrExportKind, Program, Statement};
+use oxc_span::GetSpan;
 
 use crate::analyze::component::{find_components, find_route_component, validate_route_component};
 use crate::analyze::jsx::check_jsx;
@@ -111,7 +112,7 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     // `check_jsx` must run here, not only in lowering: `runai check` is the gate
     // an agent sees first, and a refusal it cannot reach is a false negative.
     diagnostics.extend(check_jsx(program, source));
-    diagnostics.extend(check_imports(program, source));
+    diagnostics.extend(check_imports(program, source, mode));
     diagnostics.extend(check_erased_declarations(program, path));
 
     // One semantic build for the signal rules. A page with a known mode pays one
@@ -347,8 +348,8 @@ pub(crate) fn is_page(path: &str) -> bool {
 /// Every other form (`import x from`, `import "./x"`, `import {} from`,
 /// `import { x } from`, `import * as x from`, and a mixed `import { type T, x }`)
 /// keeps at least one runtime binding and is reported.
-fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
-    program
+fn check_imports(program: &Program<'_>, source: &str, mode: Option<Mode>) -> Vec<Diagnostic> {
+    let mut diagnostics: Vec<Diagnostic> = program
         .body
         .iter()
         .filter_map(|statement| match statement {
@@ -379,7 +380,177 @@ fn check_imports(program: &Program<'_>, source: &str) -> Vec<Diagnostic> {
             ))),
             _ => None,
         })
-        .collect()
+        .collect();
+    // An island is the only mode whose artifact carries an import list, so it is
+    // the only mode where a specifier can name a binding the runtime lacks.
+    if mode == Some(Mode::Island) {
+        diagnostics.extend(check_runai_specifier_names(program));
+    }
+    diagnostics
+}
+
+/// `RA014` for a named `"runai"` specifier the runtime does not export.
+///
+/// The emitted island module writes one import from the runtime URL, and a
+/// specifier that the runtime does not export produces a module no engine can
+/// link:
+///
+/// ```text
+/// SyntaxError: The requested module './runtime.mjs' does not provide an export
+/// named '_a'
+/// ```
+///
+/// `_a` is an island emitter **local** ([`crate::ir::ISLAND_LOCALS`]), not a runtime
+/// export. The reserved-name rule knows the difference — it reserves `_a` against a
+/// *declaration* — but it never asked whether the runtime exports it, so
+/// `import { _a } from "runai"` passed `check`, passed `build`, and shipped a module
+/// that cannot load. This rule asks the only question that matters for a specifier:
+/// **does the runtime have this name?**
+///
+/// # Why every non-export is refused, not only a used one
+///
+/// TypeScript erases an unused import, so `import { _a }` with no use is currently
+/// harmless. But that makes the verdict depend on whether the agent later *uses*
+/// the name: the file is clean now and a load failure the moment it is referenced.
+/// That is the accept-then-reject class this round exists to close, so the specifier
+/// is refused wherever it is written.
+///
+/// # The one exemption
+///
+/// [`crate::ir::RUNTIME_TYPE_EXPORTS`] — `Accessor`, `Template`, `Result` — are real
+/// members of the module in `index.d.ts`, declared as **types**. A value import of
+/// one used only in a type position is erased and must stay clean (a common, legal
+/// shape this rule must not reject); used as a value it emits a reference to a
+/// binding that was never imported, so it is refused with the `import type` repair.
+/// Telling the two apart needs the semantic pass, so it runs only when such a
+/// specifier exists.
+fn check_runai_specifier_names(program: &Program<'_>) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    // Specifiers whose name is a type export need the reference flags to decide.
+    let mut type_named: Vec<(String, String, (u32, u32))> = Vec::new();
+
+    for (specifier, _) in crate::analyze::signals::runai_specifiers(program) {
+        let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier else {
+            continue;
+        };
+        let imported = specifier.imported.name().as_str().to_string();
+        let span = specifier.imported.span();
+        let span = (span.start, span.end);
+
+        if crate::ir::RUNTIME_EXPORTS.contains(&imported.as_str()) {
+            continue;
+        }
+
+        if crate::ir::RUNTIME_TYPE_EXPORTS.contains(&imported.as_str()) {
+            // Kept for the semantic pass below: only a value *use* is a defect.
+            type_named.push((imported, specifier.local.name.as_str().to_string(), span));
+            continue;
+        }
+
+        diagnostics.push(not_a_runtime_export(&imported, span));
+    }
+
+    if type_named.is_empty() {
+        return diagnostics;
+    }
+    let semantic = oxc_semantic::SemanticBuilder::new().build(program).semantic;
+    let scoping = semantic.scoping();
+    for (imported, local, span) in type_named {
+        let symbol = scoping.get_binding(
+            scoping.root_scope_id(),
+            oxc_ast::ast::Ident::from(local.as_str()),
+        );
+        let used_as_a_value = symbol.is_some_and(|symbol| {
+            scoping
+                .get_resolved_references(symbol)
+                .any(|reference| !reference.flags().is_type_only())
+        });
+        if used_as_a_value {
+            diagnostics.push(type_export_used_as_a_value(&imported, span));
+        }
+    }
+    diagnostics
+}
+
+/// `RA014` for a `"runai"` specifier the runtime has no export for.
+///
+/// The message lists the names that **do** exist, because that is the only way an
+/// agent can pick one, and names the closest when one is obvious (`signals` →
+/// `signal`). The list comes from [`crate::ir::RUNTIME_EXPORTS`], whose drift from
+/// the shipped `runtime.js` is a test failure rather than a diagnostic nobody can
+/// trust.
+fn not_a_runtime_export(name: &str, span: (u32, u32)) -> Diagnostic {
+    let exports = crate::ir::RUNTIME_EXPORTS
+        .iter()
+        .map(|export| format!("`{export}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suggestion = closest_runtime_export(name)
+        .map(|candidate| format!(" Did you mean `{candidate}`?"))
+        .unwrap_or_default();
+    Diagnostic::new(
+        Code::RA014,
+        span,
+        format!(
+            "`\"{PRIMITIVE_SOURCE}\"` does not export `{name}`, so the generated module's import \
+             would name a binding the runtime does not provide and the module could not load.\
+             {suggestion} The runtime exports {exports}. Import one of those, or declare `{name}` \
+             in this file."
+        ),
+    )
+}
+
+/// `RA014` for a value import of an `index.d.ts` type used as a value.
+fn type_export_used_as_a_value(name: &str, span: (u32, u32)) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA014,
+        span,
+        format!(
+            "`{name}` is a type exported by `\"{PRIMITIVE_SOURCE}\"`, not a runtime value, so a \
+             value import of it emits a reference to a binding that is never imported. Write \
+             `import {{ type {name} }} from \"{PRIMITIVE_SOURCE}\"` and use it only in type \
+             positions."
+        ),
+    )
+}
+
+/// The runtime export `name` most likely meant, or `None` when nothing is close.
+///
+/// One relation: edit distance **exactly one** — a single deletion, insertion,
+/// or substitution. That covers the typos an agent actually writes (`signals` →
+/// `signal`, `singal` → `signal`) and deliberately nothing looser: `_a` is two
+/// edits from `_on`, and suggesting `_on` for `_a` would be a guess the runtime's
+/// export list does not support. When no name is one edit away there is nothing
+/// to suggest, so the message lists the exports and says no more.
+fn closest_runtime_export(name: &str) -> Option<&'static str> {
+    let mut best: Option<(&'static str, usize)> = None;
+    for candidate in crate::ir::RUNTIME_EXPORTS {
+        let distance = edit_distance(name, candidate);
+        if distance == 1 && best.is_none_or(|(_, best)| distance < best) {
+            best = Some((candidate, distance));
+        }
+    }
+    best.map(|(candidate, _)| candidate)
+}
+
+/// Levenshtein distance over `char`s, for [`closest_runtime_export`].
+///
+/// Names are short ASCII identifiers, so the quadratic table is a few dozen bytes.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (row, left_char) in left.chars().enumerate() {
+        current[0] = row + 1;
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != *right_char);
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 /// `RA014` for one `import`, or `None` when the emitted module can write it.
@@ -1375,6 +1546,187 @@ mod tests {
                 .message
                 .contains("Move `header` into the component body"),
             "the contradictory repair must be gone: {d:?}"
+        );
+    }
+
+    /// D2 (round 6): an import specifier whose name the runtime does not export is
+    /// refused in an island, in both spellings (used and unused).
+    ///
+    /// `_a` is an island emitter **local**, not a runtime export. Before this rule
+    /// `check` was `[]` for both spellings and `build` exited 0 for the used one,
+    /// shipping a module that cannot link:
+    ///
+    /// ```text
+    /// SyntaxError: The requested module … does not provide an export named '_a'
+    /// ```
+    ///
+    /// The message must list the real exports — that is the only way to pick one —
+    /// and must suggest the close match when there is one (`signals` → `signal`).
+    ///
+    /// A **static** route is not refused: its module carries no import at all, so a
+    /// specifier there cannot name a binding, and a message claiming the generated
+    /// import would be false. That control is asserted too.
+    #[test]
+    fn a_specifier_the_runtime_does_not_export_is_ra014() {
+        for use_site in ["", "{_a}"] {
+            let src = format!(
+                "\"use island\"\nimport {{ _a }} from \"runai\"\nexport default function P(props: Record<never, never>) {{ return <p>{use_site}</p> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014 && row.message.contains("does not export"))
+                .unwrap_or_else(|| panic!("`{use_site}`: no runtime-export row: {d:?}"));
+            assert_eq!(
+                &src[row.span.0 as usize..row.span.1 as usize],
+                "_a",
+                "the row points at the specifier to edit: {row:?}"
+            );
+            for real in ["`signal`", "`derived`", "`mount`", "`_setText`"] {
+                assert!(
+                    row.message.contains(real),
+                    "the message lists the real exports, including {real}: {}",
+                    row.message
+                );
+            }
+            assert!(
+                !row.message.contains("Did you mean"),
+                "nothing in the runtime is one edit from `_a`: {}",
+                row.message
+            );
+        }
+
+        // The static control: the prerender module has no import, so the specifier
+        // has no artifact consequence and must not be refused for one.
+        let statik = "\"use static\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        assert!(
+            !analyze(statik, "src/routes/index.page.tsx")
+                .iter()
+                .any(|row| row.message.contains("does not export")),
+            "a static route writes no import, so there is no runtime binding to miss"
+        );
+
+        // The obvious-suggestion case: the plural is one deletion from the real
+        // export, and the message says so rather than leaving the agent to guess.
+        let src = "\"use island\"\nimport { signals } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{signals}</p> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        let row = d
+            .iter()
+            .find(|row| row.code == Code::RA014 && row.message.contains("does not export"))
+            .unwrap_or_else(|| panic!("`signals` is not a runtime export: {d:?}"));
+        assert!(
+            row.message.contains("Did you mean `signal`?"),
+            "the close match is suggested: {}",
+            row.message
+        );
+    }
+
+    /// The controls for the rule above, both directions, so it cannot be passing by
+    /// refusing every `"runai"` specifier:
+    ///
+    /// - a legal import (`signal`) stays clean in both modes and the artifact
+    ///   carries it;
+    /// - a **type** exported by `index.d.ts` is not a runtime export, but a value
+    ///   import of one used only in a type position erases and stays clean —
+    ///   refusing it would reject the common `import { Accessor }` shape;
+    /// - the same import used as a **value** is refused with the `import type`
+    ///   repair, because the binding is never imported.
+    #[test]
+    fn a_legal_runai_import_stays_clean_and_a_type_used_as_a_value_is_refused() {
+        // (1) the legal value import.
+        let legal = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <p>{n()}</p> }\n";
+        assert!(
+            analyze(legal, "src/routes/index.page.tsx").is_empty(),
+            "`signal` is a real runtime export and must stay clean"
+        );
+        let module =
+            crate::codegen::emit_client_checked(legal, "src/routes/index.page.tsx", "/r.js")
+                .expect("a legal import builds");
+        assert!(
+            module.contains("signal,"),
+            "the artifact imports the name: {module}"
+        );
+
+        // (2) a type export used only in a type position is erased, so it is clean.
+        let type_only = "\"use island\"\nimport { Accessor } from \"runai\"\nexport default function P(props: Record<never, never>) { const n: Accessor<number> = { value: 0 } as unknown as Accessor<number>; return <p>{String(n)}</p> }\n";
+        assert!(
+            analyze(type_only, "src/routes/index.page.tsx").is_empty(),
+            "a value import used only as a type is erased, which is the legal shape"
+        );
+        let module =
+            crate::codegen::emit_client_checked(type_only, "src/routes/index.page.tsx", "/r.js")
+                .expect("the type-only use builds");
+        assert!(
+            !module.contains("Accessor"),
+            "the erased import is not in the artifact: {module}"
+        );
+
+        // (3) the same import used as a value emits a reference with no binding.
+        let as_value = "\"use island\"\nimport { Accessor } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{String(Accessor)}</p> }\n";
+        let d = analyze(as_value, "src/routes/index.page.tsx");
+        let row = d
+            .iter()
+            .find(|row| row.code == Code::RA014 && row.message.contains("not a runtime value"))
+            .unwrap_or_else(|| panic!("a type used as a value must be refused: {d:?}"));
+        assert!(
+            row.message.contains("import { type Accessor }"),
+            "the repair is the type-only import form: {}",
+            row.message
+        );
+    }
+
+    /// The runtime export list cannot drift from the package: it is parsed out of
+    /// `packages/runai/runtime.js`'s own `export` statements and compared to
+    /// [`crate::ir::RUNTIME_EXPORTS`] in both directions.
+    ///
+    /// The rule above is only as good as this list. A new runtime export missing
+    /// from it would refuse a legal import; an entry here that the runtime dropped
+    /// would accept a module that cannot link — the exact defect D2 is.
+    #[test]
+    fn the_runtime_export_list_matches_the_shipped_runtime() {
+        let runtime = include_str!("../../../../packages/runai/runtime.js");
+        let mut declared: Vec<&str> = Vec::new();
+        for line in runtime.lines() {
+            let line = line.trim();
+            // `export function name(` and `export const name =` are the two forms the
+            // runtime uses; anything else is not a named export.
+            let name = if let Some(rest) = line.strip_prefix("export function ") {
+                rest.split('(').next()
+            } else if let Some(rest) = line.strip_prefix("export const ") {
+                rest.split(['=', ' ']).next()
+            } else {
+                None
+            };
+            if let Some(name) = name {
+                declared.push(name.trim());
+            }
+        }
+        declared.sort_unstable();
+        declared.dedup();
+        assert!(
+            !declared.is_empty(),
+            "the runtime parse found no exports, so it proves nothing"
+        );
+
+        let mut listed: Vec<&str> = crate::ir::RUNTIME_EXPORTS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            listed, declared,
+            "RUNTIME_EXPORTS must name exactly the runtime's own exports"
+        );
+    }
+
+    /// A `"runai"` re-export whose specifier the runtime does not export is refused
+    /// by the re-export rule before this one (the statement is dropped entirely), so
+    /// this fixture asserts the two rules do not both fire on one statement.
+    #[test]
+    fn a_runai_reexport_of_a_non_export_is_one_row() {
+        let src = "\"use island\"\nexport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(
+            codes(&d),
+            vec![Code::RA014],
+            "the dropped statement is one problem: {d:?}"
         );
     }
 

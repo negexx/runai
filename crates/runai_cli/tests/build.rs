@@ -964,6 +964,128 @@ fn a_reserved_name_and_a_route_diagnostic_are_both_reported() {
     assert!(!tmp.path().join("dist").exists());
 }
 
+/// The property D1 violated: **any route this compiler accepts must build a module
+/// `node --check` accepts.** Either the route is refused (a diagnostic, which is a
+/// correct outcome) or an artifact exists and it must parse as ESM.
+///
+/// The fixtures include the shapes D1 shipped broken — `export const s` beside
+/// `export { s }`, `export function f` beside `export { f }`, two `export { x }`
+/// statements, an alias colliding with a declaration — because a check that only
+/// looked at already-legal fixtures could not have caught it. Before this round each
+/// of those was *accepted* and produced a module node rejects with `SyntaxError:
+/// Duplicate export of '…'`, so the pre-fix run of this test fails on the artifact
+/// rather than on a diagnostic.
+#[test]
+fn every_accepted_island_builds_a_valid_esm_artifact() {
+    let cases = [
+        // the single-export control, which was legal before and after the round.
+        "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n",
+        // distinct names: a declaration and a specifier exporting different names.
+        "\"use island\"\nexport const a = 1\nexport { a as b }\nexport function f() { return a }\nexport default function P(props: Record<never, never>) { return <p>{f()}{b}</p> }\n",
+        // a plain local with one specifier.
+        "\"use island\"\nimport { signal } from \"runai\"\nconst s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n",
+        // D1 shapes: each must be refused, or must build into valid ESM.
+        "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n",
+        "\"use island\"\nexport function f() { return 1 }\nexport { f }\nexport default function P(props: Record<never, never>) { return <p>{f()}</p> }\n",
+        "\"use island\"\nconst x = 1\nexport { x }\nexport { x }\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n",
+        "\"use island\"\nexport const a = 1\nexport { a as b }\nexport const b = 2\nexport default function P(props: Record<never, never>) { return <p>{a}{b}</p> }\n",
+    ];
+    for route in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        write_app(tmp.path(), route);
+        let out = run(&["build", "--out", "dist"], tmp.path());
+        if !out.status.success() {
+            // Refused: the correct outcome for the duplicate shapes, and nothing was
+            // published, so there is no unloadable artifact to ship.
+            assert!(
+                !tmp.path().join("dist").exists(),
+                "a refused build publishes nothing:\nroute:\n{route}"
+            );
+            continue;
+        }
+        // Accepted: the artifact must parse. `node --check` is the parser that
+        // defines ESM, so it decides validity rather than a grep over the text. The
+        // file is copied to a `.mjs` name first: `node --check` on a `.js` path with
+        // no `"type": "module"` beside it treats the file as CommonJS and **skips**
+        // the duplicate-export check, which is exactly how D1 hid.
+        let artifact = tmp.path().join("dist/assets/index.js");
+        let text = std::fs::read_to_string(&artifact).expect("the island module");
+        let module = tmp.path().join("built-island.mjs");
+        std::fs::write(&module, &text).expect("write the module as ESM");
+        match Command::new("node").arg("--check").arg(&module).output() {
+            Ok(check) => assert!(
+                check.status.success(),
+                "an accepted route must build valid ESM.\nroute:\n{route}\nmodule:\n{text}\nstderr:\n{}",
+                String::from_utf8_lossy(&check.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node is not installed: the ESM check was skipped");
+            }
+            Err(error) => panic!("could not run node: {error}"),
+        }
+    }
+}
+
+/// D1 end to end: a route that exports one name twice is refused by `check` and by
+/// `build`, and no `dist/` is published.
+///
+/// Reproduced on the pre-fix code as `check` → `[]`, `build` → exit 0, and an
+/// artifact node rejects with `SyntaxError: Duplicate export of 's'`.
+#[test]
+fn a_duplicate_export_stops_the_build() {
+    for route in [
+        "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n",
+        "\"use island\"\nexport function f() { return 1 }\nexport { f }\nexport default function P(props: Record<never, never>) { return <p>{f()}</p> }\n",
+        "\"use island\"\nconst x = 1\nexport { x }\nexport { x }\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_app(tmp.path(), route);
+
+        let check = run(&["check"], tmp.path());
+        assert_eq!(check.status.code(), Some(1), "check must refuse:\n{route}");
+        // `runai check` prints diagnostics to stdout; `build` prints them to stderr.
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stdout.contains("exported twice") && stdout.contains("RA014"),
+            "the reason names the duplicate: {stdout}"
+        );
+
+        let build = run(&["build", "--out", "dist"], tmp.path());
+        assert_eq!(build.status.code(), Some(1), "build must refuse:\n{route}");
+        assert!(
+            !tmp.path().join("dist").exists(),
+            "nothing is published for a module that cannot load"
+        );
+    }
+}
+
+/// D2 end to end: an island importing a name the runtime does not export is refused
+/// by `check` and by `build`.
+///
+/// Reproduced on the pre-fix code as `check` → `[]`, `build` → exit 0, and an
+/// artifact node rejects with `SyntaxError: The requested module … does not provide
+/// an export named '_a'`.
+#[test]
+fn an_import_the_runtime_does_not_export_stops_the_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(
+        tmp.path(),
+        "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{String(_a)}</p> }\n",
+    );
+
+    let check = run(&["check"], tmp.path());
+    assert_eq!(check.status.code(), Some(1), "check must refuse");
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("does not export `_a`") && stdout.contains("`signal`"),
+        "the message names the missing name and lists the real exports: {stdout}"
+    );
+
+    let build = run(&["build", "--out", "dist"], tmp.path());
+    assert_eq!(build.status.code(), Some(1), "build must refuse");
+    assert!(!tmp.path().join("dist").exists());
+}
+
 // M1, the missing test: a build killed between `assemble_into` and `publish` leaves
 // its scratch directory STAMPED but (on the pre-fix code) UNMARKED, because the
 // ownership marker was unlinked before publishing. `sweep_scratch`'s unique-name arm

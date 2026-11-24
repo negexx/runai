@@ -197,6 +197,14 @@ pub fn check_emitted_names(mode: Mode, source: &str, program: &Program<'_>) -> V
 
     let mut diagnostics = Vec::new();
 
+    // (0) A name the source exports twice. Two exports of one name is a syntax
+    // error in ESM (`SyntaxError: Duplicate export of 's'`), so there is no legal
+    // case to protect and no artifact to emit: the emitter copies an `export`
+    // statement verbatim, so both reach the module. Refused before anything else
+    // because it is not about names the *emitter* chose — it is about the file's
+    // own exports.
+    diagnostics.extend(duplicate_exports(program));
+
     // (1) Declarations in the two emitted scopes: an emitted module statement
     // (including the declarators a multi-declarator route statement leaves
     // behind), and an emitted body statement.
@@ -709,6 +717,176 @@ fn reserved_names(mode: Mode, source: &str, program: &Program<'_>) -> Reserved {
             }
         }
     }
+}
+
+/// `RA014` for a name the source exports more than once.
+///
+/// Two exports of the same name in one module is a **syntax error** in ESM, not a
+/// style question: `node --check` rejects the module with `SyntaxError: Duplicate
+/// export of 's'`. Before this rule existed, `check` returned `[]` and `build`
+/// exited 0 for
+///
+/// ```tsx
+/// "use island"
+/// export const s = signal(0)
+/// export { s }
+/// ```
+///
+/// because the emitter copies an `export` statement verbatim *and* appends the
+/// specifier, so the artifact carried both and could not load. Since the
+/// duplicate is a syntax error in every case, there is no legal file to protect
+/// and the refusal is unconditional.
+///
+/// The row lands on the **second** export site, which is the statement to delete,
+/// and at the exported *name*'s span inside a specifier — not the specifier's own
+/// span, because the reserved-name arm already owns that span for
+/// `export { x as _attr }`, and `analyze`'s dedup would drop one of the two rows.
+fn duplicate_exports(program: &Program<'_>) -> Vec<Diagnostic> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    for statement in &program.body {
+        for site in export_sites(statement) {
+            match seen.iter().find(|(name, _)| *name == site.name) {
+                Some((_, first)) => out.push(duplicate_export_refusal(&site, first)),
+                None => seen.push((site.name.clone(), site.phrase.clone())),
+            }
+        }
+    }
+    out
+}
+
+/// One exported name in the source, the statement that exports it, and a short
+/// phrase naming that statement for the diagnostic.
+struct ExportSite {
+    name: String,
+    phrase: String,
+    span: (u32, u32),
+}
+
+/// Every name `statement` exports, in source order.
+///
+/// A type alias, an interface, and a `type` specifier are erased before emission,
+/// so they export nothing and are skipped — the same "type-only is not a value"
+/// predicate the rest of the crate uses.
+fn export_sites(statement: &Statement<'_>) -> Vec<ExportSite> {
+    let mut sites = Vec::new();
+    match statement {
+        Statement::ExportDeclaration(exported) => match &exported.declaration {
+            Declaration::VariableDeclaration(declaration) => {
+                let kind = match declaration.kind {
+                    oxc_ast::ast::VariableDeclarationKind::Const => "const",
+                    oxc_ast::ast::VariableDeclarationKind::Let => "let",
+                    oxc_ast::ast::VariableDeclarationKind::Var => "var",
+                    oxc_ast::ast::VariableDeclarationKind::Using => "using",
+                    oxc_ast::ast::VariableDeclarationKind::AwaitUsing => "await using",
+                };
+                for declarator in &declaration.declarations {
+                    for identifier in declarator.id.get_binding_identifiers() {
+                        let name = identifier.name.as_str().to_string();
+                        sites.push(ExportSite {
+                            phrase: format!("export {kind} {name}"),
+                            name,
+                            span: (identifier.span.start, identifier.span.end),
+                        });
+                    }
+                }
+            }
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(identifier) = &function.id {
+                    let name = identifier.name.as_str().to_string();
+                    sites.push(ExportSite {
+                        phrase: format!("export function {name}"),
+                        name,
+                        span: (identifier.span.start, identifier.span.end),
+                    });
+                }
+            }
+            Declaration::ClassDeclaration(class) => {
+                if let Some(identifier) = &class.id {
+                    let name = identifier.name.as_str().to_string();
+                    sites.push(ExportSite {
+                        phrase: format!("export class {name}"),
+                        name,
+                        span: (identifier.span.start, identifier.span.end),
+                    });
+                }
+            }
+            Declaration::TSEnumDeclaration(enumeration) => {
+                let name = enumeration.id.name.as_str().to_string();
+                sites.push(ExportSite {
+                    phrase: format!("export enum {name}"),
+                    name,
+                    span: (enumeration.id.span.start, enumeration.id.span.end),
+                });
+            }
+            Declaration::TSNamespaceDeclaration(namespace) => {
+                let name = namespace.id.name.as_str().to_string();
+                sites.push(ExportSite {
+                    phrase: format!("export namespace {name}"),
+                    name,
+                    span: (namespace.id.span.start, namespace.id.span.end),
+                });
+            }
+            Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {}
+            _ => {}
+        },
+        Statement::ExportNamedDeclaration(named) => {
+            for specifier in &named.specifiers {
+                if specifier.export_kind == oxc_ast::ast::ImportOrExportKind::Type {
+                    continue;
+                }
+                let exported = specifier.exported.name().as_str().to_string();
+                let local = specifier.local.name().as_str().to_string();
+                let phrase = if local == exported {
+                    format!("export {{ {exported} }}")
+                } else {
+                    format!("export {{ {local} as {exported} }}")
+                };
+                let span = specifier.exported.span();
+                sites.push(ExportSite {
+                    name: exported,
+                    phrase,
+                    span: (span.start, span.end),
+                });
+            }
+        }
+        // `export default …` exports the name `default`, whatever the declaration
+        // is called. The parser catches two of them only when both are literal
+        // `export default`; `export { P as default }` beside one is accepted and is
+        // what the duplicate rule catches.
+        Statement::ExportDefaultDeclaration(default) => sites.push(ExportSite {
+            name: "default".to_string(),
+            phrase: "export default".to_string(),
+            span: (default.span.start, default.span.end),
+        }),
+        _ => {}
+    }
+    sites
+}
+
+/// `RA014` for `site`, the second export of its name, naming the first one too.
+///
+/// Both halves are facts about the file the agent can check: the two statements
+/// that export the name, and ESM's one-export-per-name rule.
+///
+/// The message deliberately does **not** say the generated module carries both.
+/// The emitter copies an `export` statement verbatim, so for `export const s` beside
+/// `export { s }` it does — but `export default function P` and `export { P as
+/// default }` are both emitter-owned statements the artifact drops entirely, so a
+/// claim about the artifact would be false for that shape even though the file's own
+/// export list is still invalid ESM. What is true for every shape is the rule.
+fn duplicate_export_refusal(site: &ExportSite, first: &str) -> Diagnostic {
+    let name = &site.name;
+    Diagnostic::new(
+        Code::RA014,
+        site.span,
+        format!(
+            "`{name}` is exported twice: once by `{first}` and once by `{second}`, and an ES \
+             module may export a name once. Delete one of the two exports, or export one of them \
+             under a different name.",
+            second = site.phrase,
+        ),
+    )
 }
 
 /// One emitted module part: a whole statement, or the declarators a route
@@ -1957,9 +2135,14 @@ mod tests {
     ///   the message offers is not refused elsewhere;
     /// - a name the emitter itself chose (`_attr`, `render`) still refuses, and its
     ///   message may name the compiler's list — that list is the compiler's.
+    ///
+    /// The local here is a plain `const` with a specifier, not `export const s`
+    /// beside `export { s }`: the latter exports `s` twice, which is D1's defect and
+    /// is refused at its own row since round 6. The `export const` shape alone —
+    /// one export — is the second control below, and it is clean and valid ESM.
     #[test]
     fn the_export_arm_still_accepts_locals_and_refuses_the_emitters_own_names() {
-        let local = "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        let local = "\"use island\"\nimport { signal } from \"runai\"\nconst s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
         assert!(
             crate::analyze::analyze(local, "src/routes/index.page.tsx").is_empty(),
             "a local export is legal"
@@ -1971,6 +2154,23 @@ mod tests {
             module.contains("export { s };"),
             "the artifact carries the local export: {module}"
         );
+        assert_valid_esm(&module);
+
+        // The other single-export shape: the declaration itself carries `export`,
+        // with no specifier beside it. Also clean and valid ESM.
+        let declared = "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        assert!(
+            crate::analyze::analyze(declared, "src/routes/index.page.tsx").is_empty(),
+            "one `export const` and no specifier exports `s` once"
+        );
+        let module =
+            crate::codegen::emit_client_checked(declared, "src/routes/index.page.tsx", "/r.js")
+                .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export const s = signal(0);"),
+            "the artifact carries the declared export: {module}"
+        );
+        assert_valid_esm(&module);
 
         for (src, name) in [
             (
@@ -2218,58 +2418,54 @@ mod tests {
         );
     }
 
-    /// What `import { _a } from "runai"` does, pinned as measured.
+    /// `import { _a } from "runai"` is refused in every form, because `_a` is not a
+    /// runtime export.
     ///
-    /// `_a` is an island emitter **local** (the marker list) and *not* a runtime
-    /// export, so importing it asks the runtime for a name it does not have. The
-    /// module is half-erased and half-kept:
+    /// Round 5 pinned this as a *measured false negative*: `_a` is an island emitter
+    /// local (the marker list), so the emitted `import { _a, … }` named a binding the
+    /// runtime does not provide, and the artifact threw `SyntaxError: The requested
+    /// module … does not provide an export named '_a'`. The unused spelling was
+    /// erased by type stripping, so whether the file was valid depended on whether
+    /// the agent later referenced the name — the accept-then-reject class.
     ///
-    /// - **unused**, type stripping erases the import, nothing of it reaches the
-    ///   artifact, and the file is clean;
-    /// - **used**, the name survives into the emitted `import { _a, … }`, analysis is
-    ///   clean (the reference arm exempts every reference to a `"runai"` import), the
-    ///   build succeeds, and the artifact throws `SyntaxError: The requested module …
-    ///   does not provide an export named '_a'` when it loads. Measured with `node`
-    ///   on the built file.
-    ///
-    /// This is a pre-existing false negative in the **import/reference** arm, not the
-    /// export arm this round changed, so it is pinned rather than fixed — see the
-    /// round-5 report's `Open`.
+    /// Round 6 closes it at the specifier, in both spellings, so the verdict no
+    /// longer depends on a use that has not been written yet. The runtime-side fact
+    /// is asserted from the shipped file as well, so the fixture and the package
+    /// cannot disagree.
     #[test]
-    fn an_import_of_the_emitters_own_local_name_is_clean_and_cannot_link() {
-        let unused = "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\n";
-        assert!(
-            crate::analyze::analyze(unused, "src/routes/index.page.tsx").is_empty(),
-            "an unused import is erased and collides with nothing"
-        );
-        let unused_module =
-            crate::codegen::emit_client_checked(unused, "src/routes/index.page.tsx", "/r.js")
-                .expect("the unused import emits");
-        assert!(
-            !unused_module.contains("_a,"),
-            "an unused import is stripped before emission: {unused_module}"
-        );
+    fn an_import_of_the_emitters_own_local_name_is_refused() {
+        for fixture in [
+            "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+            "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{_a}</p> }\n",
+        ] {
+            let d = crate::analyze::analyze(fixture, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014)
+                .unwrap_or_else(|| panic!("`_a` is not a runtime export: {d:?}"));
+            assert!(
+                row.message.contains("`_a`") && row.message.contains("does not export"),
+                "the message names the specifier and the reason: {}",
+                row.message
+            );
+            assert!(
+                !row.message.contains("Did you mean"),
+                "no runtime name is close to `_a`, so no suggestion is invented: {}",
+                row.message
+            );
+            assert!(
+                crate::codegen::emit_client_checked(fixture, "src/routes/index.page.tsx", "/r.js")
+                    .is_err(),
+                "a module that cannot link must not be built"
+            );
+        }
 
-        let used = "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{_a}</p> }\n";
-        assert!(
-            crate::analyze::analyze(used, "src/routes/index.page.tsx").is_empty(),
-            "a reference to a `\"runai\"` import is exempt in the reference arm"
-        );
-        let module =
-            crate::codegen::emit_client_checked(used, "src/routes/index.page.tsx", "/r.js")
-                .expect("the used import emits");
-        assert!(
-            module.contains("import { _a,"),
-            "the used import survives into the emitted import list: {module}"
-        );
-
-        // The durable fact behind the load-time failure: the runtime has no such
-        // export, so any artifact that imports it cannot link.
+        // The durable fact behind the refusal: the runtime has no such export, so
+        // the list this rule reads must not gain one without the rule changing.
         let runtime = include_str!("../../../../packages/runai/runtime.js");
         assert!(
             !runtime.contains("export function _a(") && !runtime.contains("export const _a "),
-            "the shipped runtime exports no `_a`; if that changes, this fixture's \
-             consequence changed and the report's Open item is stale"
+            "the shipped runtime exports no `_a`, so importing it can never link"
         );
     }
 
@@ -2296,5 +2492,159 @@ mod tests {
             "the artifact carries the local export: {module}"
         );
         assert_valid_esm(&module);
+    }
+
+    // --- D1: a name exported twice is a syntax error, not a style issue -------
+
+    /// The exact fixture the round-6 review reproduced: `check` was `[]`, `build`
+    /// exited 0, and the emitted module carried both `export const s = …;` and
+    /// `export { s };`, which `node --check` rejects with `SyntaxError: Duplicate
+    /// export of 's'`.
+    ///
+    /// An ES module may export a name once, so there is no legal case to protect:
+    /// the file is refused before an artifact exists.
+    #[test]
+    fn a_declared_name_exported_again_by_a_specifier_is_ra014() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d.len(), 1, "one row for one duplicate: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`s`") && d[0].message.contains("twice"),
+            "the message names the name and says it is exported twice: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("export const s") && d[0].message.contains("export { s }"),
+            "the message names both exports so the agent knows which to drop: {}",
+            d[0].message
+        );
+        // The span is the specifier that duplicates, not the declaration that is
+        // already correct: `export { s }` is the statement to delete.
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "s",
+            "the row points at the duplicated name in `export {{ s }}`: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js").is_err(),
+            "a file whose module cannot load must not produce an artifact"
+        );
+    }
+
+    /// Every shape that duplicates an export, and the legal neighbours beside
+    /// them. Each refusal is one row whose message says "twice"; each neighbour is
+    /// clean and its artifact is valid ESM, so the rule cannot be passing by
+    /// refusing every export.
+    #[test]
+    fn every_duplicate_export_shape_is_refused() {
+        // (a) `export function f(){}` + `export { f }`.
+        // (b) `export default function P(){}` + `export { P as default }`.
+        // (c) two `export { x }` statements.
+        // (d) a name exported under an alias that collides:
+        //     `export const a = 1; export { a as b }; export const b = 2`.
+        let duplicates = [
+            "export function f() { return 1 }\nexport { f }",
+            "function Q(props: Record<never, never>) { return <p>hi</p> }\nexport { Q as default }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }",
+            "const x = 1\nexport { x }\nexport { x }",
+            "export const a = 1\nexport { a as b }\nexport const b = 2",
+        ];
+        for body in duplicates {
+            let src = format!(
+                "\"use island\"\n{body}\nexport default function R(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            // Shape (b) already has its own `export default` in the fixture, so the
+            // shared tail would be a second one; that shape is complete without it.
+            let src = if body.contains(" as default ") {
+                format!("\"use island\"\n{body}\n")
+            } else {
+                src
+            };
+            let d = crate::analyze::analyze(&src, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014 && row.message.contains("twice"))
+                .unwrap_or_else(|| panic!("{body}: no duplicate-export row: {d:?}"));
+            assert!(
+                row.message.contains("exported twice") && row.message.contains("may export"),
+                "{body}: the reason is ESM's one-export-per-name rule: {}",
+                row.message
+            );
+            let check =
+                crate::codegen::emit_client_checked(&src, "src/routes/index.page.tsx", "/r.js");
+            assert!(check.is_err(), "{body}: build must refuse: {check:?}");
+        }
+
+        // The legal neighbours, each of which exports a name once: a declaration
+        // exported under a *different* name, and a plain local with one specifier.
+        for body in [
+            "export function f() { return 1 }\nexport { f as g }",
+            "const x = 1\nexport { x }",
+        ] {
+            let src = format!(
+                "\"use island\"\n{body}\nexport default function R(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            assert!(
+                crate::analyze::analyze(&src, "src/routes/index.page.tsx").is_empty(),
+                "{body}: exporting distinct names is legal"
+            );
+            let module =
+                crate::codegen::emit_client_checked(&src, "src/routes/index.page.tsx", "/r.js")
+                    .unwrap_or_else(|d| panic!("{body}: must build: {d:?}"));
+            assert_valid_esm(&module);
+        }
+    }
+
+    /// `analyze` drops identical `(code, span)` pairs, so the duplicate row must
+    /// sit on a span no other rule claims. This fixture makes both rules fire on
+    /// the same specifier (`_a` is a reserved island local *and* a duplicate) and
+    /// asserts both rows survive — the reserved row on the specifier, the
+    /// duplicate row on the exported name.
+    #[test]
+    fn the_duplicate_row_is_not_swallowed_by_analyzes_dedup() {
+        let src = "\"use island\"\nconst x = 1\nexport { x as _a }\nexport { x as _a }\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        let rows = d
+            .iter()
+            .filter(|row| row.code == Code::RA014)
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.message.contains("exported twice")),
+            "the duplicate row survives the dedup: {d:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.message.contains("twice"))
+                && d.iter()
+                    .filter(|row| row.message.contains("exported twice"))
+                    .count()
+                    == 1,
+            "exactly one duplicate row: {d:?}"
+        );
+    }
+
+    /// The property D1 violated, asserted directly: every export surface a route
+    /// may legally write emits a module that `node --check` accepts.
+    ///
+    /// Before this round no test ran `node --check` over a module whose source had
+    /// an export *declaration* beside a specifier, so the duplicate shipped.
+    #[test]
+    fn every_emitted_export_surface_is_valid_esm() {
+        // Each fixture is legal (the rule above proves the duplicates are not).
+        let legal = [
+            // The single-export control: `node --check` accepted this even before
+            // the rule, which is why the defect hid.
+            "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n",
+            // A declaration exported under a second name, plus a function export.
+            "\"use island\"\nexport const a = 1\nexport { a as b }\nexport function f() { return a }\nexport default function P(props: Record<never, never>) { return <p>{f()}{b}</p> }\n",
+            // A plain local and one specifier.
+            "\"use island\"\nconst s = 1\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s}</p> }\n",
+        ];
+        for src in legal {
+            let module =
+                crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+                    .unwrap_or_else(|d| panic!("must build: {d:?}"));
+            assert_valid_esm(&module);
+        }
     }
 }

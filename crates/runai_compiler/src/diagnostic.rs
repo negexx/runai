@@ -224,9 +224,17 @@ impl Code {
                  `\"runai\"` is not a form the client module emits, and `import x = require(…)` or \
                  `export =` is rewritten by type stripping into `require`/`module.exports`, which \
                  an ES module does not have — each route is emitted from its own file, so a second \
-                 module cannot be resolved or inlined. A re-export is refused even when its source \
+                 module cannot be resolved or inlined. An island's import list is built from the \
+                 runtime's actual exports, so a named specifier the runtime does not provide — \
+                 `import { _a } from \"runai\"`, where `_a` is one of the emitter's own locals — is \
+                 refused too: the artifact would ask the engine for a binding that does not exist \
+                 and fail to load. A re-export is refused even when its source \
                  is `\"runai\"`, because the emitted module never carries one, so accepting it would \
-                 drop the statement silently. A third is a value the generated module cannot see — \
+                 drop the statement silently. The file's own export list is part of this family too: \
+                 a name exported twice — `export const s` beside `export { s }`, or two \
+                 `export { x }` statements — is refused because an ES module may export a name \
+                 once, so the module would be a syntax error rather than a page. A third is a \
+                 value the generated module cannot see — \
                  a `\"runai\"` name or the route component's own name at module scope, in a \
                  component-body statement, or in a \
                  `\"use static\"` route's markup, whose prerender module has no imports and does \
@@ -303,9 +311,12 @@ impl Code {
                  re-export whose source is `\"runai\"` becomes `import { owner } from \"runai\"` \
                  with the name used here; a \
                  default or namespace `\"runai\"` import is not a form the emitted module writes, \
-                 so rewrite it as named imports; write `import x = require(…)` as an `import`, and \
-                 `export =` as `export default` or a named export. For a `declare` statement, \
-                 replace it with a value this file defines, because it is erased before emission. \
+                 so rewrite it as named imports; a name the runtime does not export is not imported \
+                 by any `\"runai\"` specifier, so use one of the names the message lists, or import \
+                 an `index.d.ts` type with `import { type … }`; write `import x = require(…)` as \
+                 an `import`, and `export =` as `export default` or a named export. For a \
+                 `declare` statement, replace it with a value this file defines, because it is \
+                 erased before emission. \
                  For a route signature — a default, a destructuring pattern, a rest parameter, or \
                  a different name — the emitters rebuild the parameter list as one `props` \
                  parameter, so write the parameter as `(props: Record<never, never>)` when it \
@@ -329,7 +340,9 @@ impl Code {
                  markup directly, because both modes call the component synchronously. \
                  For a declaration, export name, or reference that uses a reserved generated \
                  name (`_esc`, `_attr`, or `render`), rename it, because the emitted module \
-                 declares those names itself."
+                 declares those names itself. For a name the file exports twice, delete one of \
+                 the two exports or export one under a different name, because an ES module may \
+                 export a name once."
             }
         }
     }

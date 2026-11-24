@@ -162,6 +162,45 @@ pub const PRERENDER_EXPORTS: &[&str] = &["render"];
 /// the module's bindings, never a duplicate export.
 pub const ISLAND_EXPORTS: &[&str] = &[];
 
+/// The names the **runtime** module (`packages/runai/runtime.js`) actually
+/// exports, as the emitted island's `import { … } from "<runtime url>"` resolves
+/// them.
+///
+/// An island module's one import names the runtime, so a specifier that is not in
+/// this list produces a module the JavaScript engine refuses to link:
+/// `SyntaxError: The requested module … does not provide an export named '_a'`.
+/// `_a` is an island emitter **local** ([`ISLAND_LOCALS`]), not a runtime export,
+/// and `check_emitted_names` reserves it against a declaration without asking
+/// whether the runtime has it — so before this list existed, `import { _a } from
+/// "runai"` passed `check` and `build` and shipped an unloadable module.
+///
+/// This is a hand-kept copy of `runtime.js`'s `export` statements, on purpose: the
+/// compiler cannot read the package at build time, and the alternative — a list
+/// derived from *usages* — is the false negative this list exists to close. The
+/// drift is closed from the other side by
+/// `crates/runai_compiler/src/analyze/entry.rs`'s
+/// `the_runtime_export_list_matches_the_shipped_runtime`, which parses the real
+/// `runtime.js` and fails if the two disagree in either direction. So a future
+/// runtime export cannot be missing here without a test failing.
+///
+/// `index.d.ts` is not the source: it declares `Accessor`, `Template`, and
+/// `Result` as **types**, which erase at build time and are never runtime exports.
+/// A type imported as a value is a different defect (the import disappears and the
+/// name is unresolved), and is not this list's question.
+pub const RUNTIME_EXPORTS: &[&str] = &[
+    "signal", "derived", "effect", "owner", "template", "For", "Show", "When", "resource", "mount",
+    "_setText", "_setAttr", "_on",
+];
+
+/// The names `packages/runai/index.d.ts` declares as **types**, which erase before
+/// the module runs and are therefore not in [`RUNTIME_EXPORTS`].
+///
+/// They exist in this list for one sentence: an import of one of these as a value
+/// is refused, and the repair must say how to import it as what it is. Without the
+/// list the refusal could only offer the value exports, which is not what an agent
+/// using `Accessor` wants.
+pub const RUNTIME_TYPE_EXPORTS: &[&str] = &["Accessor", "Template", "Result"];
+
 /// The names an **island** module declares for itself, independent of the route.
 ///
 /// The island emitter's own locals: `_c` (the marker collector), `_a` (the marker

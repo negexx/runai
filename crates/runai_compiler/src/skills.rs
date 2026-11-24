@@ -49,7 +49,7 @@ fn description(code: Code) -> &'static str {
         Code::RA012 => "The file opens without a `\"use static\"` or `\"use island\"` directive.",
         Code::RA014 => {
             "Valid syntax this milestone cannot compile — an unsupported construct, import, \
-             unreachable value, `declare`, or reserved name."
+             unreachable value, `declare`, reserved name, or a name exported twice."
         }
     }
 }
@@ -182,9 +182,19 @@ fn why(code: Code) -> &'static str {
              named specifiers only; the repair is to rewrite the declaration as named imports. \
              And the CommonJS spellings TypeScript allows — `import x = require(\"./x\")` and \
              `export = x` — are refused because type stripping rewrites them to `require(…)` and \
-             `module.exports = …`, which an ES module does not have. `import type` — and the \
+             `module.exports = …`, which an ES module does not have. A named specifier the runtime \
+             does not export is refused in an island for the same family's reason: the artifact's \
+             one import would ask the engine for a binding that does not exist, so the module fails \
+             to load. `_a` is the sharp case — it is an island emitter local, not a runtime export \
+             — and the `message` lists the names that do exist. `import type` — and the \
              inline `import { type X }` form — is exempt, because types are stripped and leave no \
              runtime import behind.\
+             \n\n\
+             The file's own export list belongs to that same second family: a name exported twice — \
+             `export const s` beside `export { s }`, `export default function P` beside `export { P \
+             as default }`, or two `export { x }` statements — is refused because an ES module may \
+             export a name once. That is a syntax error in the emitted module, not a limitation: \
+             there is no legal file to protect, so it is refused rather than emitted.\
              \n\n\
              The third family is a value the generated module genuinely cannot see, and it has \
              two members only. A `\"runai\"` name, or the route component's own name, used at \
