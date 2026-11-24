@@ -5,3 +5,6 @@ dist/
 .superpowers/
 *.Zone.Identifier
 .worktrees/
+
+# Third-party research documents kept locally
+OpenCode Production Workspace Setup.md
