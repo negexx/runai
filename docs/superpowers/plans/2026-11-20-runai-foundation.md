@@ -2163,7 +2163,17 @@ For each static route:
 2. run `bun -e "import('./<name>.mjs').then(m => process.stdout.write(m.render()))"`, or the same with `node --input-type=module -e`;
 3. capture stdout and wrap it in the document shell: `<!doctype html><html><head><meta charset="utf-8"><title>runai</title></head><body><div id="app">…</div></body></html>`.
 
-For island routes, emit the same shell with an empty `#app` and a module script pointing at `/assets/<name>.js`, write the route module, and copy the runtime. A failed `bun`/`node` invocation prints its stderr, exits 1, and removes `<out>.tmp`.
+**The exit status is not a failure signal here — use these three checks.** Measured on this
+machine (Bun 1.4.1, Node v24.20.0): a module with a syntax error, a module that throws at
+import, and a module whose `render` is missing each print to stderr and still **exit 0**.
+So a build that trusts `status().success()` writes an error banner into the page. Use
+`Command::output()` and fail — printing the captured stderr — unless all three hold:
+the status succeeded, **stderr is empty**, and stdout is non-empty. Empirically a clean
+module writes exactly the HTML to stdout and nothing to stderr, so an empty stderr is a
+safe requirement. The child's working directory must be the directory holding the
+module, because both runtimes are invoked with a relative specifier.
+
+For island routes, emit the same shell with an empty `#app` and a module script pointing at `/assets/<name>.js`, write the route module, and copy the runtime. A failed `bun`/`node` invocation (per the three checks above) prints its stderr, exits 1, and removes `<out>.tmp`.
 
 - [ ] **Step 4: Run and verify pass**
 
