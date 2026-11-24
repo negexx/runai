@@ -5,17 +5,27 @@
 //!
 //! - `0` — every file was analyzed and nothing is wrong;
 //! - `1` — at least one `error` diagnostic was reported;
-//! - `2` — the command was misused or the path does not exist. **Nothing is
-//!   written to stdout** in this case; the message goes to stderr, because a
-//!   caller parsing `--json` output must never see prose where an array belongs.
+//! - `2` — the command was misused, the path does not exist, or nothing could be
+//!   read at all. **Nothing is written to stdout** in this case; the message goes
+//!   to stderr, because a caller parsing `--json` output must never see prose
+//!   where an array belongs.
 //!
-//! # Paths are relative to the working directory
+//! One unreadable file among readable ones does not end the run: it is reported
+//! on stderr — naming the path and the OS error — and the walk continues, so the
+//! rest of the tree is still analyzed and its diagnostics still print. The exit
+//! code is then `1` if any diagnostic was produced and `0` if none was; only when
+//! no file could be read at all is it `2`. The message never goes to stdout, so
+//! `--json` output stays one parseable array either way.
 //!
-//! Every file is passed to [`analyze`] as a path relative to the process's
-//! working directory, with `/` separators. That path is what lands in
-//! [`Diagnostic::file`], so it is what the editor jumps to and what the tests
-//! assert; an absolute path would leak the machine's layout into the output and
-//! make two runs on two checkouts differ.
+//! # Paths are relative to the working directory when that is possible
+//!
+//! A file that canonicalizes to a location under the process's working directory
+//! is passed to [`analyze`] as a path relative to that directory, with `/`
+//! separators; that relative form is what lands in [`Diagnostic::file`], so two
+//! checkouts of the same tree print the same paths. A file outside the working
+//! directory keeps the path the user gave — no `../..` chain is invented — so an
+//! absolute argument from elsewhere reports an absolute `file`. Either way the
+//! separators are `/`.
 //!
 //! # Output is deterministic
 //!
@@ -35,8 +45,8 @@ const DEFAULT_PATH: &str = "src/routes";
 
 /// Run `runai check …` with the arguments that follow `check`.
 ///
-/// Returns the process exit code: `0` clean, `1` errors found, `2` usage error
-/// or missing path. Only the `2` cases write to stderr.
+/// Returns the process exit code: `0` clean, `1` errors found, `2` usage error,
+/// missing path, or nothing readable. Every `2` writes to stderr only.
 pub fn run(args: &[String]) -> i32 {
     let mut json = false;
     let mut path: Option<&str> = None;
@@ -48,6 +58,14 @@ pub fn run(args: &[String]) -> i32 {
             "--json" => json = true,
             flag if flag.starts_with('-') => {
                 eprintln!("error: unknown flag `{flag}`");
+                eprintln!("{USAGE}");
+                return 2;
+            }
+            // A second path is refused rather than silently dropping the first:
+            // `check a b` that analyzed only `b` would report a clean tree for a
+            // tree full of errors, and the exit code is the whole product here.
+            value if path.is_some() => {
+                eprintln!("error: unexpected argument `{value}`");
                 eprintln!("{USAGE}");
                 return 2;
             }
@@ -71,13 +89,17 @@ pub fn run(args: &[String]) -> i32 {
     // the JSON form needs every diagnostic across all files at once.
     let mut checked: Vec<(String, Vec<Diagnostic>)> = Vec::new();
     let mut failed = false;
+    let mut unreadable = false;
 
     for file in files {
+        // An unreadable file is reported and skipped, not fatal: aborting here
+        // would hide every diagnostic in the same tree behind one bad encoding.
         let source = match std::fs::read_to_string(&file) {
             Ok(source) => source,
             Err(error) => {
                 eprintln!("error: cannot read {}: {error}", file.display());
-                return 2;
+                unreadable = true;
+                continue;
             }
         };
         let relative = relative_path(&file, &cwd);
@@ -89,6 +111,12 @@ pub fn run(args: &[String]) -> i32 {
             failed = true;
         }
         checked.push((source, diagnostics));
+    }
+
+    // Nothing was read at all: there is no analysis to report, so this is the
+    // exit-`2` case and stdout stays untouched for a `--json` caller.
+    if checked.is_empty() && unreadable {
+        return 2;
     }
 
     if json {
@@ -110,15 +138,23 @@ pub fn run(args: &[String]) -> i32 {
 
 /// Every `*.tsx` file under `path`, sorted by relative path.
 ///
-/// `path` may be a directory (walked recursively) or a single file, in which
-/// case that one file is checked. A path that does not exist is the exit-`2`
+/// `path` may be a directory (walked recursively) or a single `*.tsx` file, in
+/// which case that one file is checked. A file with any other extension is a
+/// usage error rather than a file to analyze: `analyze` treats its input as TSX,
+/// so `package.json` would come back as a syntax diagnostic and a non-route
+/// would look like a broken route. A path that does not exist is the exit-`2`
 /// message, which names the path the user asked for so the repair is obvious.
 fn collect(path: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
     let metadata =
         std::fs::metadata(root).map_err(|_| format!("no such directory or file: `{path}`"))?;
 
     if metadata.is_file() {
-        return Ok(vec![root.to_path_buf()]);
+        if root.extension().is_some_and(|ext| ext == "tsx") {
+            return Ok(vec![root.to_path_buf()]);
+        }
+        return Err(format!(
+            "not a route file (expected a `*.tsx` file or a directory): `{path}`"
+        ));
     }
 
     let mut files = Vec::new();
