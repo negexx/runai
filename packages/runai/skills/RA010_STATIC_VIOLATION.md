@@ -13,4 +13,4 @@ Static routes ship zero bytes of JavaScript. There is no runtime on the page to 
 
 ## Fix
 
-Change line 1 to "use island" to ship JavaScript for this route.
+Change this file's "use static" directive to "use island" to ship JavaScript for this route.

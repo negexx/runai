@@ -647,7 +647,9 @@ fn emitted_parameter_list(params: &oxc_ast::ast::FormalParameters<'_>) -> Option
 ///
 /// The repair is a literal signature rather than "move it into the body", because
 /// the parameter *is* the thing to rewrite: applying this text verbatim produces
-/// the one shape both emitters write.
+/// the one shape both emitters write. The type in the example is the concrete
+/// no-props type `RA006` also uses, never a `<Type>` placeholder: a fix is an
+/// instruction, and a placeholder cannot be typed.
 ///
 /// `reason` is a complete clause, so the message composes without a conjunction
 /// that would double when the clause already carries one.
@@ -657,8 +659,9 @@ fn signature_refusal(params: &oxc_ast::ast::FormalParameters<'_>, reason: &str) 
         (params.span.start, params.span.end),
         format!(
             "this route signature is not emitted: the generated component is always written as \
-             `function <Name>(props)`, so {reason}. Write the parameter as `(props: <Type>)` and \
-             read the fields from `props` in the body."
+             `function <Name>(props)`, so {reason}. Write the parameter as \
+             `(props: Record<never, never>)` when it carries no data, or with the type it \
+             actually needs, and read the fields from `props` in the body."
         ),
     )
 }
@@ -675,8 +678,8 @@ fn runtime_import(span: (u32, u32), name: &str) -> Diagnostic {
         span,
         format!(
             "`{name}` is imported from `\"runai\"`, but a `\"use static\"` route is evaluated in \
-             a module with no imports. Change line 1 to \"use island\" to ship the runtime this \
-             value comes from, or remove the reference."
+             a module with no imports. Change the directive to \"use island\" to ship the \
+             runtime this value comes from, or remove the reference."
         ),
     )
 }
@@ -701,7 +704,7 @@ fn route_parameter(span: (u32, u32), name: &str, site: ParameterSite) -> Diagnos
         ParameterSite::Component => format!(
             "`{name}` is the route's parameter, but a route is given no props and the \
              prerendered module takes no arguments, so `{name}` would be undefined at build \
-             time. Replace the reference with a literal value, or change line 1 to \
+             time. Replace the reference with a literal value, or change the directive to \
              \"use island\" to declare the parameter."
         ),
         ParameterSite::ModuleScope => format!(
@@ -744,8 +747,8 @@ fn route_component(span: (u32, u32), name: &str) -> Diagnostic {
         format!(
             "`{name}` is the route's own component, but a `\"use static\"` route is emitted as \
              a `render()` function and the component is not declared in it, so `{name}` would be \
-             undefined at build time. Change line 1 to \"use island\" to keep the component, or \
-             remove the reference."
+             undefined at build time. Change the directive to \"use island\" to keep the \
+             component, or remove the reference."
         ),
     )
 }
@@ -849,7 +852,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
-                .contains("Change line 1 to \"use island\""),
+                .contains("Change the directive to \"use island\""),
             "the static repair is the directive: {diagnostics:?}"
         );
     }
@@ -949,7 +952,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
-                .contains("Change line 1 to \"use island\""),
+                .contains("Change the directive to \"use island\""),
             "the repair is the directive: {diagnostics:?}"
         );
 
@@ -1186,7 +1189,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
-                .contains("Change line 1 to \"use island\""),
+                .contains("Change the directive to \"use island\""),
             "the repair is the directive: {diagnostics:?}"
         );
         let span = diagnostics[0].span;
@@ -1283,7 +1286,7 @@ mod tests {
         assert!(
             diagnostics[0]
                 .message
-                .contains("Change line 1 to \"use island\""),
+                .contains("Change the directive to \"use island\""),
             "the module statement is emitted, so its body is in the module: {diagnostics:?}"
         );
 

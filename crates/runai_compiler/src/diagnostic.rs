@@ -126,9 +126,10 @@ impl Code {
                  it runs when that callback runs."
             }
             Code::RA002 => {
-                "A signal is written inside an `effect(...)` argument. An effect re-runs when \
-                 the signals it reads change, so writing one makes that write a dependency of \
-                 the run that performed it — a loop."
+                "A signal is written inside an `effect(...)` argument. An effect re-runs for the \
+                 signals it reads, and a write in its body executes as part of that run, so the \
+                 write is a side effect of the effect rather than a derived value. When the effect \
+                 also reads the signal it writes, that write causes the next run in turn."
             }
             Code::RA006 => {
                 "A component's props parameter is missing an explicit type annotation, or the \
@@ -252,7 +253,10 @@ impl Code {
                     ra009_consequence!()
                 )
             }
-            Code::RA010 => "Change line 1 to \"use island\" to ship JavaScript for this route.",
+            Code::RA010 => {
+                "Change this file's \"use static\" directive to \"use island\" to ship JavaScript \
+                 for this route."
+            }
             Code::RA011 => {
                 "Add a default export if it is missing. Replace the existing default export if it \
                  is not a component, rather than declaring a second one. Either way it must take \
@@ -271,13 +275,15 @@ impl Code {
                  so rewrite it as named imports; write `import x = require(…)` as an `import`, and \
                  `export =` as `export default` or a named export. For a `declare` statement, \
                  replace it with a value this file defines, because it is erased before emission. \
-                 For a route signature the emitter rewrites as `function <Name>(props)` — a \
-                 default, a destructuring pattern, a rest parameter, or a different name — write \
-                 the parameter as `(props: <Type>)` and read the fields from `props`. For a value \
+                 For a route signature — a default, a destructuring pattern, a rest parameter, or \
+                 a different name — the emitters rebuild the parameter list as one `props` \
+                 parameter, so write the parameter as `(props: Record<never, never>)` when it \
+                 carries no data, or with the type it actually needs, and read the fields from \
+                 `props`. For a value \
                  the generated module cannot see — a `\"runai\"` name, or the route's own \
                  component, at module scope, in a component-body statement, or in a `\"use static\"` \
                  route's markup, or the route's own parameter in a \
-                 `\"use static\"` route — do what the message names: change line 1 to \
+                 `\"use static\"` route — do what the message names: change the directive to \
                  `\"use island\"` for the first two, and replace the parameter reference with a \
                  literal value. For a JSX construct, write the spread out, move the JSX into the \
                  children or the returned tree, give the attribute or prop a value, wrap a root \
@@ -657,7 +663,7 @@ mod tests {
         );
         assert_eq!(
             Code::RA010.fix_template(),
-            "Change line 1 to \"use island\" to ship JavaScript for this route."
+            "Change this file's \"use static\" directive to \"use island\" to ship JavaScript for this route."
         );
     }
 
@@ -668,6 +674,45 @@ mod tests {
         for code in Code::all() {
             assert!(!code.explain().is_empty(), "{}", code.as_str());
             assert!(code.fix_template().len() > 20, "{}", code.as_str());
+        }
+    }
+
+    /// A `fix_template` is an instruction, so every character in it must be
+    /// typeable. `<Name>` is fine in a `message`, where it names a symbol; in a
+    /// fix, `<Type>` is a placeholder an agent cannot apply verbatim. The
+    /// predicate: a `<` immediately followed by an ASCII uppercase letter.
+    #[test]
+    fn no_fix_template_contains_an_angle_bracket_placeholder() {
+        for code in Code::all() {
+            let fix = code.fix_template();
+            let bytes = fix.as_bytes();
+            for (i, window) in bytes.windows(2).enumerate() {
+                if window[0] == b'<' && window[1].is_ascii_uppercase() {
+                    panic!(
+                        "{}: fix_template carries a `<…>` placeholder at byte {i}: {}",
+                        code.as_str(),
+                        &fix[i..(i + 12).min(fix.len())]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `RA010` fires wherever the directive sits, not only on line 1: `detect_mode`
+    /// accepts a comment above it. A fix that names a line tells the agent to edit
+    /// whatever is on that line, which may be the comment.
+    #[test]
+    fn ra010_fix_names_no_line_number() {
+        let fix = Code::RA010.fix_template();
+        assert!(
+            !fix.to_ascii_lowercase().contains("line 1"),
+            "RA010's fix must not name line 1: {fix}"
+        );
+        let bytes = fix.to_ascii_lowercase().into_bytes();
+        for (i, window) in bytes.windows(5).enumerate() {
+            if window == b"line " && bytes.get(i + 5).is_some_and(u8::is_ascii_digit) {
+                panic!("RA010's fix names a line number at byte {i}: {fix}");
+            }
         }
     }
 

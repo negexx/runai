@@ -103,8 +103,9 @@ pub fn emit_prerender_checked(source: &str, path: &str) -> Result<String, Vec<Di
                 Code::RA014,
                 (0, 0),
                 format!(
-                    "`{path}` is a \"use island\" route: the prerender emitter writes static routes only. \
-                     Change line 1 to \"use static\", or emit it with `emit_client_checked`."
+                    "`{path}` is a \"use island\" route: the prerender emitter writes static \
+                     routes only. Change the directive to \"use static\", or emit it with \
+                     `emit_client_checked`."
                 ),
             ),
             source,
@@ -296,8 +297,8 @@ pub fn emit_client_checked(
                 format!(
                     "`{path}` is a \"use static\" route: the island emitter writes island routes \
                      only, and this module would import the runtime and mount JavaScript for a \
-                     route that must ship none. Change line 1 to \"use island\", or emit it with \
-                     `emit_prerender_checked`."
+                     route that must ship none. Change the directive to \"use island\", or emit it \
+                     with `emit_prerender_checked`."
                 ),
             ),
             source,

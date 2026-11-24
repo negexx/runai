@@ -618,7 +618,10 @@ mod tests {
         let d = analyze(&src, "src/routes/index.page.tsx");
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].code, Code::RA010);
-        assert!(d[0].fix.contains("Change line 1 to \"use island\""));
+        assert!(
+            d[0].fix
+                .contains("Change this file's \"use static\" directive to \"use island\"")
+        );
         assert_eq!(d[0].line, 2);
     }
 
@@ -727,7 +730,8 @@ mod tests {
         let d = analyze(&src("\"use static\""), "src/routes/index.page.tsx");
         assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
         assert!(
-            d[0].message.contains("Change line 1 to \"use island\""),
+            d[0].message
+                .contains("Change the directive to \"use island\""),
             "the repair is the directive: {d:?}"
         );
         assert!(
@@ -767,7 +771,8 @@ mod tests {
         assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
         assert_eq!(d[0].line, 3, "the module statement is the site: {d:?}");
         assert!(
-            d[0].message.contains("Change line 1 to \"use island\""),
+            d[0].message
+                .contains("Change the directive to \"use island\""),
             "the repair is the directive: {d:?}"
         );
         // `build` still succeeds — the gate is what refuses, not lowering — but
@@ -943,7 +948,8 @@ mod tests {
         assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
         assert_eq!(d[0].line, 3, "the reference in the helper: {d:?}");
         assert!(
-            d[0].message.contains("Change line 1 to \"use island\""),
+            d[0].message
+                .contains("Change the directive to \"use island\""),
             "the repair is the directive: {d:?}"
         );
 
@@ -969,7 +975,8 @@ mod tests {
         assert_eq!(codes(&d), vec![Code::RA014], "{d:?}");
         assert_eq!(d[0].line, 3, "{d:?}");
         assert!(
-            d[0].message.contains("Change line 1 to \"use island\""),
+            d[0].message
+                .contains("Change the directive to \"use island\""),
             "{d:?}"
         );
         assert!(

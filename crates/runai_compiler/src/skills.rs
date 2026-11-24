@@ -28,7 +28,8 @@ fn description(code: Code) -> &'static str {
              render."
         }
         Code::RA002 => {
-            "A signal written inside an `effect` body makes the write its own dependency."
+            "A signal written inside an `effect` body is a side effect of that run, not a derived \
+             value."
         }
         Code::RA006 => {
             "A component's props parameter has no explicit type, or there is no parameter at all."
@@ -68,8 +69,11 @@ fn why(code: Code) -> &'static str {
              expression slot is likewise owned by that tracking scope, not by the render."
         }
         Code::RA002 => {
-            "An effect re-runs when the signals it reads change. Writing a signal it reads makes \
-             that write a new dependency of the run that performed it, which is a loop."
+            "An effect re-runs for the signals it reads, and a write in its body executes as part \
+             of that run. So the write is a side effect of the effect, not a derived value: when \
+             the effect also reads the signal it writes, each run schedules the next one, which is \
+             a loop. An effect that reads nothing cannot re-run at all, so the write there is a \
+             one-shot side effect — still not a derived value, and still the wrong place for it."
         }
         Code::RA006 => {
             "An unannotated parameter leaves the answer unstated, and a propless component leaves \
@@ -569,7 +573,7 @@ mod tests {
             "`\"use island\"`",
             "replace the parameter reference with a literal value",
             "replace it with a value this file defines",
-            "write the parameter as `(props: <Type>)`",
+            "write the parameter as `(props: Record<never, never>)`",
             "`export =` as `export default`",
         ] {
             assert!(fix.contains(repair), "missing repair `{repair}`: {fix}");

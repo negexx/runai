@@ -7,8 +7,9 @@
 //!   which is not inside a tracking scope. Nothing re-runs it, so the value on
 //!   screen is the value at first render — the silently frozen value.
 //! - `RA002_EFFECT_WRITE`: a write whose nearest function is the function passed to
-//!   an `effect`. The effect re-runs when the signals it reads change and it reads
-//!   the signal it writes, so the write feeds its own run.
+//!   an `effect`. The effect re-runs for the signals it reads, and the write runs
+//!   as part of that run; when the effect reads the signal it writes, each run
+//!   schedules the next, which is the loop.
 //! - `RA009_IMPLICIT_EFFECT`: a write whose nearest function is a component body.
 //! - `RA010_STATIC_VIOLATION`: any of the above in a `"use static"` route, where
 //!   there is no runtime at all — see [`check_static_mode`].
@@ -304,8 +305,9 @@ fn effect_write(call: &AccessorCall) -> Diagnostic {
         Code::RA002,
         call.span,
         format!(
-            "`{name}` is written inside an `effect(...)` argument; the effect re-runs when the \
-             signals it reads change, so this write makes its own run a dependency",
+            "`{name}` is written inside an `effect(...)` argument; an effect re-runs for the \
+             signals it reads, so this write runs as part of an effect run instead of deriving \
+             a value",
             name = call.name,
         ),
     )
@@ -520,6 +522,37 @@ mod tests {
     fn a_write_in_a_parenthesized_effect_is_ra002() {
         let src = "export default function P() { const n = signal(0); effect((() => { n(1) })); return <p/> }\n";
         assert_eq!(codes(src), vec!["RA002_EFFECT_WRITE"]);
+    }
+
+    /// The message must state only what is unconditionally true. `effect(() => { n(1) })`
+    /// reads nothing, so it cannot re-run: a message claiming the write "makes its own
+    /// run a dependency" is false here, while the code still fires (the rule flags
+    /// every write in an effect body). Pin the message to the reading that holds for
+    /// every site: it runs as part of a run, not as a derived value.
+    #[test]
+    fn the_ra002_message_does_not_claim_a_loop_for_an_effect_that_reads_nothing() {
+        let src = "import { signal, effect } from \"runai\"\nexport default function P() { const n = signal(0); effect(() => { n(1) }); return <p/> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        let d = check_signal_rules(program, &b);
+        assert_eq!(d.len(), 1, "{d:?}");
+        let message = &d[0].message;
+        for false_claim in [
+            "makes its own run",
+            "dependency of the run",
+            "own run",
+            "a loop",
+        ] {
+            assert!(
+                !message.contains(false_claim),
+                "RA002's message claims `{false_claim}` for an effect that reads nothing: {message}"
+            );
+        }
+        assert!(
+            message.contains("runs as part of an effect run"),
+            "the message must state the unconditional truth: {message}"
+        );
     }
 
     /// A write inside a `derived` is not one of these three codes: the plan assigns
