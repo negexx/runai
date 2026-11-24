@@ -30,8 +30,17 @@
 //! `TcpStream::connect` failing is `Gone` (safe to delete); a read timeout after a
 //! successful connect is `Busy` (lockfile untouched, exit `1`, "try again").
 //! [`fetch_status`] carries that distinction as [`Answer`], and [`stop_server`] acts on
-//! it. The same rule governs `--background`: a verified server that is busy is not
-//! stale, so a second background start refuses instead of spawning a rival.
+//! it. The same rule governs `--background` when it finds an **already running** server:
+//! a verified server that is busy is not stale, so a second background start refuses
+//! instead of spawning a rival.
+//!
+//! That rule is *not* applied to the child `--background` has just spawned. A fresh
+//! server is in its initial build and answers no status for as long as that build takes,
+//! which is the normal case for a real project, so a `Busy` probe during startup keeps
+//! polling until [`STARTUP_TIMEOUT`]. A start that gives up for any reason — timeout, an
+//! exited child — shuts the child down and removes the lockfile before returning
+//! non-zero: an abandoned start that left a server behind would hold a port no
+//! `dev stop` could reach.
 //!
 //! # The control channel does not share a thread with the build
 //!
@@ -63,9 +72,15 @@
 //!
 //! A mtime *ahead* of the clock is not treated as "in the future" for the purpose of
 //! skipping it, because the file was still touched after the last build. What stops it
-//! rebuilding forever is the build marker: after building, `built_at` becomes
-//! `max(now, newest source mtime)`, so a file whose mtime is an hour ahead is covered by
-//! the marker that was derived from it ([`Server::rebuild_locked`]).
+//! rebuilding forever is the build marker: when a build starts, `built_at` becomes
+//! `max(start, newest source mtime at that instant)`, so a file whose mtime is an hour
+//! ahead is covered by the marker that was derived from it ([`Server::rebuild_locked`]).
+//!
+//! The marker is taken **before** `build::run`, never after, and that is load-bearing: an
+//! edit made while the build is running must stay newer than the marker, so the next
+//! request rebuilds instead of serving the tree that missed it. Measuring the newest
+//! mtime after the build covered the edit permanently — the server served the pre-edit
+//! tree until the next unrelated edit.
 //!
 //! # The server is a hand-written HTTP/1.1 reader on purpose
 //!
@@ -104,7 +119,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use runai_compiler::diagnostic::Diagnostic;
@@ -269,13 +284,18 @@ struct Shared {
     /// and the lockfile carries, so a reused lockfile can be verified against it.
     root: PathBuf,
     port: u16,
-    /// When the last rebuild started, clamped forward to the newest mtime it saw. A
-    /// source newer than this is a reason to build again.
+    /// When the last rebuild started, clamped forward to the newest mtime that existed at
+    /// that instant. A source newer than this is a reason to build again.
     ///
     /// The clamp is what stops a *future* mtime (`touch -d tomorrow`, or clock skew on
-    /// an NFS mount) from rebuilding on every request: the marker is set to
-    /// `max(now, newest)` after the build, so a file whose mtime is ahead of the clock
-    /// is not newer than the marker that was derived from it.
+    /// an NFS mount) from rebuilding on every request: the marker is
+    /// `max(start, newest-at-start)`, so a file whose mtime is ahead of the clock is not
+    /// newer than the marker that was derived from it.
+    ///
+    /// It is taken **before** [`crate::build::run`], never after: a file edited while the
+    /// build runs must stay newer than the marker, so the next request rebuilds instead of
+    /// serving the tree that missed the edit. Measuring after the build covers the edit
+    /// permanently and serves the pre-edit tree until some unrelated change.
     built_at: SystemTime,
     /// The error diagnostics of the last failed build; empty when it was clean.
     ///
@@ -453,10 +473,13 @@ impl Server {
         // A build is publishing. Exiting now would kill the process between assembling
         // and renaming a tree; answering "busy" leaves the lockfile in place and lets
         // the caller retry, which is exactly what `dev stop` reports.
-        if self.build.try_lock().is_err() {
+        //
+        // The guard is held until `process::exit` below: releasing it first would let a
+        // page request begin a publish in the window between the answer and the exit.
+        let Some(_guard) = lock_unless_building(&self.build) else {
             write_response(stream, 503, "application/json", br#"{"busy":true}"#, false);
             return;
-        }
+        };
 
         write_response(
             stream,
@@ -471,6 +494,10 @@ impl Server {
         // successor that already overwrote it (started in the same instant `stop`
         // began) must keep its own lockfile.
         self.remove_own_lock();
+        // `_guard` is still held: releasing it before the exit would let a page request
+        // begin a publish in the window between the answer and `process::exit`. (A panic
+        // unwinding past this point would poison the lock, which `lock_unless_building`
+        // treats as finished — never as busy.)
         std::process::exit(0);
     }
 
@@ -552,21 +579,24 @@ impl Server {
     /// served tree is exactly what `runai build` produces. A failure is recorded, not
     /// returned: the previous `dist/` is still there and must keep being served.
     fn rebuild_locked(&self, reason: &str) {
-        // The marker is published *before* the build: a file edited while the build runs
-        // has an mtime later than this, so the next request rebuilds again rather than
-        // serving the tree that missed the edit.
+        // The marker is published *before* the build, clamped to the newest mtime that
+        // exists **now**. Both halves matter: taking it before the build means a file
+        // edited while the build runs stays newer than it, so the next request rebuilds;
+        // clamping it to the newest mtime that existed at this instant means a future
+        // mtime is covered by the marker derived from it and builds exactly once.
+        //
+        // Never measure `newest` after the build: an edit made inside the build window
+        // would then have `mtime < built_at` and be invisible forever.
+        let started = SystemTime::now();
+        let newest_at_start = newest_modified(&self.shared().root);
         {
-            self.shared().built_at = SystemTime::now();
+            let mut shared = self.shared();
+            shared.built_at = started.max(newest_at_start);
+            shared.building = true;
         }
 
         let code = crate::build::run(&["--out".to_string(), DIST.to_string()]);
 
-        // After the build the marker moves to `max(now, newest source mtime)`. Clamping
-        // forward is what makes a future mtime build exactly once: the marker covers
-        // the mtime instead of staying behind it forever.
-        let finished = SystemTime::now();
-        let newest = newest_modified(&self.shared().root);
-        let built_at = finished.max(newest);
         let diagnostics = if code == 0 {
             Vec::new()
         } else {
@@ -574,8 +604,9 @@ impl Server {
         };
         {
             let mut shared = self.shared();
-            shared.built_at = built_at;
             shared.diagnostics = diagnostics;
+            // Cleared on both paths: a failed build is finished, not in flight.
+            shared.building = false;
         }
 
         if code == 0 {
@@ -686,20 +717,28 @@ fn start_background(root: &Path, port: u16) -> i32 {
 
     let deadline = SystemTime::now() + STARTUP_TIMEOUT;
     let mut exited = None;
+    // The port the child bound, learned from its lockfile. `None` until it writes one.
+    let mut probed = None;
     while SystemTime::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {
             exited = Some(status);
             break;
         }
         match read_lock(root) {
-            Some(lock) if lock.pid == u64::from(child.id()) => match fetch_status(lock.port) {
-                Answer::Status(status) if status.pid == lock.pid => {
-                    println!("{}", status.body);
-                    return 0;
+            Some(lock) if lock.pid == u64::from(child.id()) => {
+                probed = Some(lock.port);
+                match fetch_status(lock.port) {
+                    Answer::Status(status) if status.pid == lock.pid => {
+                        println!("{}", status.body);
+                        return 0;
+                    }
+                    // A child that is still in its initial build accepts the connection
+                    // and has no status yet: healthy and slow, not failed. Poll until
+                    // STARTUP_TIMEOUT rather than calling this "busy" after one probe.
+                    Answer::Busy => {}
+                    Answer::Status(_) | Answer::Gone => {}
                 }
-                Answer::Busy => return report_busy(),
-                Answer::Status(_) | Answer::Gone => {}
-            },
+            }
             // The child has not written its lockfile yet; keep waiting.
             _ => {}
         }
@@ -709,6 +748,8 @@ fn start_background(root: &Path, port: u16) -> i32 {
     match exited {
         Some(status) => {
             eprintln!("error: the dev server exited during startup ({status})");
+            // It is already gone; this only clears a lockfile still naming it.
+            remove_lock_naming(root, child.id());
             1
         }
         None => {
@@ -716,8 +757,60 @@ fn start_background(root: &Path, port: u16) -> i32 {
                 "error: the dev server did not answer `/_runai/status` within {}s",
                 STARTUP_TIMEOUT.as_secs()
             );
+            // The child is alive: whichever reason made this fail, it must not outlive
+            // the command that started it. Every abandoned start leaves a server holding
+            // a port that no `dev stop` can reach, because the lockfile is about to go.
+            stop_spawned_child(&mut child, probed, root);
             1
         }
+    }
+}
+
+/// Shut down a child this process spawned and could not verify, so a failed
+/// `--background` leaves no process and no lockfile behind.
+///
+/// Preferred: `POST /_runai/shutdown` on the port the child reported, which is the same
+/// path `dev stop` uses and lets the child remove its own lockfile. Fallback: kill the pid
+/// just spawned, which is this process's own child and nobody else's. Either way the
+/// lockfile is then removed, because it names a server that no longer exists.
+fn stop_spawned_child(child: &mut std::process::Child, port: Option<u16>, root: &Path) {
+    let stopped = match port {
+        // The same path `dev stop` uses: the child answers, removes its own lockfile and
+        // exits. A `Busy` answer means a build is publishing and the child will not stop,
+        // so it falls through to the kill below rather than being waited for.
+        Some(port) => matches!(post_shutdown(port), Shutdown::Stopped),
+        None => false,
+    };
+
+    let mut exited = false;
+    if stopped {
+        let deadline = SystemTime::now() + STARTUP_TIMEOUT;
+        while SystemTime::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+    if !exited {
+        // Its own child, by the pid `spawn` returned: never a pattern, never another
+        // process's server.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    remove_lock_naming(root, child.id());
+}
+
+/// Remove `.runai/dev.json` when it names `pid`, so a failed start leaves no lockfile
+/// pointing at a server that no longer exists. A successor that started in the meantime
+/// owns its own lockfile and is left alone.
+fn remove_lock_naming(root: &Path, pid: u32) {
+    if let Some(found) = read_lock(root)
+        && found.pid == u64::from(pid)
+    {
+        let _ = std::fs::remove_file(root.join(LOCKFILE));
     }
 }
 
@@ -1037,6 +1130,36 @@ fn read_head(stream: &mut TcpStream) -> Option<(String, String)> {
     Some((method, target))
 }
 
+/// Try to take the build lock without waiting, for `/_runai/shutdown`.
+///
+/// `None` means a build is publishing: the caller answers `503` and leaves the restart to
+/// `dev stop`. A **poisoned** lock is not busy — the work it guarded is finished or its
+/// thread is gone — so it proceeds. Returning `None` on poison made a panic in one build
+/// render the server permanently unstoppable: `/_runai/shutdown` answered `503` forever,
+/// `dev stop` exited `1` without deleting the lockfile, and the process needed `kill`.
+/// [`Server::shared`] and [`Server::rebuild_locked`] already recover from poison
+/// deliberately; this is the same decision at the one remaining `try_lock`.
+fn lock_unless_building(build: &Mutex<()>) -> Option<std::sync::MutexGuard<'_, ()>> {
+    match build.try_lock() {
+        Ok(guard) => Some(guard),
+        // A build is publishing: that is the one answer `dev stop` must not act on.
+        Err(TryLockError::WouldBlock) => None,
+        // The guard's work is over; taking the lock is the honest reading.
+        Err(TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+    }
+}
+
+/// The HTTP reason phrase for a status code this server emits.
+fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Error",
+    }
+}
+
 /// Write one response and close. Headers are lowercase-free and ASCII only.
 fn write_response(
     stream: &mut TcpStream,
@@ -1045,12 +1168,7 @@ fn write_response(
     body: &[u8],
     head_only: bool,
 ) {
-    let reason = match code {
-        200 => "OK",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Error",
-    };
+    let reason = reason_phrase(code);
     let head = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
@@ -1560,5 +1678,67 @@ mod tests {
             !changed_since(tmp.path(), marker),
             "a future mtime must not look newer than the marker derived from it"
         );
+    }
+
+    /// NEW-C, as a unit: the marker must be derived from the sources that existed when the
+    /// build **started**, so a file written during the build is newer than it. Measuring
+    /// the newest mtime after the build covered that edit permanently.
+    #[test]
+    fn a_file_written_during_a_build_stays_newer_than_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = tmp.path().join(SRC).join("index.page.tsx");
+        std::fs::create_dir_all(route.parent().unwrap()).unwrap();
+        std::fs::write(&route, "before").unwrap();
+
+        // What `rebuild_locked` now does: stamp before the build.
+        let started = SystemTime::now();
+        let marker = started.max(newest_modified(tmp.path()));
+
+        // The build runs; the user saves the file while it does.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&route, "after").unwrap();
+
+        assert!(
+            changed_since(tmp.path(), marker),
+            "an edit made during a build must be newer than the marker taken before it"
+        );
+    }
+
+    /// NEW-MB: a poisoned build lock must not make the server unstoppable. A panic inside
+    /// one build poisons the mutex; `try_lock` then returns `Err(Poisoned)` forever, and
+    /// the old `is_err()` test answered `503` to every shutdown — `dev stop` exited `1`,
+    /// kept the lockfile, and only `kill` ended the process.
+    #[test]
+    fn a_poisoned_build_lock_still_allows_shutdown() {
+        let build = Mutex::new(());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = build.lock().unwrap();
+            panic!("a build panicked while holding the lock");
+        }));
+        assert!(poisoned.is_err(), "the test must actually poison the lock");
+
+        assert!(
+            lock_unless_building(&build).is_some(),
+            "a poisoned lock means the build is over, so shutdown must proceed"
+        );
+    }
+
+    /// The busy half, which must not regress: a lock held by a live build is `None`.
+    #[test]
+    fn a_held_build_lock_reports_busy() {
+        let build = Mutex::new(());
+        let _held = build.lock().unwrap();
+        assert!(
+            lock_unless_building(&build).is_none(),
+            "a build in flight must answer `503`, not exit under it"
+        );
+    }
+
+    /// The status line for `503` read `HTTP/1.1 503 Error`, which no client expects.
+    #[test]
+    fn every_status_code_has_a_real_reason_phrase() {
+        assert_eq!(reason_phrase(503), "Service Unavailable");
+        assert_eq!(reason_phrase(404), "Not Found");
+        assert_eq!(reason_phrase(200), "OK");
     }
 }

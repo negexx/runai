@@ -552,6 +552,180 @@ fn serve_only_refuses_to_clobber_a_live_lockfile() {
     assert_eq!(status["pid"].as_u64().unwrap(), pid);
 }
 
+/// NEW-C: an edit made *while a build is running* must be rebuilt on the next request.
+///
+/// The build marker was taken from `now` **after** `build::run` returned, so a file
+/// touched inside the build window had `mtime < built_at` and was never seen as a change
+/// again: the pre-edit tree was served forever.
+#[test]
+fn an_edit_during_a_build_is_rebuilt_on_the_next_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+
+    settle();
+    // A four-second rebuild, publishing SLOWBUILD if the edit is not picked up.
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        slow_route_text("SLOWBUILD", 4000),
+    )
+    .unwrap();
+    let rebuild = std::thread::spawn(move || {
+        let _ = http_lenient(port, "GET", "/");
+    });
+
+    // The build is now inside its render; edit the route under it.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        route_body("NEWEDIT"),
+    )
+    .unwrap();
+    rebuild.join().unwrap();
+
+    let (code, body) = http(port, "GET", "/");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("<p>NEWEDIT</p>"),
+        "an edit made during a build must be rebuilt on the next request, not lost; \
+         served: {body}"
+    );
+}
+
+/// NEW-MA(a): a healthy child whose *initial* build takes seconds answers no status yet,
+/// so the parent's 500 ms probe reads `Busy`. That must be polled through to
+/// [`STARTUP_TIMEOUT`], not turned into a "busy" failure at half a second.
+#[test]
+fn background_copes_with_a_slow_initial_build_and_leaves_one_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    // ~3 s inside the prerender: longer than one probe, shorter than the startup timeout.
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        slow_route_text("hi", 3000),
+    )
+    .unwrap();
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+
+    let status = run_json(&["dev", "--background", "--port", "0"], tmp.path());
+    assert_eq!(status["running"], true);
+    let pid = status["pid"].as_u64().unwrap();
+    assert_eq!(
+        serve_only_pids(tmp.path()),
+        vec![pid],
+        "a slow-but-healthy start must leave exactly one server process"
+    );
+    assert_eq!(http(status["port"].as_u64().unwrap(), "GET", "/").0, 200);
+}
+
+/// NEW-MA(b): a start that fails must not leave the child it spawned behind, and must not
+/// leave a lockfile naming a server no parent owns. The trigger is the startup timeout: a
+/// route whose prerender outlives it, so the parent gives up mid-build.
+#[test]
+fn a_failed_background_start_kills_the_child_it_spawned() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        slow_route_text("hi", 9000),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_runai"))
+        .args(["dev", "--background", "--port", "0"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a start that never becomes ready must fail: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // A SIGKILLed child does not get to clean up, so the parent must have done it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !serve_only_pids(tmp.path()).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(
+        serve_only_pids(tmp.path()),
+        Vec::<u64>::new(),
+        "a failed `--background` must not leave a server holding the port"
+    );
+    assert!(
+        !tmp.path().join(".runai/dev.json").exists(),
+        "a failed `--background` must not leave a lockfile for a server it killed"
+    );
+}
+
+/// `building` must be true while a rebuild runs, or a client polling `/_runai/status` can
+/// never tell why a page request is slow.
+#[test]
+fn status_reports_that_a_build_is_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+
+    settle();
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        slow_route(3000),
+    )
+    .unwrap();
+    let rebuild = std::thread::spawn(move || {
+        let _ = http_lenient(port, "GET", "/");
+    });
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    let (code, body) = http_lenient(port, "GET", "/_runai/status").expect("status must answer");
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("\"building\":true"),
+        "a rebuild in flight must be reported: {body}"
+    );
+
+    rebuild.join().unwrap();
+    let (_, body) = http(port, "GET", "/_runai/status");
+    assert!(
+        body.contains("\"building\":false"),
+        "the flag must clear once the build ends: {body}"
+    );
+}
+
+/// The pids of this project's `--serve-only` servers, from `/proc`, addressed by pid and
+/// by the child's working directory — never by a name pattern, which can match the shell
+/// running the test.
+fn serve_only_pids(root: &Path) -> Vec<u64> {
+    let root = root.canonicalize().unwrap();
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u64>() else {
+            continue;
+        };
+        let Ok(command) = std::fs::read_to_string(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if !command.contains("--serve-only") {
+            continue;
+        }
+        match std::fs::read_link(entry.path().join("cwd")) {
+            Ok(cwd) if cwd == root => found.push(pid),
+            _ => {}
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
 /// A route file rendering `text`, as the brief's apps write them.
 fn route_body(text: &str) -> String {
     format!(
@@ -563,11 +737,16 @@ fn route_body(text: &str) -> String {
 /// flight. Same shape as `tests/build.rs`'s `slow_route`: the loop runs inside the
 /// prerender child, i.e. after the build has taken its lock.
 fn slow_route(millis: u64) -> String {
+    slow_route_text("slow", millis)
+}
+
+/// [`slow_route`] with a chosen body, so a test can name the tree a slow build publishes.
+fn slow_route_text(text: &str, millis: u64) -> String {
     format!(
         "\"use static\"\nexport default function P(props: Record<never, never>) {{\n\
          const until = Date.now() + {millis};\n\
          while (Date.now() < until) {{}}\n\
-         return <p>slow</p>\n}}\n"
+         return <p>{text}</p>\n}}\n"
     )
 }
 
