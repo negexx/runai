@@ -20,6 +20,17 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// Kills and reaps a child on drop, including when the test panics, so a process under
+/// test cannot outlive its assertions.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Minimal std-only HTTP client: no reqwest, no async runtime.
 fn http(port: u64, method: &str, path: &str) -> (u16, String) {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
@@ -149,6 +160,425 @@ fn edits_are_rebuilt_on_the_next_page_request() {
     )
     .unwrap();
     assert!(http(port, "GET", "/").1.contains("<p>changed</p>"));
+}
+
+/// The raw response head and body, so headers can be asserted.
+fn http_raw(port: u64, method: &str, path: &str) -> String {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out
+}
+
+/// `http` for a caller that may legitimately lose its connection (the server may be
+/// exiting under it), with a bounded read so a test can never hang.
+fn http_lenient(port: u64, method: &str, path: &str) -> Option<(u16, String)> {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port as u16)).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    )
+    .ok()?;
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok()?;
+    let code = out.get(9..12)?.parse().ok()?;
+    let body = out.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Some((code, body))
+}
+
+/// `GET /_runai/status`, parsed for its `built_at` epoch-millisecond stamp: the contract
+/// the I3 test reads to prove no build happened between two requests.
+fn built_at(port: u64) -> u64 {
+    let (code, body) = http(port, "GET", "/_runai/status");
+    assert_eq!(code, 200, "{body}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    value["built_at"].as_u64().unwrap_or_else(|| {
+        panic!("`/_runai/status` must report when the last build started: {body}")
+    })
+}
+
+/// C2: a deleted route must stop being served. The walk compared file mtimes only, so
+/// removing a file changed nothing it looked at (just the parent directory's mtime,
+/// which it never read) and the deleted page kept answering 200.
+#[test]
+fn a_deleted_route_stops_being_served() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    std::fs::write(
+        tmp.path().join("src/routes/gone.page.tsx"),
+        route_body("gone"),
+    )
+    .unwrap();
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(http(port, "GET", "/gone/").0, 200);
+
+    settle();
+    std::fs::remove_file(tmp.path().join("src/routes/gone.page.tsx")).unwrap();
+
+    assert_eq!(http(port, "GET", "/").0, 200, "the rebuild must publish");
+    assert_eq!(
+        http(port, "GET", "/gone/").0,
+        404,
+        "a deleted route must stop being served"
+    );
+    assert!(
+        http(port, "GET", "/").1.contains("<p>hi</p>"),
+        "the surviving route must still work"
+    );
+}
+
+/// The failed-rebuild property: a broken edit keeps the last good tree up and puts the
+/// diagnostic on `/_runai/status`. Verified by hand in round 0; pinned here.
+#[test]
+fn a_failed_rebuild_keeps_serving_the_last_good_tree_and_reports_the_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+    assert!(http(port, "GET", "/").1.contains("<p>hi</p>"));
+
+    settle();
+    std::fs::write(tmp.path().join("src/routes/index.page.tsx"), broken_route()).unwrap();
+
+    let (code, body) = http(port, "GET", "/");
+    assert_eq!(code, 200, "a broken edit must not take the page down");
+    assert!(
+        body.contains("<p>hi</p>"),
+        "the last good build must still be served: {body}"
+    );
+
+    let (code, status) = http(port, "GET", "/_runai/status");
+    assert_eq!(code, 200);
+    assert!(
+        status.contains("RA010"),
+        "the diagnostic must reach `/_runai/status`: {status}"
+    );
+}
+
+/// C1(a) end to end: a lockfile whose port accepts the connection and then never answers
+/// is a LIVE server that is busy. The round-0 defect deleted exactly this lockfile and
+/// exited 0, orphaning a server no later `dev stop` could reach. The pinned shape here is
+/// the bare socket, so the assertion is about the timeout, not about any rebuild.
+#[test]
+fn stop_leaves_the_lockfile_of_a_server_that_accepts_but_never_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    // Accept and hold: `TcpStream::connect` from `dev stop` succeeds, the read times out.
+    // Non-blocking because the number of connections `dev stop` makes is its business,
+    // not this test's — a blocking `accept` here would wait for one that never comes.
+    let held = std::thread::spawn(move || {
+        let mut accepted = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => accepted.push(stream),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        drop(accepted);
+    });
+
+    std::fs::create_dir_all(tmp.path().join(".runai")).unwrap();
+    std::fs::write(
+        tmp.path().join(".runai/dev.json"),
+        format!(
+            "{{\"pid\":{},\"port\":{port},\"root\":{:?}}}\n",
+            std::process::id(),
+            tmp.path().canonicalize().unwrap().display().to_string()
+        ),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(tmp.path().join(".runai/dev.json")).unwrap();
+
+    let stop = std::process::Command::new(env!("CARGO_BIN_EXE_runai"))
+        .args(["dev", "stop"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&stop.stderr);
+    assert!(
+        !stop.status.success(),
+        "a server that accepted the connection is not proven dead: {stderr}"
+    );
+    assert!(stderr.contains("busy"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".runai/dev.json")).unwrap(),
+        before,
+        "the lockfile of a server this process could not disprove must survive"
+    );
+
+    held.join().unwrap();
+    let _ = std::fs::remove_file(tmp.path().join(".runai/dev.json"));
+}
+
+/// C1(a): a lockfile whose server accepts the connection but does not answer in time is
+/// BUSY, not stale. Deleting it strands a live server that `dev stop` can never reach
+/// again. Reproduced in round 0 with a slow rebuild, which blocked the serial status
+/// route for seconds.
+#[test]
+fn stop_during_a_slow_rebuild_keeps_the_lockfile_and_reports_busy() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let running = run_json(&["dev", "--background", "--port", "0"], tmp.path());
+    let port = running["port"].as_u64().unwrap();
+    let pid = running["pid"].as_u64().unwrap_or_default();
+
+    settle();
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        slow_route(4000),
+    )
+    .unwrap();
+    let rebuild = std::thread::spawn(move || {
+        let _ = http_lenient(port, "GET", "/");
+    });
+    // Long enough for the page request to be inside the rebuild, short enough that it is
+    // certainly still running when `stop` fires.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    let stop = std::process::Command::new(env!("CARGO_BIN_EXE_runai"))
+        .args(["dev", "stop"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&stop.stderr);
+    assert!(
+        !stop.status.success(),
+        "stopping a busy server must not report success: {stderr}"
+    );
+    assert!(
+        stderr.contains("busy"),
+        "the command must say the server is busy: {stderr}"
+    );
+    assert!(
+        tmp.path().join(".runai/dev.json").exists(),
+        "the lockfile of a LIVE server must survive a busy stop (pid {pid})"
+    );
+
+    rebuild.join().unwrap();
+
+    // Once the build finishes the server must be stoppable: either it has already exited
+    // after the shutdown it was holding, or `dev stop` now succeeds.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let closed = loop {
+        if std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_err() {
+            break true;
+        }
+        let retry = std::process::Command::new(env!("CARGO_BIN_EXE_runai"))
+            .args(["dev", "stop"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        if retry.status.success()
+            && std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_err()
+        {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(closed, "the server must be stoppable once the rebuild ends");
+}
+
+/// C1(b): `/_runai/status` is answered from memory, so a rebuild cannot block it. This is
+/// what keeps the busy case rare even when it cannot be made impossible.
+#[test]
+fn status_answers_while_a_rebuild_is_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+
+    settle();
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        slow_route(3000),
+    )
+    .unwrap();
+    let rebuild = std::thread::spawn(move || {
+        let _ = http_lenient(port, "GET", "/");
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let started = std::time::Instant::now();
+    let (code, body) = http_lenient(port, "GET", "/_runai/status")
+        .expect("`/_runai/status` must answer while a rebuild is in flight");
+    let elapsed = started.elapsed();
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"running\":true"), "{body}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(900),
+        "the control route queued behind the rebuild: {elapsed:?}"
+    );
+
+    rebuild.join().unwrap();
+}
+
+/// I3: an mtime ahead of `now` (a `touch -d tomorrow`, or clock skew on NFS) must not
+/// rebuild on every request forever. The stamp is compared for equality across two
+/// consecutive page requests.
+#[test]
+fn a_future_mtime_does_not_rebuild_on_every_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+
+    let route = tmp.path().join("src/routes/index.page.tsx");
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&route)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+
+    assert_eq!(http(port, "GET", "/").0, 200, "the first request rebuilds");
+    let first = built_at(port);
+    assert_eq!(http(port, "GET", "/").0, 200);
+    let second = built_at(port);
+    assert_eq!(
+        first, second,
+        "a future mtime rebuilt on every request (build stamp moved {first} -> {second})"
+    );
+}
+
+/// Fold: a browser must not serve a cached pre-edit page after a rebuild.
+#[test]
+fn every_response_is_no_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+    for path in ["/", "/_runai/status", "/missing.html"] {
+        let raw = http_raw(port, "GET", path);
+        assert!(
+            raw.to_ascii_lowercase().contains("cache-control: no-store"),
+            "`{path}` must be `no-store`: {raw}"
+        );
+    }
+}
+
+/// Fold: the runtime is a wasm build; serving it as `application/octet-stream` makes
+/// `WebAssembly.instantiateStreaming` refuse it.
+#[test]
+fn wasm_is_served_as_webassembly() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let port = run_json(&["dev", "--background", "--port", "0"], tmp.path())["port"]
+        .as_u64()
+        .unwrap();
+    std::fs::write(tmp.path().join("dist/app.wasm"), b"\0asm").unwrap();
+    let raw = http_raw(port, "GET", "/app.wasm");
+    assert!(
+        raw.to_ascii_lowercase()
+            .contains("content-type: application/wasm"),
+        "{raw}"
+    );
+}
+
+/// I4: `--serve-only` is internal to `--background`. A human running it in a project
+/// with a background server must not replace that server's lockfile with its own.
+#[test]
+fn serve_only_refuses_to_clobber_a_live_lockfile() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_min_app(tmp.path());
+    let _guard = StopOnDrop(tmp.path().to_path_buf());
+    let running = run_json(&["dev", "--background", "--port", "0"], tmp.path());
+    let port = running["port"].as_u64().unwrap();
+    let pid = running["pid"].as_u64().unwrap();
+    let before = std::fs::read_to_string(tmp.path().join(".runai/dev.json")).unwrap();
+
+    // Bounded: on the code this test was written against, `--serve-only` serves forever,
+    // so a plain `output()` would hang the suite instead of failing it.
+    let mut stray = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_runai"))
+            .args(["dev", "--serve-only", "--port", "0"])
+            .current_dir(tmp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = stray.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a stray `--serve-only` kept serving instead of refusing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(
+        !status.success(),
+        "a stray `--serve-only` must not start a second server"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(".runai/dev.json")).unwrap(),
+        before,
+        "the live server's lockfile must be untouched"
+    );
+    assert_eq!(http(port, "GET", "/_runai/status").0, 200, "still serving");
+    let status: serde_json::Value =
+        serde_json::from_str(&http(port, "GET", "/_runai/status").1).unwrap();
+    assert_eq!(status["pid"].as_u64().unwrap(), pid);
+}
+
+/// A route file rendering `text`, as the brief's apps write them.
+fn route_body(text: &str) -> String {
+    format!(
+        "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <p>{text}</p> }}\n"
+    )
+}
+
+/// A static route that busy-waits in `render`, so a rebuild is observable while it is in
+/// flight. Same shape as `tests/build.rs`'s `slow_route`: the loop runs inside the
+/// prerender child, i.e. after the build has taken its lock.
+fn slow_route(millis: u64) -> String {
+    format!(
+        "\"use static\"\nexport default function P(props: Record<never, never>) {{\n\
+         const until = Date.now() + {millis};\n\
+         while (Date.now() < until) {{}}\n\
+         return <p>slow</p>\n}}\n"
+    )
+}
+
+/// A route that cannot build: `"use static"` with a signal is RA010.
+fn broken_route() -> &'static str {
+    "\"use static\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <p>{n()}</p> }\n"
+}
+
+/// Wait past the coarse 1-second mtime resolution some filesystems have.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 }
 
 /// A minimal app: one static root route rendering `<p>hi</p>`, plus a `runai.json`

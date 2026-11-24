@@ -20,13 +20,61 @@
 //! signals a pid. A stale lockfile whose port now belongs to another program is the
 //! case that would otherwise kill an innocent process.
 //!
+//! # "Could not connect" and "connected but slow" are different facts
+//!
+//! `dev stop` deletes the lockfile only when it can **positively disprove** a live
+//! server: nothing listening, or a server that answers as a different pid/root. A
+//! connection that is accepted and then times out is a live server that is busy, and
+//! deleting its lockfile strands it — it holds its port, `dev stop` can never reach it
+//! again, and a later `--background` starts a second server beside it. So:
+//! `TcpStream::connect` failing is `Gone` (safe to delete); a read timeout after a
+//! successful connect is `Busy` (lockfile untouched, exit `1`, "try again").
+//! [`fetch_status`] carries that distinction as [`Answer`], and [`stop_server`] acts on
+//! it. The same rule governs `--background`: a verified server that is busy is not
+//! stale, so a second background start refuses instead of spawning a rival.
+//!
+//! # The control channel does not share a thread with the build
+//!
+//! One thread per connection ([`Server::serve`]) is what keeps `/_runai/status` and
+//! `/_runai/shutdown` answerable while a multi-second build is running. The state they
+//! read lives behind their own mutex ([`Shared`]), and they never take the build lock to
+//! answer — `status` takes `Shared` for one `format!`, and `shutdown` tries the build
+//! lock and answers `503 {"busy":true}` rather than waiting for it. That makes the busy
+//! case above rare: it needs a connection that is accepted before a handler thread
+//! exists, not merely a slow build.
+//!
+//! # `--serve-only` is gated on an environment variable
+//!
+//! It writes the lockfile unconditionally, so a human running it in a project that
+//! already has a background server would replace that server's `{pid,port}` with its
+//! own and strand it. [`serve`] therefore refuses unless `RUNAI_DEV_SERVE_ONLY` is set,
+//! and only the `--background` parent sets it. The alternative — "refuse when a live
+//! lockfile verifies" — loses a race against the parent's own startup window, in which
+//! the lockfile is written before the first build finishes and a stray invocation would
+//! find it not-yet-answering and proceed. The env var has no such window.
+//!
+//! # A rebuild is triggered by any change, including a deletion
+//!
+//! [`changed_since`] compares every file's mtime **and every directory's own mtime**,
+//! recursively. A creation, deletion, or rename under a directory changes only that
+//! directory's mtime and no file's, so a walk that reads only files cannot see
+//! `rm src/routes/gone.page.tsx` — that was the defect where a deleted page kept being
+//! served from the previous `dist/` forever.
+//!
+//! A mtime *ahead* of the clock is not treated as "in the future" for the purpose of
+//! skipping it, because the file was still touched after the last build. What stops it
+//! rebuilding forever is the build marker: after building, `built_at` becomes
+//! `max(now, newest source mtime)`, so a file whose mtime is an hour ahead is covered by
+//! the marker that was derived from it ([`Server::rebuild_locked`]).
+//!
 //! # The server is a hand-written HTTP/1.1 reader on purpose
 //!
 //! The runtime budget is 6144 bytes gzipped and the binary takes no HTTP dependency.
 //! It binds `127.0.0.1` only — never `0.0.0.0` — reads one request, answers, and
-//! closes. Requests are served one at a time: a rebuild is synchronous, and a browser
-//! loading a page issues a handful of requests, so a thread pool would add failure
-//! modes without adding anything.
+//! closes. Each accepted connection gets its own thread; see "The control channel does
+//! not share a thread with the build" above for why that is required, not a convenience.
+//! Every response carries `Cache-Control: no-store`: a browser reusing a pre-edit page
+//! would defeat the whole point of edit-then-fetch.
 //!
 //! # `diagnostics` is the last build's located errors, and `[]` means clean
 //!
@@ -56,6 +104,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use runai_compiler::diagnostic::Diagnostic;
@@ -99,6 +148,10 @@ const SHUTDOWN: &str = "/_runai/shutdown";
 /// The hidden flag that turns this process into the detached server. Not in [`USAGE`]:
 /// it is an implementation detail of `--background`, not something to type.
 const SERVE_ONLY: &str = "--serve-only";
+
+/// The variable a `--background` parent sets for its child, and the gate [`serve`] checks.
+/// It is what keeps a stray `--serve-only` from overwriting a live server's lockfile.
+const SERVE_ONLY_ENV: &str = "RUNAI_DEV_SERVE_ONLY";
 
 /// Run `runai dev …` with the arguments that follow `dev`.
 ///
@@ -172,21 +225,27 @@ pub fn run(args: &[String]) -> i32 {
 
     // Foreground: build once so the first request has something to serve, then serve
     // in this process. stdout is the status JSON, matching `--background`.
-    let mut state = State::new(&root, port);
-    match state.begin_listen() {
+    let server = Arc::new(Server::new(&root, port));
+    match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => {
-            state.port = listener
+            server.shared().port = listener
                 .local_addr()
                 .map(|address| address.port())
                 .unwrap_or(port);
-            state.rebuild("the initial build");
-            state.write_lock();
-            println!("{}", state.status_json());
-            state.serve(listener);
+            {
+                let _guard = server
+                    .build
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                server.rebuild_locked("the initial build");
+            }
+            server.write_lock();
+            println!("{}", server.status_json());
+            server.serve(listener);
             0
         }
-        Err(message) => {
-            eprintln!("error: {message}");
+        Err(error) => {
+            eprintln!("error: cannot listen on 127.0.0.1:{port}: {error}");
             1
         }
     }
@@ -199,16 +258,25 @@ fn bad_port(value: &str) -> i32 {
     2
 }
 
-/// The live server: what it serves, on what port, and what the last build said.
-struct State {
+/// What `/_runai/status` answers, and what a rebuild records.
+///
+/// Every field here is read by control requests, so it lives behind its own mutex that a
+/// build never holds for longer than the two assignments around it. That is the whole
+/// point: a rebuild must not be able to block `/_runai/status`, because `dev stop` reads
+/// a blocked status as "no server" and would then delete the lockfile of a live one.
+struct Shared {
     /// The app root, absolute and canonical: the same value `/_runai/status` reports
     /// and the lockfile carries, so a reused lockfile can be verified against it.
     root: PathBuf,
     port: u16,
-    /// When the last rebuild *started*. A file modified after this is a reason to
-    /// build again. A failed build moves this forward too, so a broken edit is not
-    /// rebuilt on every request while it stays broken.
-    last_build: SystemTime,
+    /// When the last rebuild started, clamped forward to the newest mtime it saw. A
+    /// source newer than this is a reason to build again.
+    ///
+    /// The clamp is what stops a *future* mtime (`touch -d tomorrow`, or clock skew on
+    /// an NFS mount) from rebuilding on every request: the marker is set to
+    /// `max(now, newest)` after the build, so a file whose mtime is ahead of the clock
+    /// is not newer than the marker that was derived from it.
+    built_at: SystemTime,
     /// The error diagnostics of the last failed build; empty when it was clean.
     ///
     /// A failure that is not a located diagnostic — a render that threw, a missing
@@ -216,35 +284,58 @@ struct State {
     /// tuple of a code and a span and inventing one would be a lie about a code. Those
     /// reasons are on stderr; see the module docs.
     diagnostics: Vec<Diagnostic>,
+    /// Whether a build is in flight, published so `/_runai/status` can say so under its
+    /// own mutex without waiting for the build.
+    building: bool,
 }
 
-impl State {
-    fn new(root: &Path, port: u16) -> State {
-        State {
-            root: root.to_path_buf(),
-            port,
-            last_build: SystemTime::UNIX_EPOCH,
-            diagnostics: Vec::new(),
+/// The live server. Shared with one thread per connection.
+struct Server {
+    shared: Mutex<Shared>,
+    /// Held for the whole of a build. `/_runai/shutdown` refuses while it is held, so a
+    /// stop cannot kill the process between assembling and publishing a tree; that is
+    /// reported as "busy" and retried by the caller.
+    build: Mutex<()>,
+}
+
+impl Server {
+    fn new(root: &Path, port: u16) -> Server {
+        Server {
+            shared: Mutex::new(Shared {
+                root: root.to_path_buf(),
+                port,
+                built_at: SystemTime::UNIX_EPOCH,
+                diagnostics: Vec::new(),
+                building: false,
+            }),
+            build: Mutex::new(()),
         }
     }
 
+    /// The shared state, ignoring poisoning: a panic in one handler must not stop the
+    /// server from answering the next request.
+    fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn dist(&self) -> PathBuf {
-        self.root.join(DIST)
+        self.shared().root.join(DIST)
     }
 
     fn lock_path(&self) -> PathBuf {
-        self.root.join(LOCKFILE)
+        self.shared().root.join(LOCKFILE)
     }
 
-    /// Bind `127.0.0.1:port`; port `0` asks the OS for a free one.
-    fn begin_listen(&self) -> Result<TcpListener, String> {
-        TcpListener::bind(("127.0.0.1", self.port))
-            .map_err(|error| format!("cannot listen on 127.0.0.1:{}: {error}", self.port))
-    }
-
-    /// The single accept loop. Ends only by [`std::process::exit`] from the shutdown
-    /// endpoint, which is why it returns nothing.
-    fn serve(&mut self, listener: TcpListener) {
+    /// Accept connections and answer each on its own thread.
+    ///
+    /// A thread per request is what makes the control channel independent of the build:
+    /// one thread can be inside a multi-second `crate::build::run` while another answers
+    /// `/_runai/status`. The alternative — one serial loop — is the defect this replaced:
+    /// a rebuild blocked the status route, and a timed-out status read was taken for a
+    /// dead server, so `dev stop` deleted a live server's lockfile.
+    fn serve(self: &Arc<Self>, listener: TcpListener) {
         for stream in listener.incoming() {
             let mut stream = match stream {
                 Ok(stream) => stream,
@@ -252,26 +343,31 @@ impl State {
                 // server must not exit over it.
                 Err(_) => continue,
             };
-            let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
-            let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
-            let Some((method, target)) = read_head(&mut stream) else {
-                continue;
-            };
-            if self.handle(&mut stream, &method, &target) {
-                return;
-            }
+            let server = Arc::clone(self);
+            // The thread owns one connection and exits with it; there is no pool and no
+            // queue, so a slow client holds nothing another client needs.
+            let _ = std::thread::Builder::new()
+                .name("runai-dev-request".to_string())
+                .spawn(move || {
+                    let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
+                    if let Some((method, target)) = read_head(&mut stream) {
+                        server.handle(&mut stream, &method, &target);
+                    }
+                });
         }
     }
 
-    /// Answer one request. Returns `true` when the process should stop.
-    fn handle(&mut self, stream: &mut TcpStream, method: &str, target: &str) -> bool {
+    /// Answer one request.
+    fn handle(&self, stream: &mut TcpStream, method: &str, target: &str) {
         // Control endpoints are matched on the raw target: they are literal ASCII
         // paths this server owns, and comparing before decoding keeps the status
         // endpoint reachable even for a request whose encoding is odd. The path
         // safety rule below never applies to a file lookup that is not attempted.
         let path = target.split('?').next().unwrap_or(target);
         if path == STATUS || path == SHUTDOWN {
-            return self.control(stream, method, path);
+            self.control(stream, method, path);
+            return;
         }
 
         if method != "GET" && method != "HEAD" {
@@ -282,12 +378,12 @@ impl State {
                 b"method not allowed\n",
                 false,
             );
-            return false;
+            return;
         }
 
         let Some(decoded) = decode_path(path) else {
             not_found(stream, method);
-            return false;
+            return;
         };
 
         // A rebuild is only worth its cost when the response can be stale HTML. That is
@@ -300,7 +396,7 @@ impl State {
 
         let Some(file) = resolve_file(&self.dist(), &decoded) else {
             not_found(stream, method);
-            return false;
+            return;
         };
         match std::fs::read(&file) {
             Ok(body) => {
@@ -311,11 +407,14 @@ impl State {
             // publishing over the tree, not a bug: a 404 is the honest answer.
             Err(_) => not_found(stream, method),
         }
-        false
     }
 
-    /// Answer `/_runai/status` or `/_runai/shutdown`. Returns `true` to stop.
-    fn control(&mut self, stream: &mut TcpStream, method: &str, path: &str) -> bool {
+    /// Answer `/_runai/status` or `/_runai/shutdown`.
+    ///
+    /// Neither path touches the build, and neither holds the build lock while it waits:
+    /// `status` takes the shared mutex for one format, shutdown tries the build lock and
+    /// answers `503` instead of waiting for it.
+    fn control(&self, stream: &mut TcpStream, method: &str, path: &str) {
         if path == STATUS {
             if method != "GET" && method != "HEAD" {
                 write_response(
@@ -325,7 +424,7 @@ impl State {
                     b"method not allowed\n",
                     false,
                 );
-                return false;
+                return;
             }
             let body = self.status_json();
             write_response(
@@ -335,7 +434,7 @@ impl State {
                 body.as_bytes(),
                 method == "HEAD",
             );
-            return false;
+            return;
         }
 
         // Shutdown is a POST: a browser prefetch or a stray GET must not stop the
@@ -348,8 +447,17 @@ impl State {
                 b"method not allowed\n",
                 false,
             );
-            return false;
+            return;
         }
+
+        // A build is publishing. Exiting now would kill the process between assembling
+        // and renaming a tree; answering "busy" leaves the lockfile in place and lets
+        // the caller retry, which is exactly what `dev stop` reports.
+        if self.build.try_lock().is_err() {
+            write_response(stream, 503, "application/json", br#"{"busy":true}"#, false);
+            return;
+        }
+
         write_response(
             stream,
             200,
@@ -366,20 +474,26 @@ impl State {
         std::process::exit(0);
     }
 
-    /// The status payload. Field order is the contract documented in the brief.
+    /// The status payload. Field order is the contract documented in the brief;
+    /// `built_at` and `building` are appended so a caller can tell whether a request
+    /// rebuilt and whether one is in flight.
     fn status_json(&self) -> String {
+        let shared = self.shared();
         format!(
-            "{{\"running\":true,\"pid\":{},\"port\":{},\"root\":{},\"diagnostics\":{}}}",
+            "{{\"running\":true,\"pid\":{},\"port\":{},\"root\":{},\"built_at\":{},\"building\":{},\"diagnostics\":{}}}",
             std::process::id(),
-            self.port,
-            json_string(&self.root.to_string_lossy()),
-            Diagnostic::render_all_json(&self.diagnostics),
+            shared.port,
+            json_string(&shared.root.to_string_lossy()),
+            epoch_millis(shared.built_at),
+            shared.building,
+            Diagnostic::render_all_json(&shared.diagnostics),
         )
     }
 
     /// Write `.runai/dev.json` as `{pid,port,root}`.
     fn write_lock(&self) {
-        let path = self.lock_path();
+        let shared = self.shared();
+        let path = shared.root.join(LOCKFILE);
         if let Some(parent) = path.parent()
             && std::fs::create_dir_all(parent).is_err()
         {
@@ -388,8 +502,8 @@ impl State {
         let body = format!(
             "{{\"pid\":{},\"port\":{},\"root\":{}}}\n",
             std::process::id(),
-            self.port,
-            json_string(&self.root.to_string_lossy()),
+            shared.port,
+            json_string(&shared.root.to_string_lossy()),
         );
         // Best effort: a read-only checkout still serves, it just cannot be stopped by
         // lockfile and has to be killed. The caller's own process is the authority.
@@ -399,70 +513,112 @@ impl State {
     /// Remove the lockfile if it still names this pid and port.
     fn remove_own_lock(&self) {
         let path = self.lock_path();
+        let port = self.shared().port;
         let Ok(text) = std::fs::read_to_string(&path) else {
             return;
         };
         let pid = field_number(&text, "pid");
-        let port = field_number(&text, "port");
-        if pid == Some(u64::from(std::process::id())) && port == Some(u64::from(self.port)) {
+        let lock_port = field_number(&text, "port");
+        if pid == Some(u64::from(std::process::id())) && lock_port == Some(u64::from(port)) {
             let _ = std::fs::remove_file(&path);
         }
     }
 
+    /// Whether a source file is newer than the last build.
+    fn stale(&self) -> bool {
+        let built_at = self.shared().built_at;
+        changed_since(&self.shared().root, built_at)
+    }
+
     /// Rebuild when anything under `src/` or `runai.json` is newer than the last build.
-    fn rebuild_if_stale(&mut self) {
-        if changed_since(&self.root, self.last_build) {
-            self.rebuild("a page request");
+    ///
+    /// The build lock is taken *before* the check, so a page request that arrives while
+    /// a build is publishing waits for it and then serves the published tree instead of
+    /// racing the rename. It is also what makes two simultaneous page requests run one
+    /// build, not two.
+    fn rebuild_if_stale(&self) {
+        let _guard = self
+            .build
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.stale() {
+            self.rebuild_locked("a page request");
         }
     }
 
-    /// Build into `dist/`, recording the outcome.
+    /// Build into `dist/`, recording the outcome. The caller holds [`Server::build`].
     ///
     /// The build itself is [`crate::build::run`] — this never reimplements it, so the
     /// served tree is exactly what `runai build` produces. A failure is recorded, not
     /// returned: the previous `dist/` is still there and must keep being served.
-    fn rebuild(&mut self, reason: &str) {
-        // The marker is taken *before* the build: a file edited while the build runs
-        // has an mtime later than this, so the next request rebuilds again rather
-        // than serving the tree that missed the edit.
-        self.last_build = SystemTime::now();
-
-        let code = crate::build::run(&["--out".to_string(), DIST.to_string()]);
-        if code == 0 {
-            self.diagnostics.clear();
-            return;
+    fn rebuild_locked(&self, reason: &str) {
+        // The marker is published *before* the build: a file edited while the build runs
+        // has an mtime later than this, so the next request rebuilds again rather than
+        // serving the tree that missed the edit.
+        {
+            self.shared().built_at = SystemTime::now();
         }
 
-        // The build refused. Its stderr went wherever this process's stderr goes (null
-        // when backgrounded), so the reason is also captured structurally for the
-        // status endpoint. `crate::build::diagnostics` is the same walk and the same
-        // `analyze` the build gates on.
-        self.diagnostics = crate::build::diagnostics();
-        if self.diagnostics.is_empty() {
+        let code = crate::build::run(&["--out".to_string(), DIST.to_string()]);
+
+        // After the build the marker moves to `max(now, newest source mtime)`. Clamping
+        // forward is what makes a future mtime build exactly once: the marker covers
+        // the mtime instead of staying behind it forever.
+        let finished = SystemTime::now();
+        let newest = newest_modified(&self.shared().root);
+        let built_at = finished.max(newest);
+        let diagnostics = if code == 0 {
+            Vec::new()
+        } else {
+            crate::build::diagnostics()
+        };
+        {
+            let mut shared = self.shared();
+            shared.built_at = built_at;
+            shared.diagnostics = diagnostics;
+        }
+
+        if code == 0 {
+            return;
+        }
+        let count = self.shared().diagnostics.len();
+        if count == 0 {
             eprintln!("runai dev: the build failed during {reason}; serving the last good `dist/`");
         } else {
             eprintln!(
-                "runai dev: the build failed during {reason} with {} diagnostic(s); serving the last good `dist/`",
-                self.diagnostics.len()
+                "runai dev: the build failed during {reason} with {count} diagnostic(s); serving the last good `dist/`"
             );
         }
     }
 }
 
 /// The child half of `--background`: build, then serve until shutdown.
+///
+/// It refuses to run unless the parent set [`SERVE_ONLY_ENV`]: `--serve-only` writes the
+/// lockfile unconditionally, so a human typing it in a project that already has a
+/// background server would replace that server's `{pid,port}` with its own and strand it.
+/// The env var is the gate (chosen over "refuse when a live lockfile verifies", which is
+/// racy against the parent's own startup window and would need that same env var anyway).
 fn serve(root: &Path, port: u16) -> i32 {
-    let mut state = State::new(root, port);
-    let listener = match state.begin_listen() {
+    if std::env::var_os(SERVE_ONLY_ENV).is_none() {
+        eprintln!(
+            "error: `{SERVE_ONLY}` is internal to `dev --background`; run `runai dev` or `runai dev --background`"
+        );
+        return 2;
+    }
+
+    let server = Arc::new(Server::new(root, port));
+    let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
-        Err(message) => {
+        Err(error) => {
             // The parent is polling for the lockfile and will time out with its own
-            // message; this one is for a human running `--serve-only` by hand.
-            eprintln!("error: {message}");
+            // message; this one is for a human who bypassed the gate deliberately.
+            eprintln!("error: cannot listen on 127.0.0.1:{port}: {error}");
             return 1;
         }
     };
     // The real port, which differs from the argument when it was `0`.
-    state.port = listener
+    server.shared().port = listener
         .local_addr()
         .map(|address| address.port())
         .unwrap_or(port);
@@ -470,23 +626,35 @@ fn serve(root: &Path, port: u16) -> i32 {
     // The lockfile is written before the build so the parent learns the port quickly;
     // the parent re-fetches status with a timeout, so it does not observe a half-built
     // server as ready.
-    state.write_lock();
-    state.rebuild("startup");
-    state.serve(listener);
+    server.write_lock();
+    {
+        let _guard = server
+            .build
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        server.rebuild_locked("startup");
+    }
+    server.serve(listener);
     0
 }
 
 /// `--background`: reuse a verified running server, or spawn one and wait for it.
 fn start_background(root: &Path, port: u16) -> i32 {
-    if let Some(existing) = verified_server(root) {
-        println!("{existing}");
-        return 0;
+    match verified_server(root) {
+        Verified::Running(body) => {
+            println!("{body}");
+            return 0;
+        }
+        // A live server we could not get an answer from is busy, not stale. Removing its
+        // lockfile here would start a second server beside it and strand both.
+        Verified::Busy => return report_busy(),
+        Verified::Stale => {}
     }
 
-    // Anything in the lockfile is now known stale: it is either unreadable, or its
-    // port did not answer, or it answered as a different pid or root. Removing it
-    // before the spawn means a crashed child that never got to write cannot leave the
-    // parent polling yesterday's file.
+    // Anything in the lockfile is now known stale: it is unreadable, its port refused
+    // the connection, or it answered as a different pid or root. Removing it before the
+    // spawn means a crashed child that never got to write cannot leave the parent
+    // polling yesterday's file.
     let lock = root.join(LOCKFILE);
     let _ = std::fs::remove_file(&lock);
 
@@ -498,6 +666,9 @@ fn start_background(root: &Path, port: u16) -> i32 {
     let child = Command::new(executable)
         .args(["dev", SERVE_ONLY, "--port", &port.to_string()])
         .current_dir(root)
+        // The gate `serve` checks: only a `--background` parent sets this, so a human
+        // typing the hidden flag gets the refusal above instead of a clobbered lockfile.
+        .env(SERVE_ONLY_ENV, "1")
         // All three null: the child outlives this process, and leaving a pipe open
         // would make the shell that ran `runai dev --background` wait on the server
         // instead of returning.
@@ -520,14 +691,17 @@ fn start_background(root: &Path, port: u16) -> i32 {
             exited = Some(status);
             break;
         }
-        if let Some(lock) = read_lock(root)
-            && lock.pid == u64::from(child.id())
-            && let Some(status) = fetch_status(lock.port)
-            && status.pid == lock.pid
-            && same_root(&status.root, &lock.root)
-        {
-            println!("{}", status.body);
-            return 0;
+        match read_lock(root) {
+            Some(lock) if lock.pid == u64::from(child.id()) => match fetch_status(lock.port) {
+                Answer::Status(status) if status.pid == lock.pid => {
+                    println!("{}", status.body);
+                    return 0;
+                }
+                Answer::Busy => return report_busy(),
+                Answer::Status(_) | Answer::Gone => {}
+            },
+            // The child has not written its lockfile yet; keep waiting.
+            _ => {}
         }
         std::thread::sleep(POLL);
     }
@@ -549,10 +723,12 @@ fn start_background(root: &Path, port: u16) -> i32 {
 
 /// `dev stop`: verify the lockfile against a live server, ask it to stop, clean up.
 ///
-/// Every path exits `0`. Stopping a server that is not running is success, not an
-/// error — `dev stop` in a script must be callable unconditionally. The unverified
-/// case is the important one: a lockfile whose port now belongs to another program is
-/// deleted, and that program is never signalled.
+/// `0` when stopped, already stopped, or when the lockfile was neither ours nor live.
+/// `1` when the server is **busy**: it accepted the connection but did not answer, or
+/// answered `503` because a build is publishing. In that case the lockfile is left
+/// exactly as it was — a lockfile this process could not positively disprove names a
+/// live server, and deleting it strands that server where no `dev stop` can reach it
+/// again. The unverified-but-dead case still deletes: a refused connection is proof.
 fn stop_server() -> i32 {
     let root = match std::env::current_dir().and_then(|dir| dir.canonicalize()) {
         Ok(root) => root,
@@ -574,24 +750,36 @@ fn stop_server() -> i32 {
         let _ = std::fs::remove_file(&lock);
         return 0;
     }
-    let Some(status) = fetch_status(found.port) else {
-        // Refused connection, or something that is not our server: stale lockfile.
-        let _ = std::fs::remove_file(&lock);
-        return 0;
-    };
-    if status.pid != found.pid || !same_root(&status.root, &found.root) {
-        // The port answers, but as a different process (or the same pid in a different
-        // checkout): this is exactly the case where a pid signal would kill an
-        // innocent program. Drop the lockfile and leave that server alone.
-        let _ = std::fs::remove_file(&lock);
-        return 0;
+
+    match fetch_status(found.port) {
+        Answer::Status(status) => {
+            if status.pid != found.pid {
+                // The port answers, but as a different process: exactly the case where a
+                // pid signal would kill an innocent program. Drop the lockfile and leave
+                // that server alone.
+                let _ = std::fs::remove_file(&lock);
+                return 0;
+            }
+        }
+        // The connection was accepted and then the read timed out: the server is alive
+        // and busy. Not proof of death, so the lockfile stays.
+        Answer::Busy => return report_busy(),
+        // Refused connection: nothing is listening, so the lockfile is genuinely stale.
+        Answer::Gone => {
+            let _ = std::fs::remove_file(&lock);
+            return 0;
+        }
     }
 
-    if !post_shutdown(found.port) {
-        // The server accepted the connection and then failed to answer; treat it as
-        // gone rather than signalling it.
-        let _ = std::fs::remove_file(&lock);
-        return 0;
+    match post_shutdown(found.port) {
+        Shutdown::Stopped => {}
+        // The server answered `503 {"busy":true}`: a rebuild holds the build lock.
+        Shutdown::Busy => return report_busy(),
+        // Accepted and then failed to answer, or gone: treat as gone rather than signal.
+        Shutdown::Unreachable => {
+            let _ = std::fs::remove_file(&lock);
+            return 0;
+        }
     }
 
     let deadline = SystemTime::now() + STARTUP_TIMEOUT;
@@ -606,6 +794,23 @@ fn stop_server() -> i32 {
     0
 }
 
+/// What `dev stop` says when the server is alive but a build holds it: the lockfile is
+/// intact, so the caller can retry, and the exit is non-zero so a script notices.
+fn report_busy() -> i32 {
+    eprintln!("error: the dev server is busy rebuilding; try `runai dev stop` again in a moment");
+    1
+}
+
+/// What a lockfile's port answered.
+enum Verified {
+    /// A live server, verified for `root`: its status body.
+    Running(String),
+    /// A server that accepted the connection and then did not answer in time.
+    Busy,
+    /// Nothing verified: no lockfile, a dead server, or a different pid or root.
+    Stale,
+}
+
 /// The status body of a server that has just been verified for `root`, if there is one.
 ///
 /// All three facts must agree: the lockfile's `pid` is the one `/_runai/status` reports,
@@ -614,16 +819,23 @@ fn stop_server() -> i32 {
 /// copied from another checkout verifies against itself — its own `root` field is the
 /// other project — and `dev stop` there would shut down a server it has no business
 /// touching.
-fn verified_server(root: &Path) -> Option<String> {
-    let found = read_lock(root)?;
+fn verified_server(root: &Path) -> Verified {
+    let Some(found) = read_lock(root) else {
+        return Verified::Stale;
+    };
     if !same_root(&found.root, &root.to_string_lossy()) {
-        return None;
+        return Verified::Stale;
     }
-    let status = fetch_status(found.port)?;
-    if status.pid != found.pid || !same_root(&status.root, &found.root) {
-        return None;
+    match fetch_status(found.port) {
+        Answer::Status(status)
+            if status.pid == found.pid && same_root(&status.root, &found.root) =>
+        {
+            Verified::Running(status.body)
+        }
+        Answer::Status(_) => Verified::Stale,
+        Answer::Busy => Verified::Busy,
+        Answer::Gone => Verified::Stale,
     }
-    Some(status.body)
 }
 
 /// A lockfile's parsed contents.
@@ -656,37 +868,113 @@ struct Status {
     root: String,
 }
 
-/// `GET /_runai/status` on `port`, or `None` when nothing answers in time.
+/// What trying to read `/_runai/status` produced.
+///
+/// The distinction between [`Answer::Busy`] and [`Answer::Gone`] is the whole of C1:
+/// `TcpStream::connect` succeeding proves something is listening, so a read timeout after
+/// it means a live-but-slow server. That must never be mistaken for a dead one, because
+/// `dev stop` deletes the lockfile on `Gone`.
+enum Answer {
+    /// A parsed status body.
+    Status(Status),
+    /// The connection was accepted and then nothing arrived in time: alive, busy.
+    Busy,
+    /// Nothing is listening, or what answered was not this server.
+    Gone,
+}
+
+/// `GET /_runai/status` on `port`.
 ///
 /// The timeout is short because a spawn that bound its port but has not finished the
 /// initial build is not ready: the caller polls, and an early answer is better than a
-/// slow one.
-fn fetch_status(port: u16) -> Option<Status> {
-    let body = request(port, "GET", STATUS, Duration::from_millis(500))?;
-    let pid = field_number(&body, "pid")?;
-    let root = field_string(&body, "root")?;
-    Some(Status { body, pid, root })
+/// slow one. A timeout is reported as `Busy`, never as `Gone`, whenever the connect
+/// itself succeeded.
+fn fetch_status(port: u16) -> Answer {
+    let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(stream) => stream,
+        Err(_) => return Answer::Gone,
+    };
+    match exchange(&mut stream, "GET", STATUS, Duration::from_millis(500)) {
+        Outcome::Answered { code, body } if (200..300).contains(&code) => {
+            let pid = field_number(&body, "pid");
+            let root = field_string(&body, "root");
+            match (pid, root) {
+                (Some(pid), Some(root)) => Answer::Status(Status { body, pid, root }),
+                // The socket is ours but the answer is not a status: not our server.
+                _ => Answer::Gone,
+            }
+        }
+        // A non-2xx answer is still an answer from something alive on the port, but it
+        // proves nothing about which process it is, so it is not ours to stop.
+        Outcome::Answered { .. } => Answer::Gone,
+        // The connection was accepted and then went quiet: alive and busy.
+        Outcome::TimedOut => Answer::Busy,
+        // Accepted then closed with no complete response, or the write failed after a
+        // successful connect: indistinguishable from gone for our purposes, and the
+        // caller only deletes on this, so it must be conservative. A closed connection
+        // is proof the peer closed it, so it is `Gone`; a failed write is not.
+        Outcome::Closed => Answer::Gone,
+        Outcome::WriteFailed => Answer::Busy,
+    }
 }
 
-/// `POST /_runai/shutdown` on `port`; whether the request got an answer.
-fn post_shutdown(port: u16) -> bool {
-    request(port, "POST", SHUTDOWN, Duration::from_secs(1)).is_some()
+/// What `POST /_runai/shutdown` produced.
+enum Shutdown {
+    /// `200 {"stopping":true}`: the server is exiting.
+    Stopped,
+    /// `503 {"busy":true}`: a rebuild holds the server; it is still alive.
+    Busy,
+    /// Nothing listening, or a complete non-200 answer: treat as gone.
+    Unreachable,
 }
 
-/// One request, returning the response body. `None` on any connection or parse error.
-fn request(port: u16, method: &str, path: &str, timeout: Duration) -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
-    write!(
+/// `POST /_runai/shutdown` on `port`.
+fn post_shutdown(port: u16) -> Shutdown {
+    let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(stream) => stream,
+        Err(_) => return Shutdown::Unreachable,
+    };
+    match exchange(&mut stream, "POST", SHUTDOWN, Duration::from_secs(1)) {
+        Outcome::Answered { code: 200, .. } => Shutdown::Stopped,
+        Outcome::Answered { code: 503, .. } => Shutdown::Busy,
+        Outcome::Answered { .. } => Shutdown::Unreachable,
+        Outcome::TimedOut | Outcome::WriteFailed => Shutdown::Busy,
+        Outcome::Closed => Shutdown::Unreachable,
+    }
+}
+
+/// How one request ended.
+enum Outcome {
+    /// A complete response head and its body.
+    Answered { code: u16, body: String },
+    /// The read timed out after the connection was established.
+    TimedOut,
+    /// The peer closed without a complete response.
+    Closed,
+    /// The request could not be sent after the connection was established.
+    WriteFailed,
+}
+
+/// Send one request on an established connection and read the response.
+fn exchange(stream: &mut TcpStream, method: &str, path: &str, timeout: Duration) -> Outcome {
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return Outcome::WriteFailed;
+    }
+    if write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     )
-    .ok()?;
-    stream.flush().ok()?;
+    .is_err()
+        || stream.flush().is_err()
+    {
+        return Outcome::WriteFailed;
+    }
 
     let mut raw = Vec::new();
     let mut chunk = [0u8; 1024];
+    let mut timed_out = false;
     loop {
         match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -696,15 +984,35 @@ fn request(port: u16, method: &str, path: &str, timeout: Duration) -> Option<Str
                     break;
                 }
             }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                timed_out = true;
+                break;
+            }
+            // Any other error mid-response: the peer went away.
             Err(_) => break,
         }
     }
+
     let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    if !head.starts_with("HTTP/1.1 200") {
-        return Some(String::new());
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        // No complete head. A timeout means alive-but-slow; a clean close means the peer
+        // hung up, which for a live server is its shutdown answering nothing.
+        return if timed_out {
+            Outcome::TimedOut
+        } else {
+            Outcome::Closed
+        };
+    };
+    let Some(code) = head.get(9..12).and_then(|code| code.parse().ok()) else {
+        return Outcome::Closed;
+    };
+    Outcome::Answered {
+        code,
+        body: body.to_string(),
     }
-    Some(body.to_string())
 }
 
 /// Read a request line: `(method, target)`.
@@ -744,7 +1052,7 @@ fn write_response(
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -910,6 +1218,7 @@ fn content_type(file: &Path) -> &'static str {
         "webp" => "image/webp",
         "ico" => "image/x-icon",
         "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -927,11 +1236,26 @@ fn changed_since(root: &Path, since: SystemTime) -> bool {
 }
 
 /// [`changed_since`] for a directory tree.
+///
+/// The directory's **own** mtime is compared, not only its entries'. A creation, a
+/// deletion, or a rename under a directory updates that directory's mtime and touches
+/// nothing else — no file mtime changes — so a walk that reads only files cannot see
+/// `rm src/routes/gone.page.tsx` at all. That was the deletion defect: the deleted page
+/// kept being served from the previous `dist/` forever.
 fn directory_changed(dir: &Path, since: SystemTime) -> bool {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
+    let metadata = match std::fs::metadata(dir) {
+        Ok(metadata) => metadata,
         // No `src/` at all: the build will report that, and it is not a change.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    // Reading the directory below updates no mtime, so this is the state the walk saw.
+    if is_newer(metadata.modified(), since) {
+        return true;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
         Err(_) => return true,
     };
     for entry in entries {
@@ -941,6 +1265,7 @@ fn directory_changed(dir: &Path, since: SystemTime) -> bool {
         };
         let path = entry.path();
         match entry.file_type() {
+            // Recurse: a nested directory's own mtime covers changes made inside it.
             Ok(kind) if kind.is_dir() => {
                 if directory_changed(&path, since) {
                     return true;
@@ -960,9 +1285,67 @@ fn directory_changed(dir: &Path, since: SystemTime) -> bool {
 /// Whether `path` exists and was modified after `since`.
 fn newer(path: &Path, since: SystemTime) -> bool {
     match std::fs::metadata(path).and_then(|metadata| metadata.modified()) {
-        Ok(modified) => modified > since,
+        Ok(modified) => is_newer(Ok(modified), since),
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
+}
+
+/// The comparison [`newer`] and [`directory_changed`] share, tolerating the clock going
+/// backwards between the timestamp's source and this process.
+///
+/// A *future* mtime is deliberately reported as newer here — the file was still touched
+/// after the last build from the build's point of view, and skipping it would serve a
+/// stale page. What stops that from rebuilding forever is not this comparison but
+/// [`Server::rebuild_locked`], which moves its marker to `max(now, newest mtime)` after
+/// building: a mtime in the future is then covered by the marker instead of staying ahead
+/// of it permanently.
+fn is_newer(modified: std::io::Result<SystemTime>, since: SystemTime) -> bool {
+    match modified {
+        Ok(modified) => modified > since,
+        Err(_) => true,
+    }
+}
+
+/// The newest mtime under `src/` or on `runai.json`, or [`SystemTime::UNIX_EPOCH`] when
+/// there is neither.
+///
+/// This is the clamp that makes a future mtime safe: the build marker becomes
+/// `max(now, this)`, so a file with a mtime an hour ahead does not look newer than the
+/// build that just included it.
+fn newest_modified(root: &Path) -> SystemTime {
+    let mut newest = SystemTime::UNIX_EPOCH;
+    newest = newest.max(modified_or_epoch(&root.join(CONFIG)));
+    newest_of(&root.join(SRC), &mut newest);
+    newest
+}
+
+/// [`newest_modified`] for a directory tree, folding into `newest`.
+fn newest_of(dir: &Path, newest: &mut SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => newest_of(&path, newest),
+            Ok(_) => *newest = (*newest).max(modified_or_epoch(&path)),
+            Err(_) => {}
+        }
+    }
+}
+
+/// A path's mtime, or the epoch when it cannot be read.
+fn modified_or_epoch(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// A `SystemTime` as epoch milliseconds, for the `built_at` field of the status JSON.
+fn epoch_millis(time: SystemTime) -> u128 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 /// Whether two root strings name the same directory, comparing canonical paths when
@@ -1100,5 +1483,82 @@ mod tests {
     fn json_strings_round_trip_through_the_field_scanner() {
         let text = format!("{{\"root\":{}}}", json_string("/a/b\"c\\d"));
         assert_eq!(field_string(&text, "root").as_deref(), Some("/a/b\"c\\d"));
+    }
+
+    /// C1(a), the half the integration test cannot isolate: a server that **accepts the
+    /// connection** and then does not answer is alive and busy, not gone. This is a unit
+    /// test because the integration tests exercise a threaded server, where the status
+    /// route answers even mid-build; the distinction still has to be right, because it is
+    /// what protects the lockfile if a build ever does block the control route.
+    #[test]
+    fn a_socket_that_accepts_and_never_answers_is_busy_not_gone() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold the connection open without writing: `accept` returns, `read` blocks.
+        let held = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(1200));
+            drop(stream);
+        });
+
+        match fetch_status(port) {
+            Answer::Busy => {}
+            Answer::Gone => panic!("an accepted connection that timed out is BUSY, not gone"),
+            Answer::Status(_) => panic!("nothing was written, so no status can exist"),
+        }
+        held.join().unwrap();
+    }
+
+    /// The other half: nothing listening is gone, which is the only case `dev stop` may
+    /// delete a lockfile on.
+    #[test]
+    fn a_closed_port_is_gone() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(matches!(fetch_status(port), Answer::Gone));
+    }
+
+    /// C2: a deletion changes only the parent directory's mtime, so the walk must compare
+    /// the directory itself. Written against the walk directly so the failure names the
+    /// mtime comparison rather than a served page.
+    #[test]
+    fn deleting_a_file_is_seen_as_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join(SRC).join("routes");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("gone.page.tsx"), "x").unwrap();
+        // Mark the moment after the file exists: nothing is newer than this.
+        let after = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::remove_file(nested.join("gone.page.tsx")).unwrap();
+        assert!(
+            changed_since(tmp.path(), after),
+            "a deletion must count as a change (directory mtime), or the deleted page is served forever"
+        );
+    }
+
+    /// I3: a future mtime is clamped by the build marker, so the second comparison says
+    /// "not newer". Mirrors what `rebuild_locked` does without needing a real build.
+    #[test]
+    fn a_future_mtime_is_covered_by_a_clamped_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = tmp.path().join(SRC).join("index.page.tsx");
+        std::fs::create_dir_all(route.parent().unwrap()).unwrap();
+        std::fs::write(&route, "x").unwrap();
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&route)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        let marker = SystemTime::now().max(newest_modified(tmp.path()));
+        assert_eq!(marker, future, "the marker must cover the future mtime");
+        assert!(
+            !changed_since(tmp.path(), marker),
+            "a future mtime must not look newer than the marker derived from it"
+        );
     }
 }
