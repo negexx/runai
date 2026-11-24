@@ -27,7 +27,10 @@
 //! import list. Presenting the author's own alias — `import { owner as myOwner }` —
 //! as "one of the names the generated module reserves for itself" was a false
 //! sentence: an agent cannot tell whether to rename the import or drop the export.
-//! [`Reserved`] holds the split.
+//! [`Reserved`] holds the split, and [`Reserved::is_own_name`] is what the export
+//! arm asks: an imported name is reserved against a *declaration*, which would
+//! shadow the import, but not against an *export*, because a local may legitimately
+//! be exported under a name the file also imports.
 //!
 //! The last one is the sharpest: an undeclared `_esc` in the template resolves to
 //! the compiler's own helper and renders its **source text**, silently. That is
@@ -38,11 +41,15 @@
 //! 1. a **declaration** in an emitted module statement
 //!    ([`crate::ir::emitted_module_parts`]) or an emitted body statement
 //!    ([`crate::ir::emitted_body_statements`]) whose bound name is reserved;
-//! 2. an **export specifier** (`export { x as render }`) whose *exported* name is
-//!    reserved — the emitted module already exports `render`, so exporting it is a
-//!    duplicate. `export const
-//!    render = …` is shape 1's declaration and 2's name in one statement, and one
-//!    row is enough;
+//! 2. an **export specifier** whose *local binding* collides with the emitted
+//!    module. The question is the local, not the exported name (Task 15 fix
+//!    round 5): `export { v as render }` exports a local under a name the
+//!    artifact also exports, so it is a duplicate; `export { owner }` beside
+//!    `import { owner }` exports the import the module also writes; but
+//!    `export { v as owner }` beside that same import exports `v`, a value this
+//!    file declares, and is valid ESM — matching the exported name alone refused
+//!    it as a false positive. `export const render = …` is shape 1's declaration
+//!    and 2's exported name in one statement, and one row is enough;
 //! 3. a **reference** to a reserved name, in the markup, the body, or the module
 //!    level — but only when the reserved name is **in scope at the emitted call
 //!    site**: unresolved, or declared at module scope. A route component named a
@@ -194,7 +201,7 @@ pub fn check_emitted_names(mode: Mode, source: &str, program: &Program<'_>) -> V
     // (including the declarators a multi-declarator route statement leaves
     // behind), and an emitted body statement.
     for part in emitted_module_parts(program, &route) {
-        check_part(&part, reserved, mode, &mut diagnostics);
+        check_part(&part, reserved, mode, scoping, runai, &mut diagnostics);
     }
     if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
         for statement in emitted_body_statements(body, return_span) {
@@ -545,12 +552,12 @@ fn scope_binding_refusal(span: (u32, u32), name: &str, reserved: &Reserved) -> D
              `for` init, or `try`/`catch`, even when nothing references it. Rename `{name}`."
         ),
         None => format!(
-            "`{name}` is one of the names the generated module declares for itself (`{names}`). \
+            "`{name}` is one of the names the generated module declares for itself{names}. \
              This binding is declared in the route component's own scope, which the emitter copies \
              into the generated component, so the template's `{name}(…)` call reaches it instead \
              of the generated helper. A `var` reaches this scope from any nested block, `for` \
              init, or `try`/`catch`, even when nothing references it. Rename `{name}`.",
-            names = reserved.own_names(),
+            names = reserved.own_names_clause(),
         ),
     };
     Diagnostic::new(Code::RA014, span, message)
@@ -595,6 +602,18 @@ impl Reserved {
         self.imported.iter().any(|candidate| candidate == name)
     }
 
+    /// Whether the **emitter itself** writes `name`, as opposed to reserving it
+    /// because this file imports it.
+    ///
+    /// This is the predicate the export arm needs. An imported name is reserved for
+    /// a *declaration* (which would shadow the import the module writes), but
+    /// exporting a local under that name collides with nothing: the import and the
+    /// export live in different namespaces in the emitted module. So the export arm
+    /// refuses only names the emitter chose.
+    fn is_own_name(&self, name: &str) -> bool {
+        self.contains(name) && !self.is_imported(name)
+    }
+
     /// The emitter's own names, joined for a message.
     ///
     /// Never includes a name this file imports: those are the author's, and
@@ -606,6 +625,22 @@ impl Reserved {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join("`, `")
+    }
+
+    /// [`Self::own_names`] wrapped as a parenthetical **clause**, or empty when the
+    /// list would be.
+    ///
+    /// E3: a message that interpolated `(` … `)` around an empty join printed a
+    /// dangling `` (` `) ``. Whether the list can be empty depends on the reserved
+    /// set for the mode, which is data, so the guard lives here rather than in a
+    /// caller that cannot know.
+    fn own_names_clause(&self) -> String {
+        let names = self.own_names();
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!(" (`{names}`)")
+        }
     }
 
     /// The clause that says **why** `name` is reserved, when this file imports it.
@@ -628,8 +663,8 @@ impl Reserved {
     fn reason(&self, name: &str) -> String {
         self.import_reason(name).unwrap_or_else(|| {
             format!(
-                "`{name}` is one of the names the generated module declares for itself (`{names}`)",
-                names = self.own_names()
+                "`{name}` is one of the names the generated module declares for itself{names}",
+                names = self.own_names_clause()
             )
         })
     }
@@ -685,6 +720,8 @@ fn check_part(
     part: &crate::ir::EmittedModulePart<'_, '_>,
     reserved: &Reserved,
     mode: Mode,
+    scoping: &oxc_semantic::Scoping,
+    runai: &[oxc_semantic::SymbolId],
     out: &mut Vec<Diagnostic>,
 ) {
     match part {
@@ -694,7 +731,7 @@ fn check_part(
             // exports a reserved name without declaring one; `export const
             // render` is caught by the declaration walk, so the specifier walk
             // reports only the shapes that declare nothing reserved.
-            check_export_names(statement, reserved, mode, out);
+            check_export_names(statement, reserved, mode, scoping, runai, out);
         }
         crate::ir::EmittedModulePart::Declarators { declarators, .. } => {
             for declarator in declarators {
@@ -837,27 +874,42 @@ fn refuse_if_reserved(
     }
 }
 
-/// Refuse every **exported** name in `statement` that is reserved.
+/// Refuse every **export specifier** in `statement` whose *local* binding
+/// collides with the emitted module.
 ///
-/// Only the exported name matters: `const x = 1; export { x as render }` exports
-/// `render` without binding it. A local name is shape 1's question, so a
-/// specifier whose local and exported names are both ordinary is ignored.
+/// The question is the **specifier's local binding**, not its exported name.
+/// `export { v as _attr }` exports a value this file declares under a name the
+/// artifact reserves — that collides, because the artifact would export `_attr`
+/// beside its own binding. `export { myOwner }` beside `import { owner as myOwner
+/// }` exports the *import*, which the emitter also writes — that collides too.
+/// But `export { v as myOwner }` beside the same import exports `v`, a value this
+/// file declares, under a name that merely happens to be imported locally; the
+/// emitted module is valid ESM (`import { owner as myOwner } …; export { v as
+/// myOwner }` loads), so it must stay clean. Judging the exported name alone was a
+/// false positive (Task 15 fix round 5): it could not tell "exporting the import
+/// itself" from "exporting a local under a name that is also imported".
 ///
-/// The reason differs by name, and asserting one reason for both was a shipped
-/// false diagnostic: only `render` is a name the artifact both declares and
-/// **exports**, so only exporting it is a duplicate export. `_esc` and `_attr` in
-/// a prerender module, and every name the island module binds, are bindings the
-/// artifact owns but does not export — exporting one would export the compiler's
-/// binding rather than a value this file defines. The message says which, so a fix
-/// is never refused for a duplicate that does not exist.
+/// So the rule resolves the local name and asks which of two things it binds:
 ///
-/// `export const render = 1` is reported by [`check_declaration`] as a
-/// declaration, and this function reports its local name too — the same span, so
-/// `analyze`'s dedup keeps one row.
+/// 1. **the `"runai"` import symbol** — exporting it would export the import, which
+///    the emitted module's own import list already binds; refused, with the import
+///    as the reason;
+/// 2. **anything else this file declares** — refused only when the artifact
+///    reserves the *exported* name, because the artifact would then export that
+///    name beside its own binding (`_attr`, `render`). A local exported under an
+///    ordinary name is legal and is not this rule's shape.
+///
+/// The two arms give different repairs: the emitter-own arm (2) may not say
+/// "export a value this file declares instead", because that is exactly what the
+/// file already does for the local — the legal repairs there are dropping or
+/// renaming the export. The import arm (1) can offer it, because the value exists
+/// and is not the import.
 fn check_export_names(
     statement: &Statement<'_>,
     reserved: &Reserved,
     mode: Mode,
+    scoping: &oxc_semantic::Scoping,
+    runai: &[oxc_semantic::SymbolId],
     out: &mut Vec<Diagnostic>,
 ) {
     let Statement::ExportNamedDeclaration(exported) = statement else {
@@ -869,36 +921,81 @@ fn check_export_names(
             ModuleExportName::IdentifierReference(identifier) => identifier.name.as_str(),
             ModuleExportName::StringLiteral(literal) => literal.value.as_str().unwrap_or(""),
         };
-        if !reserved.contains(exported_name) {
+
+        // The local binding the specifier exports. A string-literal local is not a
+        // reference this file can bind (`export { "x" as y }` has no local name at
+        // all), so it never names an import symbol; it is judged by the emitted
+        // name alone, like a plain alias.
+        let local_name: Option<&str> = match &specifier.local {
+            ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
+            ModuleExportName::IdentifierName(identifier) => Some(identifier.name.as_str()),
+            ModuleExportName::StringLiteral(_) => None,
+        };
+        let local_symbol = match &specifier.local {
+            ModuleExportName::IdentifierReference(identifier) => identifier
+                .reference_id
+                .get()
+                .and_then(|id| scoping.get_reference(id).symbol_id()),
+            ModuleExportName::IdentifierName(_) | ModuleExportName::StringLiteral(_) => None,
+        };
+
+        // Arm (1): the specifier exports the `"runai"` import symbol itself. The
+        // reason names the **local** binding (`owner` in `export { owner as other
+        // }`), because that is the thing bound by the import; the exported name is
+        // only where it would land.
+        if local_symbol.is_some_and(|symbol| runai.contains(&symbol)) {
+            let local = local_name.unwrap_or(exported_name);
+            let reason = reserved.import_reason(local).unwrap_or_else(|| {
+                format!(
+                    "`{local}` is bound by an `import` from \"runai\" in this file, and the \
+                     generated module writes its own import list from the runtime"
+                )
+            });
+            let lands = if local == exported_name {
+                format!("exporting `{local}` here would export that import")
+            } else {
+                format!("exporting it as `{exported_name}` here would export that import")
+            };
+            out.push(Diagnostic::new(
+                Code::RA014,
+                (specifier.span.start, specifier.span.end),
+                format!(
+                    "{reason}, so {lands} rather than a value this file declares. Export a value \
+                     this file declares instead, or drop the export."
+                ),
+            ));
+            continue;
+        }
+
+        // Arm (2): a local value exported under a name the emitter itself writes.
+        // A name that is only in the reserved set *because this file imports it* is
+        // not reserved as an export name: `export { v as owner }` beside
+        // `import { owner }` is valid ESM, and the artifact loads, so it stays clean
+        // (E1). Only a name the emitter declares for itself (`_esc`, `_attr`,
+        // `render`, the island locals) collides here.
+        if !reserved.is_own_name(exported_name) {
             continue;
         }
         let owns_export = match mode {
             Mode::Static => crate::ir::PRERENDER_EXPORTS.contains(&exported_name),
             Mode::Island => crate::ir::ISLAND_EXPORTS.contains(&exported_name),
         };
+        // The repair here may not be "export a value this file declares instead":
+        // the file already exports one, and for `_attr`/`render` a declaration of
+        // that name is itself refused, so naming it would be advice that cannot be
+        // followed (E2). Renaming the export name or dropping the export both work.
         let message = if owns_export {
             format!(
                 "the generated module exports `{exported_name}` of its own, so exporting \
                  `{exported_name}` here would export `{exported_name}` twice and the module cannot \
-                 load. Export it under a different name."
-            )
-        } else if let Some(reason) = reserved.import_reason(exported_name) {
-            // The name is here because **this file** imports it, not because the
-            // emitter chose it. Presenting `import { owner as myOwner }` as "one of
-            // the names the generated module reserves for itself" was the round-4
-            // defect: it lists the author's alias beside `_a` and `_c`, and an agent
-            // cannot tell whether to rename the import or drop the export.
-            format!(
-                "{reason}, so exporting `{exported_name}` here would export that import rather \
-                 than a value this file declares. Export a value this file declares instead, or \
-                 drop the export."
+                 load. Rename the exported name, or drop the export."
             )
         } else {
             format!(
-                "`{exported_name}` is one of the names the generated module declares for itself \
-                 (`{names}`), so exporting it here would export that name rather than a value this \
-                 file defines. Export a value this file declares instead, or drop the export.",
-                names = reserved.own_names()
+                "`{exported_name}` is one of the names the generated module declares for itself\
+                 {names}, so exporting a value under that name would export the generated module's \
+                 binding rather than this file's. Rename the exported name, or drop the export.",
+                names = reserved.own_names_clause()
             )
         };
         out.push(Diagnostic::new(
@@ -922,10 +1019,10 @@ fn declaration_refusal(span: (u32, u32), name: &str, reserved: &Reserved) -> Dia
              `{name}`."
         ),
         None => format!(
-            "`{name}` is one of the names the generated module declares for itself (`{names}`), \
+            "`{name}` is one of the names the generated module declares for itself{names}, \
              so a declaration here would shadow it and the template's call would reach the \
              wrong binding. Rename `{name}`.",
-            names = reserved.own_names(),
+            names = reserved.own_names_clause(),
         ),
     };
     Diagnostic::new(Code::RA014, span, message)
@@ -1906,5 +2003,298 @@ mod tests {
             d.iter().any(|row| row.message.contains("`derived`")),
             "the message names it: {d:?}"
         );
+    }
+
+    // --- The exported name is not the question; the local binding is (round 5) --
+
+    /// Assert that `module` is valid ESM as `node` defines it, by writing it to a
+    /// file and running `node --check`.
+    ///
+    /// This is the test the reviewer's evidence used: `import { owner as myOwner }
+    /// … ; export { v as myOwner }` is valid ESM, and a diagnostic claiming it is
+    /// not has to be measured against the parser that defines ESM. `node --check`
+    /// catches a duplicate export without needing a DOM, which the island module
+    /// requires at evaluation time.
+    ///
+    /// Returns `false` when `node` is not installed, like [`render_under_node`], so
+    /// the check is skipped loudly rather than silently.
+    fn assert_valid_esm(module: &str) {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "runai-emitted-names-esm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("module.mjs");
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(module.as_bytes()))
+            .expect("write the emitted module");
+        let output = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match output {
+            Ok(output) => assert!(
+                output.status.success(),
+                "the emitted module must be valid ESM.\nmodule:\n{module}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node is not installed: the ESM check was skipped");
+            }
+            Err(error) => panic!("could not run node: {error}"),
+        }
+    }
+
+    /// E1 (round 5): exporting a **local** under a name that is also imported is
+    /// legal ESM and must be clean.
+    ///
+    /// The old rule matched the reserved set on the **exported** name only, so it
+    /// could not tell "exporting the import itself" from "exporting a local under a
+    /// name that happens to be imported". Both halves of the old message were
+    /// false: the code exports `v`, a value this file declares, and the emitted
+    /// shape loads under node. The rule now resolves the specifier's local binding.
+    #[test]
+    fn an_aliased_local_export_under_an_imported_name_is_clean() {
+        let src = "\"use island\"\nimport { owner as myOwner } from \"runai\"\nconst v = 1\nexport { v as myOwner }\nexport default function P(props: Record<never, never>) { return <p>{v}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert!(
+            d.is_empty(),
+            "exporting the local `v` under the imported alias `myOwner` is valid ESM: {d:?}"
+        );
+        let module = crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+            .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { v as myOwner };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
+    }
+
+    /// The unaliased form of the same shape: `import { owner }` + `export { v as
+    /// owner }` is valid ESM, and refusing it was the same false positive.
+    #[test]
+    fn an_unaliased_local_export_under_an_imported_name_is_clean() {
+        let src = "\"use island\"\nimport { owner } from \"runai\"\nconst v = 1\nexport { v as owner }\nexport default function P(props: Record<never, never>) { return <p>{v}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert!(
+            d.is_empty(),
+            "exporting the local `v` under the imported name `owner` is valid ESM: {d:?}"
+        );
+        let module = crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+            .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { v as owner };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
+    }
+
+    /// The control for the two tests above: exporting **the import itself** is still
+    /// refused, and the reason is the import — not a name the compiler chose. The
+    /// repair offered there is legal, because a local value can be exported instead
+    /// (proven by the two tests above).
+    #[test]
+    fn exporting_the_import_itself_is_still_refused_with_the_import_reason() {
+        for (src, local) in [
+            (
+                "\"use island\"\nimport { owner } from \"runai\"\nexport { owner }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+                "owner",
+            ),
+            // The same statement under a different exported name: still the import.
+            (
+                "\"use island\"\nimport { owner as myOwner } from \"runai\"\nexport { myOwner as other }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+                "myOwner",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            let rows: Vec<&Diagnostic> = d.iter().filter(|row| row.code == Code::RA014).collect();
+            assert_eq!(rows.len(), 1, "one refusal for the exported import: {d:?}");
+            let message = &rows[0].message;
+            assert!(
+                message.contains("import") && message.contains("\"runai\""),
+                "the reason is the import this file writes: {message}"
+            );
+            assert!(
+                message.contains(&format!("`{local}`")),
+                "the reason names the bound local `{local}`: {message}"
+            );
+            assert!(
+                !message.contains("declares for itself")
+                    && !message.contains("reserves for itself"),
+                "`{local}` is the file's own import, not a compiler name: {message}"
+            );
+            assert!(
+                message.contains("Export a value this file declares instead")
+                    && message.contains("drop the export"),
+                "both repairs are offered and both are reachable here: {message}"
+            );
+        }
+    }
+
+    /// E2 (round 5): the repair in the **emitter-own** arm must be reachable.
+    ///
+    /// "Export a value this file declares instead" is illegal advice for `_attr` and
+    /// `render`: a declaration of either name is refused by
+    /// [`check_declaration`], so that repair cannot be applied. The only working
+    /// repairs are dropping or renaming the export, and the message must offer
+    /// those — and must **not** offer the one that cannot be followed.
+    #[test]
+    fn the_emitter_own_export_arm_offers_only_reachable_repairs() {
+        for (src, name) in [
+            (
+                "\"use static\"\nconst x = 1\nexport { x as _attr }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                "_attr",
+            ),
+            (
+                "\"use static\"\nconst x = 1\nexport { x as render }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                "render",
+            ),
+            (
+                // An island's own local, which no import introduces.
+                "\"use island\"\nconst x = 1\nexport { x as _a }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+                "_a",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014 && row.message.contains(&format!("`{name}`")))
+                .unwrap_or_else(|| panic!("exporting `{name}` must be refused: {d:?}"));
+            assert!(
+                !row.message
+                    .contains("Export a value this file declares instead"),
+                "the repair names a declaration that is itself refused (RA014) for `{name}`, so it \
+                 cannot be applied: {}",
+                row.message
+            );
+            assert!(
+                row.message.contains("drop the export"),
+                "the reachable repair must be offered for `{name}`: {}",
+                row.message
+            );
+            assert!(
+                row.message.contains("Rename the exported name"),
+                "renaming the export is the other reachable repair for `{name}`: {}",
+                row.message
+            );
+        }
+    }
+
+    /// E3 (round 5): `own_names()` can be empty — the reserved set is data, and a
+    /// future mode could reserve only imported names — and interpolating it as a
+    /// parenthetical would print a dangling `` (` `) ``. The clause must vanish
+    /// instead.
+    #[test]
+    fn the_own_names_clause_omits_an_empty_parenthetical() {
+        let empty = Reserved {
+            all: Vec::new(),
+            imported: Vec::new(),
+        };
+        assert_eq!(
+            empty.own_names_clause(),
+            "",
+            "an empty list prints no parenthetical at all"
+        );
+        let all_imported = Reserved {
+            all: vec!["owner".to_string()],
+            imported: vec!["owner".to_string()],
+        };
+        assert_eq!(
+            all_imported.own_names_clause(),
+            "",
+            "a set whose every name is imported has no emitter names to list"
+        );
+        let one = Reserved {
+            all: vec!["_esc".to_string()],
+            imported: Vec::new(),
+        };
+        assert_eq!(
+            one.own_names_clause(),
+            " (`_esc`)",
+            "a non-empty list keeps the parenthetical"
+        );
+    }
+
+    /// What `import { _a } from "runai"` does, pinned as measured.
+    ///
+    /// `_a` is an island emitter **local** (the marker list) and *not* a runtime
+    /// export, so importing it asks the runtime for a name it does not have. The
+    /// module is half-erased and half-kept:
+    ///
+    /// - **unused**, type stripping erases the import, nothing of it reaches the
+    ///   artifact, and the file is clean;
+    /// - **used**, the name survives into the emitted `import { _a, … }`, analysis is
+    ///   clean (the reference arm exempts every reference to a `"runai"` import), the
+    ///   build succeeds, and the artifact throws `SyntaxError: The requested module …
+    ///   does not provide an export named '_a'` when it loads. Measured with `node`
+    ///   on the built file.
+    ///
+    /// This is a pre-existing false negative in the **import/reference** arm, not the
+    /// export arm this round changed, so it is pinned rather than fixed — see the
+    /// round-5 report's `Open`.
+    #[test]
+    fn an_import_of_the_emitters_own_local_name_is_clean_and_cannot_link() {
+        let unused = "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\n";
+        assert!(
+            crate::analyze::analyze(unused, "src/routes/index.page.tsx").is_empty(),
+            "an unused import is erased and collides with nothing"
+        );
+        let unused_module =
+            crate::codegen::emit_client_checked(unused, "src/routes/index.page.tsx", "/r.js")
+                .expect("the unused import emits");
+        assert!(
+            !unused_module.contains("_a,"),
+            "an unused import is stripped before emission: {unused_module}"
+        );
+
+        let used = "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{_a}</p> }\n";
+        assert!(
+            crate::analyze::analyze(used, "src/routes/index.page.tsx").is_empty(),
+            "a reference to a `\"runai\"` import is exempt in the reference arm"
+        );
+        let module =
+            crate::codegen::emit_client_checked(used, "src/routes/index.page.tsx", "/r.js")
+                .expect("the used import emits");
+        assert!(
+            module.contains("import { _a,"),
+            "the used import survives into the emitted import list: {module}"
+        );
+
+        // The durable fact behind the load-time failure: the runtime has no such
+        // export, so any artifact that imports it cannot link.
+        let runtime = include_str!("../../../../packages/runai/runtime.js");
+        assert!(
+            !runtime.contains("export function _a(") && !runtime.contains("export const _a "),
+            "the shipped runtime exports no `_a`; if that changes, this fixture's \
+             consequence changed and the report's Open item is stale"
+        );
+    }
+
+    /// Test 6's control, stated on its own: a local export under an ordinary name
+    /// is clean, and the built module carries `export { s };` verbatim.
+    ///
+    /// The declaration here is a plain `const`, not `export const`: the emitter
+    /// copies a module statement verbatim **and** appends the export specifier, so
+    /// `export const s = …; export { s }` emits a duplicate export that `node
+    /// --check` rejects. That is a pre-existing false negative in this rule (it does
+    /// not refuse a local declared `export` and re-exported), recorded in the round-5
+    /// report as open rather than fixed here.
+    #[test]
+    fn a_local_export_under_an_ordinary_name_is_clean_and_built() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nconst s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        assert!(
+            crate::analyze::analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "a local export under an ordinary name is legal"
+        );
+        let module = crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+            .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { s };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
     }
 }
