@@ -104,13 +104,18 @@ fn why(code: Code) -> &'static str {
         }
         Code::RA010 => {
             "Static routes ship zero bytes of JavaScript, and this rule is what enforces that \
-             claim rather than observing it. Two costs, and the `message` says which one a site \
+             claim rather than observing it. Three costs, and the `message` says which one a site \
              has. A runtime feature — a signal, an effect, a resource, a write — would silently do \
              nothing, because there is no runtime on the page to run it. Code the markup carries \
-             is worse: an `on…` attribute the emitted HTML keeps and a literal `<script>` element \
-             are JavaScript the served HTML would execute, so the page would ship exactly what it \
-             promises not to. Both are refused for the same reason: the directive is the decision \
-             that controls the 0 KB guarantee, and a page that needs code is an island."
+             is worse: an `on…` attribute the emitted HTML keeps under a name HTML defines as a \
+             handler, and a literal `<script>` element, are JavaScript the served HTML would \
+             execute, so the page would ship exactly what it promises not to. And because the \
+             handler rule is a name prefix rather than an event list — a list cannot be complete \
+             and nothing fails when it drifts — an `on…` attribute the HTML keeps under a name \
+             that is *not* a handler (`once`, `onwards`) is refused too: it is either dead or \
+             inline JavaScript, and a static route has no runtime for either. All three are \
+             refused for the same reason: the directive is the decision that controls the 0 KB \
+             guarantee, and a page that needs code is an island."
         }
         Code::RA011 => {
             "The router renders the default export as the route, and it has no other source. Three \

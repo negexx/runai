@@ -192,7 +192,9 @@ impl Code {
                  a literal `<script>` element. The page ships zero bytes of JavaScript, so a \
                  runtime feature would silently do nothing, while an inline handler or a script \
                  element is code the served page would run — neither can be on a page that makes \
-                 the 0 KB claim."
+                 the 0 KB claim. An `on…` attribute that is not a handler HTML defines (`once`, \
+                 `onwards`) is refused as well: the rule is a name prefix, and such an attribute \
+                 is either dead or inline JavaScript, which a static route has no runtime for."
             }
             Code::RA011 => {
                 "A page file's default export is missing, is not a function this milestone can \

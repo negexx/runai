@@ -231,12 +231,14 @@ fn static_write(call: &AccessorCall) -> Diagnostic {
     )
 }
 
-/// `RA010_STATIC_VIOLATION`: an event handler in a static route.
+/// `RA010_STATIC_VIOLATION`: an `on…` attribute in a static route.
 ///
-/// Two sentences, one per mechanism, because one would be false for the other
-/// half: an inline attribute **is** JavaScript the served page would execute, so
-/// saying it "would never run" is wrong; a dropped `onClick={fn}` has no runtime
-/// to attach it, so saying it "ships code" is wrong. Each site gets the true one.
+/// Three sentences, one per mechanism, because each is false for the other two: an
+/// attribute the HTML keeps and the browser **does** run is code the page ships, so
+/// "would never run" is wrong; a dropped `onClick={fn}` has no listener to attach,
+/// so "ships code" is wrong; and a name neither convention classifies (`once`,
+/// `onwards`, `onclickish`, `onÖ`) is refused only because the route is static, so
+/// neither of the first two is true. Each site gets the one that is true for it.
 fn static_handler(span: (u32, u32), form: HandlerForm) -> Diagnostic {
     let message = match form {
         HandlerForm::ShipsCode => {
@@ -247,6 +249,10 @@ fn static_handler(span: (u32, u32), form: HandlerForm) -> Diagnostic {
         HandlerForm::NeverAttached => {
             "a \"use static\" route has no runtime, so this event handler would never be \
              attached or fire"
+        }
+        HandlerForm::Unclassified => {
+            "a \"use static\" route has no runtime, so an `on…` attribute here is either dead or \
+             inline JavaScript; both are refused"
         }
     };
     Diagnostic::new(Code::RA010, span, message)
@@ -312,40 +318,177 @@ fn handler_form(attribute: &oxc_ast::ast::JSXAttribute<'_>) -> Option<HandlerFor
     // which needs `on` + a capital *as written*. So an uppercase expression is the one
     // form the prerender emitter drops; a bare attribute carries no value to evaluate.
     let carried = literal || (expression && !uppercase);
-    Some(if carried {
+    if !carried {
+        return Some(HandlerForm::NeverAttached);
+    }
+    // The HTML carries this attribute, but "the browser evaluates it" is true only
+    // when the name is one HTML defines as a handler: `onclick` yes, `once` and
+    // `onwards` no. That is a fact about the *name*, used only to pick the true
+    // sentence — see [`is_known_handler_event`]. It can never weaken or widen the
+    // refusal, which happened above on the prefix.
+    Some(if is_known_handler_event(&lowercased) {
         HandlerForm::ShipsCode
     } else {
-        HandlerForm::NeverAttached
+        HandlerForm::Unclassified
     })
 }
 
+/// Whether `lowercased` (`on…`) is one of HTML's inline event handler content
+/// attributes such as `onclick` or `onkeydown`.
+///
+/// **This list is for the message only.** [`handler_form`] already decided that
+/// the attribute is refused, on the prefix; nothing here can accept one. Its job
+/// is narrower and honest: the `ShipsCode` sentence claims *the browser evaluates
+/// the attribute as JavaScript*, which is true of a real handler name and false of
+/// `once` or `onwards`. Drift is safe in the only direction it can go — a real
+/// handler this list has not heard of falls to [`HandlerForm::Unclassified`], whose
+/// sentence is true for every `on…` name — so an out-of-date entry can only make the
+/// message less specific, never false, and it cannot make the rule incomplete
+/// because the rule does not consult it.
+fn is_known_handler_event(lowercased: &str) -> bool {
+    const EVENTS: &[&str] = &[
+        "onabort",
+        "onafterprint",
+        "onanimationstart",
+        "onauxclick",
+        "onbeforeinput",
+        "onbeforematch",
+        "onbeforeprint",
+        "onbeforetoggle",
+        "onbeforeunload",
+        "onblur",
+        "oncancel",
+        "oncanplay",
+        "oncanplaythrough",
+        "onchange",
+        "onclick",
+        "onclose",
+        "oncontextlost",
+        "oncontextmenu",
+        "oncopy",
+        "oncuechange",
+        "oncut",
+        "ondblclick",
+        "ondrag",
+        "ondragend",
+        "ondragenter",
+        "ondragleave",
+        "ondragover",
+        "ondragstart",
+        "ondrop",
+        "ondurationchange",
+        "onemptied",
+        "onended",
+        "onerror",
+        "onfocus",
+        "onfocusin",
+        "onfocusout",
+        "onformdata",
+        "onhashchange",
+        "oninput",
+        "oninvalid",
+        "onkeydown",
+        "onkeypress",
+        "onkeyup",
+        "onlanguagechange",
+        "onload",
+        "onloadeddata",
+        "onloadedmetadata",
+        "onloadstart",
+        "onmessage",
+        "onmessageerror",
+        "onmousedown",
+        "onmouseenter",
+        "onmouseleave",
+        "onmousemove",
+        "onmouseout",
+        "onmouseover",
+        "onmouseup",
+        "onoffline",
+        "ononline",
+        "onpagehide",
+        "onpageshow",
+        "onpaste",
+        "onpause",
+        "onplay",
+        "onplaying",
+        "onpointercancel",
+        "onpointerdown",
+        "onpointerenter",
+        "onpointerleave",
+        "onpointermove",
+        "onpointerout",
+        "onpointerover",
+        "onpointerrawupdate",
+        "onpointerup",
+        "onpopstate",
+        "onprogress",
+        "onratechange",
+        "onrejectionhandled",
+        "onreset",
+        "onresize",
+        "onscroll",
+        "onscrollend",
+        "onsecuritypolicyviolation",
+        "onseeked",
+        "onseeking",
+        "onselect",
+        "onselectionchange",
+        "onselectstart",
+        "onslotchange",
+        "onstalled",
+        "onstorage",
+        "onsubmit",
+        "onsuspend",
+        "ontimeupdate",
+        "ontoggle",
+        "ontransitionend",
+        "onunhandledrejection",
+        "onunload",
+        "onvolumechange",
+        "onwaiting",
+        "onwheel",
+    ];
+    EVENTS.contains(&lowercased)
+}
+
 /// What the emitted markup does with a handler attribute, so the message can say
-/// the true mechanism instead of one sentence that is false for half the shapes.
+/// the true mechanism instead of one sentence that is false for some shapes.
 #[derive(Clone, Copy)]
 enum HandlerForm {
-    /// The HTML carries the attribute, so the browser evaluates it as JavaScript:
-    /// `onclick="alert(1)"`, `onClick="alert(1)"` (HTML lowercases the name), and
-    /// `onclick={expr}` (the prerender emitter interpolates the value into the
-    /// attribute) all land in the served page as live code.
+    /// The HTML carries the attribute and its lowercased name is one HTML defines
+    /// as a handler, so the browser evaluates it as JavaScript: `onclick="alert(1)"`,
+    /// `onClick="alert(1)"` (HTML lowercases the name), and `onclick={expr}` (the
+    /// prerender emitter interpolates the value into the attribute) all land in the
+    /// served page as live code.
     ShipsCode,
     /// The prerender emitter writes nothing for it (`Binding::Event`), so there is
     /// no listener on the page: `onClick={fn}`, and a bare `onClick` (or `onclick`)
     /// with no value to carry.
     NeverAttached,
+    /// The HTML carries the attribute, but its name is not one HTML defines as a
+    /// handler (`once`, `onwards`, `onclickish`, `onÖ`). The browser does not run
+    /// it; it is refused only because a static route has no runtime. Neither
+    /// "ships code" nor "never attached" is true here, so this form says only the
+    /// static fact.
+    Unclassified,
 }
 
-/// Whether `name` starts with a lowercase `on` followed by an uppercase letter
-/// (`onClick`) — the React-style convention this project already uses.
+/// Whether `name` starts with a lowercase `on` followed by an ASCII uppercase
+/// letter (`onClick`) — the React-style convention this project already uses.
 ///
 /// Used **only** for the [`HandlerForm`] split, never to decide whether something
 /// is a handler: the emitter's [`crate::ir::event_name`] uses the same
-/// case-sensitive prefix, so this is the one fact that predicts whether an
-/// expression-valued attribute becomes a listener. Deciding the attribute is a
+/// `is_ascii_uppercase` test, so this is the one fact that predicts whether an
+/// expression-valued attribute becomes a listener. It must stay ASCII: a Unicode
+/// `is_uppercase` would call `onÖ={1}` a listener while the emitter lowers it to a
+/// plain attribute and interpolates the value, so the message would say it is never
+/// attached about an attribute the HTML carries. Deciding the attribute is a
 /// handler happens on the lowercased name, above.
 fn is_uppercase_handler_name(name: &str) -> bool {
     name.strip_prefix("on")
         .and_then(|rest| rest.chars().next())
-        .is_some_and(char::is_uppercase)
+        .is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// Every refused handler attribute and literal `<script>` element in the file.

@@ -2288,11 +2288,6 @@ mod tests {
         assert!(check_static_mode(Mode::Island, program, &bindings).is_empty());
     }
 
-    /// A handler is `on` + a known HTML inline-handler event (`onclick`) or the
-    /// existing `on` + uppercase convention (`onClick`). A lowercase `on…` name
-    /// that is not an event (`once`, `onwards`) is an ordinary attribute: the
-    /// explicit list is what keeps `once={x}` from becoming a false positive.
-    ///
     /// The `onclick="…"` row is the inverted form of the old test, which pinned
     /// it as clean while the built page shipped `onclick="alert(1)"`.
     #[test]
@@ -2402,6 +2397,107 @@ mod tests {
         }
     }
 
+    /// A `once`/`onwards`/`onclickish` attribute is refused because the route is
+    /// static, **not** because a browser runs it — it does not. The message must say
+    /// only that true mechanism, and the positive half is asserted too: a blacklist
+    /// of phrases let a reworded false claim through twice on this branch, so this
+    /// pins the sentence that must be present, not just one that must be absent.
+    #[test]
+    fn an_unclassifiable_on_name_says_only_the_static_fact() {
+        for attribute in ["once=\"x\"", "onwards=\"x\"", "onclickish=\"x\""] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+            let message = &d[0].message;
+            // The false mechanism this round removes.
+            assert!(
+                !message.contains("browser evaluates"),
+                "{attribute}: the browser does not evaluate this name: {message}"
+            );
+            assert!(
+                !message.contains("would never be attached"),
+                "{attribute}: the HTML keeps this attribute, so it is attached: {message}"
+            );
+            // The positive facts: a static route, and no runtime.
+            assert!(
+                message.contains("a \"use static\" route"),
+                "{attribute}: the message must name the static route: {message}"
+            );
+            assert!(
+                message.contains("has no runtime"),
+                "{attribute}: the refusal is the missing runtime: {message}"
+            );
+            assert!(
+                message.contains("either dead or inline JavaScript"),
+                "{attribute}: the two possibilities this name has: {message}"
+            );
+        }
+    }
+
+    /// A name HTML **does** define as a handler keeps the sentence about the HTML
+    /// carrying live code, because that is true of it: the browser runs it.
+    #[test]
+    fn a_real_inline_handler_says_the_html_carries_it() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onclick=\"alert(1)\">x</button> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA010);
+        let message = &d[0].message;
+        assert!(
+            message.contains("the served HTML carries it"),
+            "a real handler is carried as live code, so the message must say so: {message}"
+        );
+        assert!(
+            message.contains("browser evaluates it as JavaScript"),
+            "the browser does run this one: {message}"
+        );
+    }
+    /// The two spellings differ only in case, which is the whole point of matching
+    /// the lowercased name: a rule that refused `onClick` and accepted `onclick`
+    /// would be the very gap this round closes.
+    /// `onÖ={1}` is the case where the two predicates used to disagree: analysis
+    /// called the capital Unicode `Ö` an uppercase handler, while the emitter's
+    /// `is_ascii_uppercase` lowered the attribute to a plain `Binding::Attr` and
+    /// interpolated the value. Both predicates now use the ASCII test, so analysis
+    /// and lowering agree: the HTML **carries** it (an attribute, not a listener),
+    /// and its name is not an HTML handler, so the true sentence is the static-only
+    /// one — not "never attached", which was about a listener the emitter never
+    /// wrote.
+    #[test]
+    fn a_unicode_capital_after_on_is_carried_like_the_emitter_does() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div onÖ={1}>x</div> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA010);
+        let message = &d[0].message;
+        assert!(
+            !message.contains("would never be attached"),
+            "the emitter carries this as an attribute, so it is attached: {message}"
+        );
+        assert!(
+            message.contains("either dead or inline JavaScript"),
+            "`onÖ` is not an HTML handler, so only the static fact is true: {message}"
+        );
+
+        // The lowering half of the same fact, from the emitter's own `event_name`:
+        // `Ö` is not an ASCII capital, so this is a plain attribute the HTML keeps,
+        // which is exactly why "never attached" would be false.
+        let lowered = crate::ir::lower_route(
+            "\"use island\"\nexport default function P() { return <div onÖ={1}>x</div> }\n",
+        )
+        .unwrap();
+        let crate::ir::IrNode::Element { bindings, .. } = lowered.tree else {
+            panic!("expected element")
+        };
+        assert!(
+            matches!(bindings.as_slice(), [crate::ir::Binding::Attr { .. }]),
+            "the emitter must agree with analysis and keep it an attribute: {bindings:?}"
+        );
+    }
+
     /// A bare `on…` attribute is refused the same way in either capitalisation.
     /// The two spellings differ only in case, which is the whole point of matching
     /// the lowercased name: a rule that refused `onClick` and accepted `onclick`
@@ -2448,6 +2544,7 @@ mod tests {
         for attribute in [
             "once=\"x\"",
             "onwards=\"x\"",
+            "onclick=\"str\"",
             "onclick=\"alert(1)\"",
             "ONCLICK=\"alert(1)\"",
         ] {
