@@ -3,19 +3,27 @@
 //! This is the first user-facing command, so it owns the exit-code contract the
 //! rest of the tooling reads:
 //!
-//! - `0` — every file was analyzed and nothing is wrong;
-//! - `1` — at least one `error` diagnostic was reported;
-//! - `2` — the command was misused, the path does not exist, or nothing could be
-//!   read at all. **Nothing is written to stdout** in this case; the message goes
-//!   to stderr, because a caller parsing `--json` output must never see prose
-//!   where an array belongs.
+//! - `0` — every route the walk found was read and analyzed, and nothing is
+//!   wrong;
+//! - `1` — every route was read and at least one `error` diagnostic was reported;
+//! - `2` — the command was misused, the path does not exist, or **any** file or
+//!   directory could not be read. **Nothing is written to stdout** in this case;
+//!   every reason goes to stderr, because a caller parsing `--json` output must
+//!   never see prose where an array belongs.
 //!
-//! One unreadable file among readable ones does not end the run: it is reported
-//! on stderr — naming the path and the OS error — and the walk continues, so the
-//! rest of the tree is still analyzed and its diagnostics still print. The exit
-//! code is then `1` if any diagnostic was produced and `0` if none was; only when
-//! no file could be read at all is it `2`. The message never goes to stdout, so
-//! `--json` output stays one parseable array either way.
+//! A clean verdict is a promise about the whole tree: `0` means every route the
+//! walk reached was analyzed. So one unreadable file — or one unreadable
+//! subdirectory — is enough to make the run incomplete, because reporting `[]`
+//! next to a warning leaves a CI free to read whichever channel is green while a
+//! route was never analyzed. Two things follow, and they are deliberate:
+//!
+//! - the walk *continues* past an unreadable entry instead of aborting, so one
+//!   bad permission bit cannot hide the diagnostics the other files produced;
+//!   and
+//! - those diagnostics are rendered to **stderr** rather than dropped. They
+//!   cannot go to stdout (that is the exit-`2` promise), but they are real
+//!   findings about readable files, and losing them would hide a broken route
+//!   behind an unrelated permission error.
 //!
 //! # Paths are relative to the working directory when that is possible
 //!
@@ -46,7 +54,8 @@ const DEFAULT_PATH: &str = "src/routes";
 /// Run `runai check …` with the arguments that follow `check`.
 ///
 /// Returns the process exit code: `0` clean, `1` errors found, `2` usage error,
-/// missing path, or nothing readable. Every `2` writes to stderr only.
+/// missing path, or any path that could not be read. Every `2` writes to stderr
+/// only.
 pub fn run(args: &[String]) -> i32 {
     let mut json = false;
     let mut path: Option<&str> = None;
@@ -76,24 +85,25 @@ pub fn run(args: &[String]) -> i32 {
     let path = path.unwrap_or(DEFAULT_PATH);
     let root = Path::new(path);
 
-    let files = match collect(path, root) {
-        Ok(files) => files,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return 2;
-        }
-    };
+    // A directory that could not be walked is not an abort: `walk` reports it and
+    // keeps going, so the files it did reach are still analyzed below. Only a
+    // path that does not exist or is not a route comes back as `Err`.
+    let mut files = Vec::new();
+    let mut unreadable = false;
+    if let Err(message) = collect(path, root, &mut files, &mut unreadable) {
+        eprintln!("error: {message}");
+        return 2;
+    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // One entry per file, because `render_human` needs that file's source and
     // the JSON form needs every diagnostic across all files at once.
     let mut checked: Vec<(String, Vec<Diagnostic>)> = Vec::new();
     let mut failed = false;
-    let mut unreadable = false;
 
     for file in files {
-        // An unreadable file is reported and skipped, not fatal: aborting here
-        // would hide every diagnostic in the same tree behind one bad encoding.
+        // An unreadable file marks the run incomplete but does not stop it: the
+        // remaining files still have diagnostics worth reporting.
         let source = match std::fs::read_to_string(&file) {
             Ok(source) => source,
             Err(error) => {
@@ -113,9 +123,18 @@ pub fn run(args: &[String]) -> i32 {
         checked.push((source, diagnostics));
     }
 
-    // Nothing was read at all: there is no analysis to report, so this is the
-    // exit-`2` case and stdout stays untouched for a `--json` caller.
-    if checked.is_empty() && unreadable {
+    // Some entry never got analyzed, so there is no verdict to report. The
+    // diagnostics found in the readable files cannot go to stdout (that would be
+    // a partial array next to a failure), so they go to stderr: they are still
+    // real findings, and the alternative is discarding a broken route behind an
+    // unrelated permission error.
+    if unreadable {
+        eprintln!("error: the check did not complete: some files or directories could not be read");
+        for (source, diagnostics) in &checked {
+            for diagnostic in diagnostics {
+                eprint!("{}", diagnostic.render_human(source));
+            }
+        }
         return 2;
     }
 
@@ -144,46 +163,74 @@ pub fn run(args: &[String]) -> i32 {
 /// so `package.json` would come back as a syntax diagnostic and a non-route
 /// would look like a broken route. A path that does not exist is the exit-`2`
 /// message, which names the path the user asked for so the repair is obvious.
-fn collect(path: &str, root: &Path) -> Result<Vec<PathBuf>, String> {
+///
+/// Those are the only `Err` cases: an unreadable directory *inside* the tree does
+/// not abort the walk. It is reported on stderr, `incomplete` is set, and the
+/// walk moves to the next entry, so the files it did reach are still analyzed.
+fn collect(
+    path: &str,
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    incomplete: &mut bool,
+) -> Result<(), String> {
     let metadata =
         std::fs::metadata(root).map_err(|_| format!("no such directory or file: `{path}`"))?;
 
     if metadata.is_file() {
         if root.extension().is_some_and(|ext| ext == "tsx") {
-            return Ok(vec![root.to_path_buf()]);
+            files.push(root.to_path_buf());
+            return Ok(());
         }
         return Err(format!(
             "not a route file (expected a `*.tsx` file or a directory): `{path}`"
         ));
     }
 
-    let mut files = Vec::new();
-    walk(root, &mut files)?;
+    walk(root, files, incomplete);
     files.sort_by_key(|path| separators(path));
-    Ok(files)
+    Ok(())
 }
 
 /// Depth-first walk collecting `*.tsx` files.
-fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+///
+/// An entry that cannot be read is reported and skipped: one unreadable
+/// subdirectory must not throw away every diagnostic the readable files produced.
+fn walk(dir: &Path, files: &mut Vec<PathBuf>, incomplete: &mut bool) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("error: cannot read {}: {error}", dir.display());
+            *incomplete = true;
+            return;
+        }
+    };
 
     for entry in entries {
-        let entry = entry.map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("error: cannot read {}: {error}", dir.display());
+                *incomplete = true;
+                continue;
+            }
+        };
         let path = entry.path();
         // `file_type` does not follow symlinks, so a link loop cannot recurse.
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                eprintln!("error: cannot read {}: {error}", path.display());
+                *incomplete = true;
+                continue;
+            }
+        };
 
         if file_type.is_dir() {
-            walk(&path, files)?;
+            walk(&path, files, incomplete);
         } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "tsx") {
             files.push(path);
         }
     }
-
-    Ok(())
 }
 
 /// `path` relative to `cwd`, with `/` separators.

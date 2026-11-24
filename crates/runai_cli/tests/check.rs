@@ -122,50 +122,99 @@ fn check_second_path_argument_is_a_usage_error() {
     assert!(stderr.contains("usage:"), "stderr carries the usage line");
 }
 
-// F3: one unreadable file used to abort the whole run, hiding every other error.
-// It is reported on stderr and the walk continues; exit is 1 because diagnostics
-// were produced. Stdout stays pure JSON.
+// N1: a route that could not be read means the run did not complete. Reporting
+// `[]` on stdout and a warning on stderr contradicts itself, and a CI reading
+// either channel stays green while one route was never analyzed. Exit 2, and
+// stdout carries nothing at all.
 #[test]
-fn check_unreadable_file_is_reported_and_the_walk_continues() {
+fn check_unreadable_route_is_not_a_clean_verdict() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
     std::fs::write(
         tmp.path().join("src/routes/a.page.tsx"),
-        "\"use static\"\nexport default function A(props) { return <p/> }\n",
+        "\"use static\"\nexport default function A(props: Record<never, never>) { return <p/> }\n",
     )
     .unwrap();
-    // Sorts between the two readable files, so a continued walk covers both sides.
+    // The clean file sorts first: `[]` here was the false green, not a missing array.
     std::fs::write(
         tmp.path().join("src/routes/b.page.tsx"),
         b"export default function B(props) { return <p>caf\xe9</p> }\n".as_slice(),
     )
     .unwrap();
-    std::fs::write(
-        tmp.path().join("src/routes/c.page.tsx"),
-        "\"use static\"\nexport default function C(props) { return <c/> }\n",
-    )
-    .unwrap();
 
     let out = run(&["check", "--json"], tmp.path());
-    assert_eq!(out.status.code(), Some(1), "diagnostics were produced");
 
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("stdout is pure JSON even with an unreadable file");
-    let files: Vec<&str> = parsed
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|diagnostic| diagnostic["file"].as_str().unwrap())
-        .collect();
     assert_eq!(
-        files,
-        vec!["src/routes/a.page.tsx", "src/routes/c.page.tsx"],
-        "both readable files are still analyzed; the unreadable one is not a diagnostic"
+        out.status.code(),
+        Some(2),
+        "an unanalyzed route means the run could not complete"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no partial array and no `[]`: stdout is silent when the run did not complete, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
     );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("src/routes/b.page.tsx"), "stderr: {stderr}");
     assert!(stderr.contains("UTF-8"), "stderr names the OS error");
+}
+
+// N2: an unreadable subdirectory used to propagate out of `walk`, so the whole
+// run aborted with exit 2 and every diagnostic the readable files produced was
+// thrown away. The walk must keep going and the run still ends at exit 2 (N1),
+// with the reasons — including the diagnostics it cannot print — on stderr.
+#[test]
+fn check_unreadable_subdirectory_keeps_its_reason_and_fails_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("src/routes/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    // A real error, in a file the walk can reach.
+    std::fs::write(
+        tmp.path().join("src/routes/a.page.tsx"),
+        "export default function A(props) { return <p/> }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/sub/ok.page.tsx"),
+        "// unreachable\n",
+    )
+    .unwrap();
+
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Under a root CI the mode is not enforced and the test would assert nothing.
+    if std::fs::read_dir(&sub).is_ok() {
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: file permissions are not enforced for this user");
+        return;
+    }
+
+    let out = run(&["check", "--json"], tmp.path());
+    // Restore before the tempdir is dropped so cleanup can remove the tree.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "a directory was never read");
+    assert!(
+        out.stdout.is_empty(),
+        "stdout stays silent, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("src/routes/sub"),
+        "stderr names the unreadable directory: {stderr}"
+    );
+    assert!(
+        stderr.contains("RA006_UNANNOTATED_PROPS"),
+        "the RA006 from the readable file is not discarded silently: {stderr}"
+    );
+    assert!(
+        stderr.contains("did not complete"),
+        "stderr states the run failed rather than reporting a verdict: {stderr}"
+    );
 }
 
 // F3: when nothing at all could be read there is no analysis to trust, so the
