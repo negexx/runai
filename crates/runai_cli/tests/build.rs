@@ -339,29 +339,27 @@ fn a_dot_modules_route_is_refused() {
     assert!(!tmp.path().join("dist").exists());
 }
 
-// A dot-prefixed file is hidden, not a route. `.page.tsx` filtered only on
-// `_`-prefix, so a hidden file became the root page and shipped its content.
+// A hidden *file* is skipped by `walk` before `route_name` sees it, so it cannot be
+// a route; a hidden *directory* is reached, and `route_name` refuses it. Pinning only
+// the directory case is deliberate: a test on `.page.tsx` would assert a filter that
+// already ran, not a rule the build enforces.
 #[test]
-fn a_hidden_dot_page_file_is_not_a_route() {
+fn a_hidden_route_directory_is_refused_not_silently_skipped() {
     let tmp = tempfile::tempdir().unwrap();
-    write_app(tmp.path(), &static_route("real"));
+    write_app(tmp.path(), &static_route("root"));
+    std::fs::create_dir_all(tmp.path().join("src/routes/.cache")).unwrap();
     std::fs::write(
-        tmp.path().join("src/routes/.page.tsx"),
+        tmp.path().join("src/routes/.cache/x.page.tsx"),
         static_route("hidden"),
     )
     .unwrap();
 
     let out = run(&["build", "--out", "dist"], tmp.path());
-    let html = std::fs::read_to_string(tmp.path().join("dist/index.html")).unwrap_or_default();
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(html.contains("<p>real</p>"), "{html}");
-    assert!(!html.contains("hidden"), "{html}");
-    assert!(!tmp.path().join("dist/.modules").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(".cache"), "{stderr}");
+    assert!(stderr.contains("hidden directory"), "{stderr}");
+    assert!(!tmp.path().join("dist").exists());
 }
 
 // The stamp gate itself, not just the `.tsx` scan: a non-empty directory with no
@@ -502,5 +500,146 @@ fn dynamic_segment_is_ra014_not_silent_output() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("RA014_NOT_SUPPORTED_YET"));
+    assert!(!tmp.path().join("dist").exists());
+}
+
+// N3: `<out>.tmp` is scratch for THIS build, but its name is derived from `--out`.
+// A pre-existing `dist.tmp` that is not a stamped leftover is somebody's directory,
+// and the old build deleted it with everything in it (exit 0).
+#[test]
+fn a_preexisting_unstamped_scratch_directory_is_refused_and_left_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("hi"));
+    std::fs::create_dir_all(tmp.path().join("dist.tmp/src")).unwrap();
+    std::fs::write(tmp.path().join("dist.tmp/src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(tmp.path().join("dist.tmp/IMPORTANT.txt"), "keep me\n").unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("dist.tmp"), "{stderr}");
+    assert!(stderr.contains("scratch space"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("dist.tmp/IMPORTANT.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert!(tmp.path().join("dist.tmp/src/main.rs").exists());
+    assert!(!tmp.path().join("dist").exists());
+}
+
+// N2: a static route ships no asset, so a static route named `runtime` collides with
+// nothing and must build. The old guard ran by name, before the mode was known, and
+// refused it with a message that was false for it.
+#[test]
+fn a_static_route_named_runtime_builds_normally() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("root"));
+    std::fs::write(
+        tmp.path().join("src/routes/runtime.page.tsx"),
+        static_route("runtime page"),
+    )
+    .unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let html = std::fs::read_to_string(tmp.path().join("dist/runtime/index.html")).unwrap();
+    assert!(html.contains("<p>runtime page</p>"), "{html}");
+    assert!(!html.contains("<script"), "{html}");
+    assert!(!tmp.path().join("dist/assets/runtime.js").exists());
+}
+
+// N1: on a case-insensitive filesystem `Runtime.page.tsx` → `assets/Runtime.js` IS
+// `assets/runtime.js`, so the runtime copy silently overwrote the page module. The
+// rule compares case-insensitively everywhere, so it fails closed on Linux too.
+#[test]
+fn an_island_route_named_uppercase_runtime_is_refused_case_insensitively() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("root"));
+    std::fs::write(
+        tmp.path().join("src/routes/Runtime.page.tsx"),
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <button onClick={() => {}}>x</button> }\n",
+    )
+    .unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("Runtime.page.tsx"), "{stderr}");
+    assert!(stderr.contains("overwrite this route's module"), "{stderr}");
+    assert!(!tmp.path().join("dist").exists());
+}
+
+// N1: `About.page.tsx` and `about/index.page.tsx` map to one output on a
+// case-insensitive filesystem (`About/index.html` == `about/index.html`), so the
+// duplicate-name guard compares case-insensitively as well.
+#[test]
+fn case_colliding_route_names_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("root"));
+    std::fs::write(
+        tmp.path().join("src/routes/About.page.tsx"),
+        static_route("upper"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes/about")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/about/index.page.tsx"),
+        static_route("lower"),
+    )
+    .unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("About.page.tsx"), "{stderr}");
+    assert!(stderr.contains("about/index.page.tsx"), "{stderr}");
+    assert!(!tmp.path().join("dist").exists());
+}
+
+// N4: `--out src/dist` does not exist yet, so the old `*.tsx` scan never ran and the
+// build wrote into the source tree. The nearest existing ancestor is inside `src`.
+#[test]
+fn out_inside_the_source_tree_is_refused_even_when_it_does_not_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("hi"));
+
+    let out = run(&["build", "--out", "src/dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("usage: runai"), "{stderr}");
+    assert!(!tmp.path().join("src/dist").exists());
+    assert!(tmp.path().join("src/routes/index.page.tsx").exists());
+}
+
+// N5: `route_name(..)?` returned early and dropped the diagnostics already collected.
+// One run must report both the reserved name and the other route's problem.
+#[test]
+fn a_reserved_name_and_a_route_diagnostic_are_both_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("root"));
+    std::fs::write(
+        tmp.path().join("src/routes/bad.page.tsx"),
+        "\"use static\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(0); return <p>{n()}</p> }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes/.modules")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/.modules/x.page.tsx"),
+        static_route("reserved"),
+    )
+    .unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("RA010"),
+        "the diagnostic must survive: {stderr}"
+    );
+    assert!(
+        stderr.contains(".modules"),
+        "the reserved name must be reported: {stderr}"
+    );
     assert!(!tmp.path().join("dist").exists());
 }
