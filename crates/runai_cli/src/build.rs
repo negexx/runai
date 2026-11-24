@@ -54,13 +54,37 @@
 //! path whose nearest existing ancestor is the route source tree or inside it
 //! (`--out src/dist` does not exist yet, so scanning `<out>` alone would miss it).
 //!
-//! `<out>.tmp` and `<out>.old` are derived names too, not proof of ownership. A
-//! pre-existing `<out>.tmp` is scratch only when it carries the ownership marker
-//! [`OWNER`], written before any route content: anything else is refused with exit `2`
-//! at the start of the build instead of being deleted. A leftover that has the marker
-//! but not the completeness stamp [`STAMP`] is this tool's own interrupted run, and is
-//! deleted and rebuilt rather than refused — otherwise one `Ctrl-C` would wedge every
-//! later build.
+//! `<out>.old` is a derived name too, not proof of ownership, so it is removed only
+//! when it carries the completeness stamp [`STAMP`].
+//!
+//! # Scratch is unique per build, and publication is single-writer
+//!
+//! Every build assembles into `<out>.tmp.<pid>.<n>`, a name no other build can be
+//! using, so two concurrent builds never touch each other's tree and "who owns this
+//! directory" stops being a question. All three earlier schemes reused one fixed
+//! `<out>.tmp` and tried to infer ownership from its contents; that cannot work,
+//! because an empty directory, one with this tool's marker, and one with neither are
+//! indistinguishable from a second process's point of view. The observed failures were
+//! deleting a user's `dist.tmp`, wedging forever after one `Ctrl-C`, and two concurrent
+//! builds deleting each other's scratch mid-run.
+//!
+//! At the start of every build, leftover scratch directories are swept **only** when
+//! they carry [`OWNER`] *and* nobody holds its lock: the marker is an OS file lock, so
+//! "marked" means "ours" and "unlocked" means "its build is gone". Any other directory
+//! is ignored — a name this tool generates is not evidence that its contents belong to
+//! this tool, and refusing the build over one was what created both wedges. The previous
+//! release's fixed `<out>.tmp` is additionally swept when empty, because an empty
+//! directory has nothing to lose and a failed marker write leaves exactly that.
+//!
+//! The rename dance that publishes `<out>` is not atomic step-by-step, so the whole run
+//! holds one OS file lock keyed by the resolved `--out` ([`lock_build`]). Concurrent
+//! builds queue instead of interleaving; the kernel drops the lock when a process dies,
+//! so a killed build cannot wedge the next one. The scratch names stay unique so two
+//! builds can assemble at the same time without sharing a directory.
+//!
+//! Each build's own scratch is removed by [`Scratch`]'s `Drop` on every failure path,
+//! so a normal failure leaves nothing behind; a killed build leaves a marked directory
+//! that the next build sweeps.
 //!
 //! # The exit status of the child is not a failure signal
 //!
@@ -105,6 +129,7 @@
 //! than pulling a parser into the binary.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -138,17 +163,30 @@ const RUNTIME_ASSET: &str = "runtime";
 /// renamed the source tree aside and deleted it.
 const STAMP: &str = ".runai-build";
 
-/// The ownership marker. Written into `<out>.tmp` **immediately after the directory is
-/// created and before any route content**, so its presence means "this scratch
-/// directory is ours" and it is what licenses deleting a leftover one.
+/// The ownership marker **and** the liveness lock, one file doing both jobs.
 ///
-/// It is deliberately a second file rather than the same fact as [`STAMP`]. A build
-/// killed mid-flight (Ctrl-C, OOM, power loss) leaves the marker and no completeness
-/// stamp; treating that leftover as foreign wedged every later build with "rename it
-/// and build again" — advice about a directory this tool created and abandoned. The
-/// two facts license two different actions: the marker licenses *deleting* scratch,
-/// the stamp licenses *publishing over* `<out>`.
+/// Created and exclusively locked **immediately after the scratch directory is created
+/// and before any route content**, so:
+///
+/// - its presence means "this scratch directory is ours" and licenses removing a
+///   leftover one;
+/// - holding the lock means "a build is using this directory right now", so a concurrent
+///   build's sweep leaves it alone. The OS releases the lock when the process dies, so a
+///   killed build's tree is immediately sweepable while a live peer's is not.
+///
+/// The second half is why this is a lock and not just a marker: a concurrent build's
+/// scratch carries the same marker, so a marker alone let round 3's `build & build` turn
+/// into one build deleting the other's live scratch.
+///
+/// It is deliberately not the same file as [`STAMP`]: the stamp is written last and
+/// licenses *publishing over* `<out>`, while this is written first and licenses
+/// *deleting* scratch. It is removed from the published tree, so `<out>` never carries it.
 const OWNER: &str = ".runai-scratch";
+
+/// The suffix appended to `<out>` for a scratch directory's final component. Scratch
+/// is `<out>.tmp.<pid>.<n>`: unique per build, so two concurrent builds never share
+/// it, and no other process can be writing to the same tree.
+const SCRATCH_SUFFIX: &str = "tmp";
 
 /// The scratch directory inside the temporary tree. It is removed before publish,
 /// so a route whose first segment is this name would be written and then deleted:
@@ -244,6 +282,20 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
+    // Publishing is a sequence of renames on names derived from `<out>`, so exactly one
+    // build may run at a time per `<out>`. The lock is an OS file lock: the kernel
+    // releases it when the process dies, so a killed build cannot wedge the next one.
+    // Concurrent builds therefore queue instead of interleaving, and each publishes a
+    // complete tree; the scratch *names* are still unique per build, which is what lets
+    // two builds assemble at the same time without sharing a directory.
+    let _lock = match lock_build(&out) {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
+
     // Before anything else: a crash between `publish`'s two renames leaves the good
     // tree in `<out>.old` and `<out>` absent, so put it back. See [`recover`].
     if let Err(message) = recover(&out) {
@@ -251,13 +303,13 @@ pub fn run(args: &[String]) -> i32 {
         return 1;
     }
 
-    // `<out>.tmp` is the scratch path this build owns — but the name is derived from
-    // `--out`, so a pre-existing `dist.tmp` is somebody's directory. A build that
-    // deleted it destroyed `dist.tmp/src/main.rs` and exited 0. Only a stamped tree
-    // (a previous build's scratch) may be replaced.
-    if let Err(message) = refuse_scratch(&out) {
+    // Scratch is unique per build (`<out>.tmp.<pid>.<n>`), so nothing can be in this
+    // build's way. Leftovers are swept here rather than refused: only those carrying
+    // the ownership marker are ours, and an unrecognised directory is ignored — a name
+    // this tool generates is not proof that its contents belong to this tool.
+    if let Err(message) = sweep_scratch(&out) {
         eprintln!("error: {message}");
-        return 2;
+        return 1;
     }
 
     // Phase one: find, read, and analyze every route. Nothing is written yet, so a
@@ -386,44 +438,173 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Refuse `<out>.tmp` unless it is scratch this tool left behind.
+/// Sweep leftover scratch directories beside `<out>`.
 ///
-/// The name is derived from `--out`, not proof of ownership: a pre-existing
-/// `dist.tmp` is somebody's directory, and the build used to delete it with its
-/// contents and exit 0. A scratch tree this build wrote carries [`OWNER`], written
-/// before any route content, so only that may be removed. The completeness stamp
-/// [`STAMP`] is irrelevant here: a run killed before it was written is still ours, and
-/// [`assemble`] deletes and rebuilds it. Exit `2`, because the invocation must change.
-fn refuse_scratch(out: &Path) -> Result<(), String> {
-    let tmp = sibling(out, "tmp");
-    if !tmp.exists() || is_scratch(&tmp) {
-        return Ok(());
+/// A scratch directory is named `<out>.tmp.<pid>.<n>`, unique per build, so a leftover
+/// can never be in the way of this one — which is why an unrecognised one is
+/// **ignored** rather than refused. Whether it may be deleted is a separate question,
+/// and contents are the only evidence available:
+///
+/// - named like our scratch, carrying [`OWNER`], and **not locked** — a killed build of
+///   ours: remove;
+/// - named like our scratch, carrying [`OWNER`], and **locked** — a build running right
+///   now (possibly a concurrent one in this very process): leave it alone. Sweeping a
+///   peer's live scratch is precisely how round 3 made `build & build` delete each
+///   other's tree;
+/// - named like our scratch with no marker — nothing says it is ours: leave it. A
+///   directory killed between `mkdir` and the marker write is indistinguishable from
+///   somebody else's, and refusing the build over a name this tool generates was what
+///   wedged every build after one interrupted one, first in round 2 and again in round
+///   3. It is harmless: it cannot block a build;
+/// - the previous release's fixed `<out>.tmp` — remove when it is empty (nothing to
+///   lose; a failed marker write leaves exactly that) or marked and unlocked; otherwise
+///   leave it;
+/// - anything else — not named like scratch at all: untouched.
+///
+/// The only failure is an unreadable directory, because a later build would then be
+/// building beside garbage while claiming success.
+fn sweep_scratch(out: &Path) -> Result<(), String> {
+    let parent = match out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => parent,
+        None => Path::new("."),
+    };
+    let prefix = scratch_prefix(out);
+
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        // A fresh nested `--out` (`build/dist`) has no parent yet, so there is nothing
+        // to sweep; `Scratch::create` creates the directory.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", parent.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", parent.display()))?;
+        let Some(kind) = scratch_kind(&entry.file_name().to_string_lossy(), &prefix) else {
+            continue;
+        };
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        // Only a marked directory whose owner is gone is certainly ours. The previous
+        // scheme's fixed name is additionally safe to remove when empty, because an
+        // empty directory holds nothing that could belong to someone else — and a
+        // failed marker write leaves exactly that.
+        let removable = match kind {
+            ScratchKind::Legacy => is_empty(&path)? || (is_owned(&path) && is_abandoned(&path)?),
+            ScratchKind::Unique => is_owned(&path) && is_abandoned(&path)?,
+        };
+        if !removable {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            // A peer removed it between the check and the removal.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot clear the leftover scratch directory {}: {error}",
+                    path.display()
+                ));
+            }
+        }
     }
-    Err(format!(
-        "`{}` already exists and does not look like a previous build's scratch space \
-         (no `{OWNER}`): refusing to delete it. Rename it and build again.",
-        tmp.display()
-    ))
+
+    Ok(())
 }
 
-/// Whether `dir` is scratch this build created.
+/// The final-component prefix of a scratch directory beside `out`: `dist` → `dist.tmp`,
+/// so a scratch tree is `dist.tmp.<pid>.<n>` and the previous release's was `dist.tmp`.
+fn scratch_prefix(out: &Path) -> String {
+    sibling(out, SCRATCH_SUFFIX)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("out.{SCRATCH_SUFFIX}"))
+}
+
+/// Which scheme a sibling directory's name belongs to, or `None` when it is not a
+/// scratch name at all.
 ///
-/// The ownership marker is written first and the completeness stamp last, so both
-/// together cover every point a run can be killed: the marker alone is an interrupted
-/// build, and a tree carrying the completeness stamp is one that got further. Either
-/// is ours; a directory with neither is somebody else's.
-fn is_scratch(dir: &Path) -> bool {
-    is_owned(dir) || is_stamped(dir)
+/// `<out>.tmp` is the previous release's fixed scratch name. `<out>.tmp.<numbers>` is
+/// this release's. A name with any other suffix (`dist.tmp.keep`) is not ours: naming a
+/// directory after scratch is not evidence that it is scratch.
+fn scratch_kind(name: &str, prefix: &str) -> Option<ScratchKind> {
+    if name == prefix {
+        return Some(ScratchKind::Legacy);
+    }
+    let suffix = name.strip_prefix(prefix)?.strip_prefix('.')?;
+    if suffix.is_empty() || !suffix.split('.').all(|part| part.parse::<u64>().is_ok()) {
+        return None;
+    }
+    Some(ScratchKind::Unique)
+}
+
+/// The two scratch naming schemes, which differ in when an unmarked directory may be
+/// removed. See [`sweep_scratch`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScratchKind {
+    /// `<out>.tmp`: one shared name, used by every build before this release.
+    Legacy,
+    /// `<out>.tmp.<pid>.<n>`: unique per build.
+    Unique,
 }
 
 /// Whether `dir` carries the ownership marker — the sign that this build created it.
+///
+/// A **non-empty** [`OWNER`] is the marker: the build locks the file first and only then
+/// writes into it, so an empty file is a directory still being created, not one that may
+/// be swept. Without that distinction a concurrent sweep could see a freshly created
+/// directory in the instant before its lock was taken and delete a live build's tree. An
+/// empty marker left by a build killed in that instant is ignored forever rather than
+/// guessed at — harmless, because scratch names are unique and it cannot block a build.
 fn is_owned(dir: &Path) -> bool {
-    dir.join(OWNER).is_file()
+    dir.join(OWNER)
+        .metadata()
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Whether the scratch tree at `dir` is abandoned: no build holds its [`OWNER`] lock.
+///
+/// A build holds the lock for its whole lifetime, so "the lock is free" means the build
+/// that created the tree is gone and the directory may be swept. A tree from before the
+/// lock existed has no marker file at all, which [`is_owned`] already excludes.
+///
+/// `try_lock` is granted to exactly one handle system-wide, including a second handle in
+/// the same process, which is what lets two concurrent builds in one process see each
+/// other. The probe handle is dropped immediately; the lock belongs to the owning build.
+fn is_abandoned(dir: &Path) -> Result<bool, String> {
+    let marker = dir.join(OWNER);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&marker)
+        .map_err(|error| format!("cannot read {}: {error}", marker.display()))?;
+    match file.try_lock() {
+        // We got it, so nobody else holds it: the tree is abandoned. Dropping `file`
+        // releases it again, which is required — the sweep is about to delete it.
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Whether `dir` carries the build stamp.
 fn is_stamped(dir: &Path) -> bool {
     dir.join(STAMP).is_file()
+}
+
+/// Whether `dir` has no entries.
+///
+/// An unreadable directory is a failure rather than a guess: assuming it is empty
+/// would delete something nobody could inspect.
+fn is_empty(dir: &Path) -> Result<bool, String> {
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    Ok(entries.next().is_none())
 }
 
 /// The first `*.tsx` file under `dir`, recursively, or `None`.
@@ -487,18 +668,6 @@ fn recover(out: &Path) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Whether `dir` has no entries. An unreadable directory is a build failure, not a
-/// reason to guess.
-fn is_empty(dir: &Path) -> Result<bool, Failure> {
-    let mut entries = std::fs::read_dir(dir).map_err(|error| {
-        Failure::Build(format!(
-            "cannot read {}: {error}; the build cannot tell whether it is empty",
-            dir.display()
-        ))
-    })?;
-    Ok(entries.next().is_none())
 }
 
 /// The error that a directory is not a previous build, for [`publish`].
@@ -666,6 +835,50 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// What a route path segment actually is on disk, so a refusal can say "file" or
+/// "directory" instead of guessing.
+///
+/// The old message always said "hidden directory", which is false for
+/// `blog/.modules.page.tsx`: that segment is a file stem, and telling an author to
+/// rename a directory that does not exist sends a repair loop in circles.
+#[derive(Clone, Copy)]
+enum Segment<'a> {
+    /// The last segment of a route path: it came from the `*.page.tsx` file name.
+    File(&'a str),
+    /// Any earlier segment: a directory containing the route.
+    Directory(&'a str),
+}
+
+impl<'a> Segment<'a> {
+    /// The segment at `index` in a `/`-split route path, where the last segment is the
+    /// file's own stem and every earlier one is a directory.
+    fn at(segments: &[&'a str], index: usize) -> Segment<'a> {
+        let name = segments[index];
+        if index + 1 == segments.len() {
+            Segment::File(name)
+        } else {
+            Segment::Directory(name)
+        }
+    }
+
+    /// The noun to use for the repair.
+    fn noun(self) -> &'static str {
+        match self {
+            Segment::File(_) => "file",
+            Segment::Directory(_) => "directory",
+        }
+    }
+}
+
+impl std::fmt::Display for Segment<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Segment::File(name) => write!(formatter, "the dot-prefixed file `{name}`"),
+            Segment::Directory(name) => write!(formatter, "the dot-prefixed directory `{name}`"),
+        }
+    }
+}
+
 /// Whether the final component of `path` begins with `prefix`.
 fn starts_with(path: &Path, prefix: char) -> bool {
     path.file_name()
@@ -706,17 +919,20 @@ fn route_name(file: &Path) -> Result<String, String> {
     // `SCRATCH` and `STAMP` are names this build owns inside its output tree. A
     // route under one would either be deleted with the scratch tree or collide with
     // the stamp, so each keeps its own message — the repair is different from the
-    // general hidden-directory rule below.
-    if let Some(segment) = without
-        .split('/')
-        .next()
-        .filter(|seg| *seg == SCRATCH || *seg == STAMP)
+    // general hidden-directory rule below. Only the *first* segment names something
+    // in the output root: `blog/.modules` is just a dot-prefixed path, and the
+    // general rule below refuses it with the reason that actually applies.
+    let segments: Vec<&str> = without.split('/').collect();
+    if let Some(first) = segments
+        .first()
+        .filter(|seg| **seg == SCRATCH || **seg == STAMP)
     {
         return Err(format!(
-            "`{}` is under `{segment}`, a name `runai build` reserves inside its output \
-             directory: the route could not be served, so it is not buildable. Rename the \
-             directory.",
-            file.display()
+            "`{}` has `{first}`, a name `runai build` reserves inside its output \
+             directory: the route could not be served, so it is not buildable. Rename \
+             the {}.",
+            file.display(),
+            Segment::at(&segments, 0).noun()
         ));
     }
 
@@ -726,12 +942,13 @@ fn route_name(file: &Path) -> Result<String, String> {
     // a path many static servers 404. `a/.b/c.page.tsx` shipped `dist/a/.b/c/index.html`
     // for the same reason: the refusal is about **any** segment of the output path, so
     // checking only the first left the identical defect one level deeper.
-    if let Some(segment) = without.split('/').find(|segment| segment.starts_with('.')) {
+    if let Some(index) = segments.iter().position(|segment| segment.starts_with('.')) {
+        let found = Segment::at(&segments, index);
         return Err(format!(
-            "`{}` is under `{segment}`, a hidden directory: its output would contain a \
-             dot-prefixed path, which many static servers refuse to serve. Rename the \
-             directory.",
-            file.display()
+            "`{}` has {found}, whose output would contain a dot-prefixed path — many \
+             static servers refuse to serve one. Rename the {}.",
+            file.display(),
+            found.noun()
         ));
     }
 
@@ -869,54 +1086,137 @@ fn emit(prepared: &Prepared) -> Result<Emitted, Vec<Diagnostic>> {
     }
 }
 
-/// Write every route into `<out>.tmp` and publish it as `<out>`.
+/// Write every route into a scratch directory and publish it as `<out>`.
 ///
-/// The temporary tree is removed on any failure, so `dist/` never exists in
-/// half-written form. `<out>` itself is only touched by [`publish`], which runs
-/// after every route has been written and every render has succeeded.
+/// The scratch tree is removed on any failure, so `dist/` never exists in
+/// half-written form. `<out>` itself is only touched by [`publish`], which runs after
+/// every route has been written and every render has succeeded.
 ///
-/// A leftover `<out>.tmp` is scratch from a crashed run — but the name is derived from
-/// the argument, so it is removed only when it carries the ownership marker that says
-/// this tool created it. [`refuse_scratch`] has already refused an unowned one with
-/// exit `2`; the check here keeps that true if the order ever changes. A leftover with
-/// the marker is this tool's own aborted run (it may or may not have reached the
-/// completeness stamp) and is deleted: refusing would wedge every build after one
-/// interrupted one.
+/// The scratch directory is [`Scratch`]: `<out>.tmp.<pid>.<n>`, unique per build, so
+/// two concurrent builds never share it. Its `Drop` removes the tree on every early
+/// return, so a normal failure leaves nothing behind.
 fn assemble(out: &Path, prepared: &[Prepared]) -> Result<(), Failure> {
-    let tmp = sibling(out, "tmp");
-    if tmp.exists() {
-        if !is_scratch(&tmp) {
-            return Err(Failure::Refused(format!(
-                "`{}` already exists and does not look like a previous build's scratch space \
-                 (no `{OWNER}`): refusing to delete it.",
-                tmp.display()
-            )));
+    let scratch = Scratch::create(out).map_err(Failure::Build)?;
+    let tmp = scratch.path();
+    assemble_into(tmp, prepared).map_err(Failure::Build)?;
+    publish(scratch, out)
+}
+
+/// A build's own scratch directory. Removed on `Drop` unless [`publish`] consumed it.
+///
+/// The name embeds the pid and a per-process counter, so two builds — concurrent
+/// threads, nested invocations, or an old leftover — never resolve to the same path.
+/// That is the whole reason ownership stops needing to be inferred from contents: no
+/// other process can even be writing here.
+struct Scratch {
+    path: PathBuf,
+    /// Held for the build's lifetime; dropped with the guard, which is what tells a
+    /// concurrent sweep that this tree is live.
+    lock: Option<std::fs::File>,
+    /// Whether `Drop` should remove `path`. Cleared by [`Scratch::consumed`], which
+    /// happens once the tree has been renamed into place.
+    armed: bool,
+}
+
+impl Scratch {
+    /// Create a fresh, empty scratch directory beside `out`, marked and locked.
+    ///
+    /// [`OWNER`] is written and locked before any route content, so a build killed at
+    /// any later point leaves a directory the next build's [`sweep_scratch`] can
+    /// identify as ours and as abandoned.
+    fn create(out: &Path) -> Result<Scratch, String> {
+        let parent = match out.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => parent.to_path_buf(),
+            None => PathBuf::from("."),
+        };
+        std::fs::create_dir_all(&parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+
+        let prefix = scratch_prefix(out);
+
+        // A counter rather than trusting the pid alone: two threads in one process
+        // share the pid, and concurrency in one process is exactly the case that broke.
+        for attempt in 0..1024u32 {
+            let name = format!("{prefix}.{}.{attempt}", std::process::id());
+            let path = parent.join(name);
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    // Lock first, then write the marker: a sweep treats a non-empty
+                    // marker as owned, so publishing that sign only after the lock is
+                    // held means no peer can see "marked and unlocked" on a live tree.
+                    let marker = path.join(OWNER);
+                    let owned = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&marker)
+                        .and_then(|mut file| {
+                            file.lock()?;
+                            file.write_all(
+                                format!("runai {} build\n", runai_compiler::VERSION).as_bytes(),
+                            )?;
+                            file.flush()?;
+                            Ok(file)
+                        });
+                    let lock = match owned {
+                        Ok(lock) => lock,
+                        Err(error) => {
+                            let _ = std::fs::remove_dir_all(&path);
+                            return Err(format!(
+                                "cannot mark the scratch directory {}: {error}",
+                                path.display()
+                            ));
+                        }
+                    };
+                    return Ok(Scratch {
+                        path,
+                        lock: Some(lock),
+                        armed: true,
+                    });
+                }
+                // Another build already took this name: try the next counter.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create the scratch directory {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
         }
-        std::fs::remove_dir_all(&tmp)
-            .map_err(|error| Failure::Build(format!("cannot clear {}: {error}", tmp.display())))?;
-    }
-    if let Some(parent) = tmp.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            Failure::Build(format!("cannot create {}: {error}", parent.display()))
-        })?;
-    }
-    std::fs::create_dir_all(&tmp)
-        .map_err(|error| Failure::Build(format!("cannot create {}: {error}", tmp.display())))?;
 
-    // The ownership marker goes in before anything else is written, so a build killed
-    // at any later point leaves scratch this tool can identify and replace. Written
-    // last instead, a crashed build left a directory nobody could claim.
-    write_file(
-        &tmp.join(OWNER),
-        &format!("runai {} build\n", runai_compiler::VERSION),
-    )
-    .map_err(Failure::Build)?;
+        Err(format!(
+            "cannot find a free scratch name for {}: tried {prefix}.<pid>.0..1023",
+            out.display()
+        ))
+    }
 
-    match assemble_into(&tmp, prepared) {
-        Ok(()) => publish(&tmp, out),
-        Err(message) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            Err(Failure::Build(message))
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Disarm the guard: the tree has been renamed into place, so there is nothing to
+    /// remove. The lock file is scratch bookkeeping and is cleared before publishing —
+    /// see [`assemble_into`] — so it never reaches `<out>`.
+    fn consumed(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Release the lock before removing: on Linux removing a directory does not
+        // require the open handle to be closed, but a peer's `is_abandoned` probe must
+        // see the tree as deletable rather than as a live build.
+        self.lock.take();
+        // Best effort: this runs on a failure path that is already reporting an error,
+        // and a leftover directory carrying `OWNER` is swept by the next build.
+        if self.path.exists() {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }
@@ -1042,9 +1342,12 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
     )?;
 
     // The ownership marker has done its job and is not part of the site: the published
-    // tree carries the completeness stamp only. Removed *after* the stamp is written,
-    // so a crash in this window leaves a tree that is still recognisably ours either
-    // way; removed before it would reopen the unclaimed-leftover window.
+    // tree carries the completeness stamp only. It is unlinked *after* the stamp is
+    // written, so a crash in this window leaves a tree that is still recognisably ours
+    // either way; removed before it would reopen the unclaimed-leftover window. The
+    // lock handle outlives the unlink (it is held until `Scratch` drops), and an open
+    // but unlinked marker is invisible to [`sweep_scratch`], which only looks at names
+    // on disk.
     let owner = tmp.join(OWNER);
     if owner.exists() {
         std::fs::remove_file(&owner)
@@ -1198,26 +1501,103 @@ fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
     u32::from_str_radix(&hex, 16).ok()
 }
 
-/// Publish a complete `tmp` tree as `out`, keeping the previous `out` on failure.
+/// The build lock's path for `out`: a file in the system temp directory keyed by the
+/// resolved output path.
+///
+/// It is deliberately **not** beside `<out>`: a lock file next to the artifact would be
+/// written into the user's project on every build, and deleting it is not an option —
+/// unlinking a lock file another process is blocked on splits the lock into two. Keying
+/// by the resolved output path keeps two builds of the same `--out` in one lock while a
+/// build of a different `--out` proceeds independently, and leaves the project clean.
+///
+/// The key is `DefaultHasher` over the resolved path. Two builds of this binary agree on
+/// it, which is all locking requires; a hash change between releases would only mean
+/// two different releases do not queue with each other.
+fn build_lock_path(out: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+
+    // Key on the resolved *parent* plus the final name, so `dist` and `./dist` are one
+    // lock (`dist` need not exist yet) while `dist` and `other` are two. Canonicalizing
+    // `<out>` itself would fail before the first build and key every output of a fresh
+    // project to the same lock, serializing builds that share nothing.
+    let name = out
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| out.to_string_lossy().into_owned());
+    let parent = match out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => nearest_existing(parent)
+            .and_then(|existing| existing.canonicalize().ok())
+            .unwrap_or_else(|| parent.to_path_buf()),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    parent.to_string_lossy().hash(&mut hasher);
+    name.hash(&mut hasher);
+    std::env::temp_dir().join(format!("runai-build-{:016x}.lock", hasher.finish()))
+}
+
+/// Hold the build lock for the lifetime of the returned guard.
+///
+/// Blocks until any other build of the same `<out>` finishes. The kernel releases the
+/// lock when the process ends, so a killed build does not wedge the next one; there is
+/// no stale-lock/heal logic because there is nothing to go stale.
+fn lock_build(out: &Path) -> Result<std::fs::File, String> {
+    let path = build_lock_path(out);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("cannot open the build lock {}: {error}", path.display()))?;
+    file.lock()
+        .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
+    Ok(file)
+}
+
+/// Publish a complete `scratch` tree as `out`, keeping the previous `out` on failure.
 ///
 /// On Linux `rename(tmp, out)` fails when `out` is a non-empty directory, so `out`
 /// is moved aside first. If the second rename fails the old tree is moved back, so
 /// the failure mode is "the previous build is still there", never "no dist at all".
 ///
-/// `out` is replaced only when it carries [`STAMP`]. The name of a directory is not
-/// proof that this tool built it: without this gate `runai build --out src` moved the
-/// source tree aside and deleted it. An unstamped `out` is refused with nothing
-/// written and nothing deleted.
-fn publish(tmp: &Path, out: &Path) -> Result<(), Failure> {
+/// Two gates run before anything is removed. First, the tree about to be installed
+/// must itself carry [`STAMP`]: that is a structural check of the artifact, not trust
+/// that [`assemble_into`] happened to write it last, so a future code path that
+/// returns early cannot publish an incomplete tree. Second, `out` is replaced only
+/// when it carries [`STAMP`] too — the name of a directory is not proof that this tool
+/// built it: without this gate `runai build --out src` moved the source tree aside and
+/// deleted it. An unstamped `out` is refused with nothing written and nothing deleted.
+///
+/// `scratch` is consumed: on success its tree has been renamed into place, and on any
+/// failure its `Drop` removes it.
+///
+/// Every step here assumes it is the only build touching these names, which
+/// [`lock_build`] guarantees: the whole run holds the per-`<out>` lock. Without it, two
+/// builds could interleave the renames and one could see a `.old` that the other had
+/// just created but not yet stamped.
+fn publish(scratch: Scratch, out: &Path) -> Result<(), Failure> {
+    let tmp = scratch.path().to_path_buf();
     let backup = sibling(out, "old");
+
+    // The tree being installed must be a complete build. This is the same fact that
+    // licenses replacing `<out>`, checked on the incoming side: a build that skipped
+    // the stamp would otherwise install a tree the next build refuses to replace.
+    if !is_stamped(&tmp) {
+        return Err(Failure::Build(format!(
+            "the assembled tree at {} does not carry `{STAMP}`, so it is not a complete \
+             build: refusing to publish it. Nothing was written or deleted.",
+            tmp.display()
+        )));
+    }
 
     // The stamp gate comes first so a refusal happens before anything is removed.
     // An *empty* unstamped directory is allowed: there is no content to destroy, and
     // `mkdir dist && runai build` is a normal CI shape. Anything with content and no
     // stamp is not a build and is refused.
     let had_previous = out.exists();
-    if had_previous && !out.join(STAMP).is_file() && !is_empty(out)? {
-        let _ = std::fs::remove_dir_all(tmp);
+    if had_previous && !out.join(STAMP).is_file() && !is_empty(out).map_err(Failure::Build)? {
         return Err(Failure::Refused(not_a_build(out)));
     }
 
@@ -1226,7 +1606,6 @@ fn publish(tmp: &Path, out: &Path) -> Result<(), Failure> {
     // destroying a directory it cannot identify.
     if backup.exists() {
         if !backup.join(STAMP).is_file() {
-            let _ = std::fs::remove_dir_all(tmp);
             return Err(Failure::Build(format!(
                 "{} exists but is not a previous build (no `{STAMP}`), so it will not be \
                  removed. Rename it and build again.",
@@ -1240,7 +1619,6 @@ fn publish(tmp: &Path, out: &Path) -> Result<(), Failure> {
 
     if had_previous {
         std::fs::rename(out, &backup).map_err(|error| {
-            let _ = std::fs::remove_dir_all(tmp);
             Failure::Build(format!(
                 "cannot move the previous `{}` aside ({error}); it was left untouched",
                 out.display()
@@ -1248,18 +1626,20 @@ fn publish(tmp: &Path, out: &Path) -> Result<(), Failure> {
         })?;
     }
 
-    if let Err(error) = std::fs::rename(tmp, out) {
+    if let Err(error) = std::fs::rename(&tmp, out) {
         if had_previous {
             // Best effort: the error below is the one worth reporting, but the old
             // tree must go back if it can.
             let _ = std::fs::rename(&backup, out);
         }
-        let _ = std::fs::remove_dir_all(tmp);
         return Err(Failure::Build(format!(
             "cannot publish {}: {error}",
             out.display()
         )));
     }
+
+    // The tree is live under its final name; nothing is left for `Drop` to do.
+    scratch.consumed();
 
     if had_previous {
         // The new tree is live; a stale backup is untidy, not a reason to fail a
@@ -1349,7 +1729,7 @@ mod tests {
         ] {
             let error = route_name(Path::new(path));
             assert!(
-                matches!(&error, Err(message) if message.contains("hidden directory")),
+                matches!(&error, Err(message) if message.contains("dot-prefixed")),
                 "{path}: {error:?}"
             );
         }
@@ -1358,8 +1738,30 @@ mod tests {
         // build `dist/blog/.modules/index.html`, which many static servers 404.
         let error = route_name(Path::new("src/routes/blog/.modules.page.tsx"));
         assert!(
-            matches!(&error, Err(message) if message.contains("hidden directory")),
+            matches!(&error, Err(message) if message.contains("dot-prefixed")),
             "{error:?}"
+        );
+    }
+
+    // D: the message must name what the offending segment actually is. `blog/.modules`
+    // is a *file stem*, so the old "rename the directory" advice pointed at something
+    // that does not exist and sent the repair loop in circles.
+    #[test]
+    fn a_refusal_names_a_file_stem_or_a_directory_as_found() {
+        let stem = route_name(Path::new("src/routes/blog/.modules.page.tsx")).unwrap_err();
+        assert!(stem.contains("dot-prefixed file `.modules`"), "{stem}");
+        assert!(stem.ends_with("Rename the file."), "{stem}");
+
+        let dir = route_name(Path::new("src/routes/a/.b/c.page.tsx")).unwrap_err();
+        assert!(dir.contains("dot-prefixed directory `.b`"), "{dir}");
+        assert!(dir.ends_with("Rename the directory."), "{dir}");
+
+        // The reserved-name refusal follows the same rule: `.modules/x` is a directory,
+        // `.runai-build` alone is the file stem the route would be named after.
+        let reserved_dir = route_name(Path::new("src/routes/.modules/x.page.tsx")).unwrap_err();
+        assert!(
+            reserved_dir.ends_with("Rename the directory."),
+            "{reserved_dir}"
         );
     }
 
@@ -1370,7 +1772,7 @@ mod tests {
     fn a_dot_segment_below_the_first_is_refused() {
         let error = route_name(Path::new("src/routes/a/.b/c.page.tsx"));
         assert!(
-            matches!(&error, Err(message) if message.contains(".b") && message.contains("hidden directory")),
+            matches!(&error, Err(message) if message.contains(".b") && message.contains("dot-prefixed")),
             "{error:?}"
         );
         // A normal nested route is unaffected: no segment begins with a dot.
@@ -1384,6 +1786,193 @@ mod tests {
     #[test]
     fn a_dot_segment_anywhere_is_refused() {
         assert!(route_name(Path::new("src/routes/blog/../x.page.tsx")).is_err());
+    }
+
+    // E: `publish` checks the incoming tree, not the fact that `assemble_into` was the
+    // one who wrote it. A scratch tree without the completeness stamp is refused, so a
+    // future early return in the assembler cannot install a half-built site.
+    #[test]
+    fn publish_refuses_a_tree_that_does_not_carry_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let scratch = Scratch::create(&out).unwrap();
+        std::fs::write(scratch.path().join("index.html"), "half a site\n").unwrap();
+
+        let error = match publish(scratch, &out) {
+            Ok(()) => panic!("an unstamped tree must not be published"),
+            Err(error) => error,
+        };
+        let Failure::Build(message) = error else {
+            panic!("an unstamped tree is a build failure, not a refusal");
+        };
+        assert!(message.contains(STAMP), "{message}");
+        assert!(!out.exists(), "nothing was published");
+
+        // The guard cleaned up after itself, and the (empty) `<out>` was not created.
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.is_empty(), "leftovers: {left:?}");
+    }
+
+    // `<out>.tmp.<pid>.<n>` must differ per build even within one process: the pid is
+    // shared by concurrent threads, which is exactly the case that broke.
+    #[test]
+    fn scratch_names_are_unique_within_one_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let first = Scratch::create(&out).unwrap();
+        let second = Scratch::create(&out).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().join(OWNER).is_file());
+        assert!(second.path().join(OWNER).is_file());
+    }
+
+    // The marker is written only after the lock is held, so a non-empty marker means a
+    // lock is in place. An EMPTY marker is a directory mid-creation, and a sweep must not
+    // treat it as ours: that instant is a live build. It is ignored instead — never
+    // refused, because it cannot block a build.
+    #[test]
+    fn an_empty_marker_is_not_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let creating = dir.path().join("dist.tmp.1.0");
+        std::fs::create_dir_all(&creating).unwrap();
+        std::fs::write(creating.join(OWNER), "").unwrap();
+        std::fs::write(creating.join("index.html"), "half\n").unwrap();
+
+        sweep_scratch(&out).unwrap();
+
+        assert!(
+            creating.join("index.html").is_file(),
+            "a directory whose marker is still empty is being created, not abandoned"
+        );
+    }
+
+    // A leftover carrying `OWNER` but left unlocked is abandoned: its build is gone,
+    // so it is swept. An unmarked one is ignored, never refused, because refusing over
+    // a name this tool generates is the wedge. The locked case is
+    // `a_live_builds_scratch_is_not_swept` in the integration tests, where a real
+    // process-level lock is the point.
+    #[test]
+    fn sweep_removes_an_abandoned_marked_scratch_and_ignores_an_unmarked_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let marked = dir.path().join("dist.tmp.1.0");
+        let unmarked = dir.path().join("dist.tmp.2.0");
+        std::fs::create_dir_all(&marked).unwrap();
+        std::fs::write(marked.join(OWNER), "runai 0.1.0 build\n").unwrap();
+        std::fs::create_dir_all(&unmarked).unwrap();
+        std::fs::write(unmarked.join("keep.txt"), "mine\n").unwrap();
+
+        sweep_scratch(&out).unwrap();
+
+        assert!(
+            !marked.exists(),
+            "a marked, unlocked leftover is abandoned and is removed"
+        );
+        assert!(
+            unmarked.join("keep.txt").is_file(),
+            "an unmarked leftover is not ours and is not"
+        );
+    }
+
+    // The previous release used one fixed `dist.tmp`; a failed marker write left it
+    // EMPTY, and round 3 wedged forever on exactly that. Empty is removable.
+    #[test]
+    fn sweep_removes_an_empty_legacy_scratch_and_keeps_a_full_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        let empty = dir.path().join("dist.tmp");
+        std::fs::create_dir(&empty).unwrap();
+        sweep_scratch(&out).unwrap();
+        assert!(!empty.exists());
+
+        let full = dir.path().join("dist.tmp");
+        std::fs::create_dir_all(full.join("keep")).unwrap();
+        std::fs::write(full.join("keep/notes.md"), "mine\n").unwrap();
+        sweep_scratch(&out).unwrap();
+        assert!(full.join("keep/notes.md").is_file());
+    }
+
+    // The lock is what makes the publish sequence single-writer. Two handles on the
+    // same output must not both hold it, and it lives outside the tree being published.
+    #[test]
+    fn the_build_lock_admits_one_holder_and_lives_outside_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+
+        let first = lock_build(&out).unwrap();
+        let path = build_lock_path(&out);
+        assert!(
+            !path.starts_with(dir.path()),
+            "the lock must not be written into the project: {}",
+            path.display()
+        );
+        assert_ne!(
+            build_lock_path(&dir.path().join("other")),
+            path,
+            "different outputs must not share a lock"
+        );
+
+        // A second handle must not acquire it while the first is held.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            probe.try_lock().is_err(),
+            "a second handle must not hold the lock"
+        );
+
+        drop(first);
+        assert!(
+            probe.try_lock().is_ok(),
+            "the lock is released when its holder is dropped"
+        );
+    }
+
+    // A killed build holds the lock no longer than the process lives — the kernel
+    // releases it — so the next build must not wedge. A pid file would have failed
+    // here: a stale pid file is indistinguishable from a live build.
+    #[test]
+    fn a_released_lock_leaves_the_next_build_free_to_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        drop(lock_build(&out).unwrap());
+        assert!(
+            lock_build(&out).is_ok(),
+            "a released lock must be reacquirable"
+        );
+    }
+
+    // `dist.tmp.keep` is somebody's directory that merely resembles ours, and
+    // `dist.tmpfile` is not a scratch name.
+    #[test]
+    fn only_generated_scratch_names_are_candidates() {
+        assert_eq!(
+            scratch_kind("dist.tmp", "dist.tmp"),
+            Some(ScratchKind::Legacy)
+        );
+        assert_eq!(
+            scratch_kind("dist.tmp.123.0", "dist.tmp"),
+            Some(ScratchKind::Unique)
+        );
+        assert_eq!(
+            scratch_kind("dist.tmp.4294967294.3", "dist.tmp"),
+            Some(ScratchKind::Unique)
+        );
+        for name in [
+            "dist.tmp.keep",
+            "dist.tmpfile",
+            "dist.old",
+            "distx.tmp.1.0",
+            "dist",
+        ] {
+            assert_eq!(scratch_kind(name, "dist.tmp"), None, "{name}");
+        }
     }
 
     // The degenerate `--out` values are usage errors before any resolution, because

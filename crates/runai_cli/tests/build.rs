@@ -358,7 +358,7 @@ fn a_hidden_route_directory_is_refused_not_silently_skipped() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains(".cache"), "{stderr}");
-    assert!(stderr.contains("hidden directory"), "{stderr}");
+    assert!(stderr.contains("dot-prefixed directory"), "{stderr}");
     assert!(!tmp.path().join("dist").exists());
 }
 
@@ -500,7 +500,7 @@ fn a_dot_segment_below_the_first_is_refused_and_a_normal_route_still_builds() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains(".b"), "{stderr}");
-    assert!(stderr.contains("hidden directory"), "{stderr}");
+    assert!(stderr.contains("dot-prefixed directory"), "{stderr}");
     assert!(!tmp.path().join("dist").exists());
 
     // The same tree without the hidden segment builds: the rule is about the segment,
@@ -570,90 +570,206 @@ fn dynamic_segment_is_ra014_not_silent_output() {
     assert!(!tmp.path().join("dist").exists());
 }
 
-// N3: `<out>.tmp` is scratch for THIS build, but its name is derived from `--out`.
-// A pre-existing `dist.tmp` that carries neither marker is somebody's directory, and
-// the old build deleted it with everything in it (exit 0). It must be refused, and it
-// must survive untouched.
+// A leftover scratch directory with content and NO marker is not ours, so it is never
+// deleted — but it is also not a reason to refuse the build: scratch names are unique
+// per build now, so an unrecognised one sits beside the build instead of blocking it.
+// Round 1 deleted such a directory (exit 0, user data gone); rounds 2 and 3 refused it
+// (exit 2 forever). Both were wrong: the build simply does not need that name.
+//
+// Both naming schemes are covered because both can be left on disk: `dist.tmp` by the
+// previous release, `dist.tmp.<pid>.<n>` by this one when a run dies before the marker.
 #[test]
-fn a_preexisting_unstamped_scratch_directory_is_refused_and_left_intact() {
+fn an_unmarked_scratch_directory_is_left_alone_and_the_build_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     write_app(tmp.path(), &static_route("hi"));
-    std::fs::create_dir_all(tmp.path().join("dist.tmp/src")).unwrap();
-    std::fs::write(tmp.path().join("dist.tmp/src/main.rs"), "fn main() {}\n").unwrap();
-    std::fs::write(tmp.path().join("dist.tmp/IMPORTANT.txt"), "keep me\n").unwrap();
+    for name in ["dist.tmp", "dist.tmp.4294967294.0"] {
+        let leftover = tmp.path().join(name);
+        std::fs::create_dir_all(leftover.join("keep")).unwrap();
+        std::fs::write(leftover.join("keep/notes.md"), "mine\n").unwrap();
 
-    let out = run(&["build", "--out", "dist"], tmp.path());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("dist.tmp"), "{stderr}");
-    assert!(stderr.contains("scratch space"), "{stderr}");
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("dist.tmp/IMPORTANT.txt")).unwrap(),
-        "keep me\n"
-    );
-    assert!(tmp.path().join("dist.tmp/src/main.rs").exists());
-    assert!(!tmp.path().join("dist").exists());
+        let out = run(&["build", "--out", "dist"], tmp.path());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{name}: {stderr}");
+        assert!(tmp.path().join("dist/index.html").is_file(), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(leftover.join("keep/notes.md")).unwrap(),
+            "mine\n",
+            "{name} must survive"
+        );
+        std::fs::remove_dir_all(&leftover).unwrap();
+    }
 }
 
-// Regression from round 2: a build killed mid-flight (Ctrl-C, OOM, power loss) leaves
-// `<out>.tmp` with the ownership marker but no completeness stamp, because the stamp is
-// written last. Round 2 read that as a foreign directory and exited 2 on every later
-// build — advice about a directory this tool created. It must be deleted and rebuilt.
+// A build killed mid-flight (Ctrl-C, OOM, power loss) leaves its scratch directory with
+// the marker and no completeness stamp, because the stamp is written last. The marker
+// licenses deleting it: refusing would wedge every later build with advice about a
+// directory this tool created and abandoned.
 #[test]
-fn a_crashed_builds_scratch_is_replaced_not_refused() {
+fn a_crashed_builds_scratch_is_swept_and_rebuilt() {
     let tmp = tempfile::tempdir().unwrap();
     write_app(tmp.path(), &static_route("rebuilt"));
 
-    // The window a real crash leaves: ownership marker present, route-ish content
-    // present, `.modules/` scratch present, completeness stamp absent.
-    std::fs::create_dir_all(tmp.path().join("dist.tmp/.modules")).unwrap();
-    std::fs::create_dir_all(tmp.path().join("dist.tmp/assets")).unwrap();
-    std::fs::write(
-        tmp.path().join("dist.tmp/.runai-scratch"),
-        "runai 0.1.0 build\n",
-    )
-    .unwrap();
-    std::fs::write(tmp.path().join("dist.tmp/index.html"), "abandoned\n").unwrap();
-    std::fs::write(tmp.path().join("dist.tmp/.modules/route0.mjs"), "partial\n").unwrap();
-    std::fs::write(tmp.path().join("dist.tmp/assets/index.js"), "partial\n").unwrap();
-    assert!(!tmp.path().join("dist.tmp/.runai-build").exists());
+    // The window a real crash leaves: marker present, route-ish content present,
+    // `.modules/` scratch present, completeness stamp absent.
+    let leftover = tmp.path().join("dist.tmp.4294967294.0");
+    std::fs::create_dir_all(leftover.join(".modules")).unwrap();
+    std::fs::create_dir_all(leftover.join("assets")).unwrap();
+    std::fs::write(leftover.join(".runai-scratch"), "runai 0.1.0 build\n").unwrap();
+    std::fs::write(leftover.join("index.html"), "abandoned\n").unwrap();
+    std::fs::write(leftover.join(".modules/route0.mjs"), "partial\n").unwrap();
+    std::fs::write(leftover.join("assets/index.js"), "partial\n").unwrap();
+    assert!(!leftover.join(".runai-build").exists());
 
     let out = run(&["build", "--out", "dist"], tmp.path());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     let html = std::fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
     assert!(html.contains("<p>rebuilt</p>"), "{html}");
-    assert!(
-        !tmp.path().join("dist.tmp").exists(),
-        "scratch must be gone"
-    );
+    assert!(!leftover.exists(), "the dead build's scratch is swept");
     assert!(tmp.path().join("dist/.runai-build").is_file());
-    // The ownership marker is scratch bookkeeping, not site content.
+    // The marker is scratch bookkeeping, not site content.
     assert!(!tmp.path().join("dist/.runai-scratch").exists());
 }
 
-// The other half of the same decision table: a directory carrying neither marker is
-// still somebody else's. The build refuses it with exit 2 and does not touch it.
+// The previous release used the fixed name `<out>.tmp`. A build killed after creating it
+// but before writing the marker leaves exactly an EMPTY directory with that name; under
+// the content-sniffing scheme that wedged every later build (exit 2 forever). An empty
+// directory holds nothing to lose, so it is removed and the build runs.
 #[test]
-fn a_leftover_scratch_without_any_marker_is_refused() {
+fn an_empty_legacy_scratch_directory_does_not_wedge_the_build() {
     let tmp = tempfile::tempdir().unwrap();
-    write_app(tmp.path(), &static_route("hi"));
-    std::fs::create_dir_all(tmp.path().join("dist.tmp/keep")).unwrap();
-    std::fs::write(tmp.path().join("dist.tmp/keep/notes.md"), "mine\n").unwrap();
+    write_app(tmp.path(), &static_route("built"));
+    std::fs::create_dir(tmp.path().join("dist.tmp")).unwrap();
 
     let out = run(&["build", "--out", "dist"], tmp.path());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("dist.tmp"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(tmp.path().join("dist/index.html").is_file());
     assert!(
-        stderr.contains("Rename it"),
-        "the message must name the directory to rename: {stderr}"
+        !tmp.path().join("dist.tmp").exists(),
+        "the empty leftover is swept"
     );
+}
+
+// A live build's scratch carries the same marker, so a marker alone cannot authorize
+// deletion: a concurrent build's sweep would delete the peer's tree mid-run, which is
+// the round-3 defect moved one level up. The marker is a lock, so a sweep must leave a
+// locked tree alone.
+#[test]
+fn a_live_builds_scratch_is_not_swept() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("hi"));
+
+    // Stand in for a concurrent build: a marked, locked scratch directory.
+    let live = tmp.path().join("dist.tmp.4294967294.0");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join(".runai-scratch"), "runai 0.1.0 build\n").unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(live.join(".runai-scratch"))
+        .unwrap();
+    held.lock().unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(live.is_dir(), "a locked scratch tree must not be swept");
+
+    // Once the owner lets go, the tree is abandoned and the next build sweeps it.
+    drop(held);
+    let again = run(&["build", "--out", "dist"], tmp.path());
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("dist.tmp/keep/notes.md")).unwrap(),
-        "mine\n"
+        again.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
     );
-    assert!(!tmp.path().join("dist").exists());
+    assert!(!live.exists(), "an abandoned scratch tree is swept");
+}
+
+// The test that motivates the whole redesign: `build & build` used to end with one
+// success and one `cannot resolve dist.tmp: No such file or directory`, because both
+// shared one scratch directory. With a scratch name per build they cannot touch each
+// other, and every build publishes a complete tree.
+//
+// A barrier makes the builds collide on purpose: with plain startup jitter they
+// stagger, and the old defect does not reproduce reliably.
+#[test]
+fn concurrent_builds_all_succeed_and_leave_one_complete_dist() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("home"));
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src/routes/blog")).unwrap();
+    std::fs::write(
+        root.join("src/routes/about.page.tsx"),
+        static_route("about"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/routes/blog/index.page.tsx"),
+        static_route("blog"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/routes/blog/post.page.tsx"),
+        static_route("post"),
+    )
+    .unwrap();
+
+    const BUILDS: usize = 4;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(BUILDS));
+    let handles: Vec<_> = (0..BUILDS)
+        .map(|_| {
+            let dir = root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                run(&["build", "--out", "dist"], &dir)
+            })
+        })
+        .collect();
+    let results: Vec<Output> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "build {index}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    // Whichever published last, the tree is one complete build.
+    assert_eq!(
+        tree(&root.join("dist")),
+        vec![
+            ".runai-build",
+            "about/index.html",
+            "blog/index.html",
+            "blog/post/index.html",
+            "index.html",
+        ]
+    );
+    for (page, text) in [
+        ("about/index.html", "about"),
+        ("blog/index.html", "blog"),
+        ("blog/post/index.html", "post"),
+        ("index.html", "home"),
+    ] {
+        let html = std::fs::read_to_string(root.join("dist").join(page)).unwrap();
+        assert!(html.contains(&format!("<p>{text}</p>")), "{page}: {html}");
+    }
+
+    // No build left scratch or a backup behind.
+    let left: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "dist" && name.starts_with("dist"))
+        .collect();
+    assert!(left.is_empty(), "leftovers: {left:?}");
 }
 
 // N2: a static route ships no asset, so a static route named `runtime` collides with
