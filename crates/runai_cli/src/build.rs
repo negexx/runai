@@ -16,9 +16,32 @@
 //!
 //! `index` is the root: `index.page.tsx` → `dist/index.html` and (island)
 //! `dist/assets/index.js`. A file or directory whose name begins with `_` is a
-//! component module, not a route, and is skipped. A `[param]` segment is `RA014`
-//! because this milestone has no router: silently emitting `dist/[slug]/index.html`
-//! would serve a 404 and look like a successful build.
+//! component module, not a route, and is skipped; a file whose name begins with `.`
+//! is hidden and also not a route. A `[param]` segment is `RA014` because this
+//! milestone has no router: silently emitting `dist/[slug]/index.html` would serve a
+//! 404 and look like a successful build.
+//!
+//! # Route names are unique, and `runtime` is reserved
+//!
+//! Two files can derive the same route name — `about.page.tsx` and
+//! `about/index.page.tsx` both give `about`, and `index.page.tsx` and `.page.tsx`
+//! both (before the hidden-file skip) gave the root. The build used to keep the last
+//! one silently, so the loser never shipped. [`prepare`] accumulates name → path and
+//! refuses a duplicate, naming both files. A route named `runtime` is refused for the
+//! same class of reason: its asset is `assets/runtime.js`, the exact path the runtime
+//! copy is written to, so the copy would overwrite the page's module. And a route
+//! under `.modules` is refused because that is the scratch directory: its output
+//! would be deleted before publishing.
+//!
+//! # `<out>` is only replaced when it is a previous build
+//!
+//! The name of a directory is not proof that this tool created it. `publish` writes a
+//! stamp (`.runai-build`) into every tree it publishes and replaces `<out>` only when
+//! it carries that stamp; an unstamped `<out>` is refused with exit `2`, nothing
+//! written and nothing deleted. Without that gate `runai build --out src` moved the
+//! source tree aside and deleted it. `--out` itself is also checked at parse time:
+//! empty, `.`, `..`, and any directory holding a `*.tsx` the build did not write are
+//! usage errors.
 //!
 //! # The exit status of the child is not a failure signal
 //!
@@ -42,6 +65,11 @@
 //! the previous `dist/` intact instead of destroying it. A build that fails before
 //! publishing removes `<out>.tmp` and never touches `<out>`.
 //!
+//! A crash between those two renames would leave `<out>` absent and the good tree in
+//! `<out>.old`, so [`recover`] runs before anything else: if `<out>` is absent and
+//! `<out>.old` carries the stamp, it is renamed back. If both exist, the stale `.old`
+//! is dropped.
+//!
 //! # `runai.json` is required only when there is an island
 //!
 //! A tree of static routes ships no runtime, so it does not need a config: the
@@ -57,6 +85,7 @@
 //! [`runtime_value`] reads that one string with a small escape-aware scanner rather
 //! than pulling a parser into the binary.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -79,6 +108,21 @@ const CONFIG: &str = "runai.json";
 /// carries it. An absolute URL path, because the browser fetches it, not the build.
 const RUNTIME_URL: &str = "/assets/runtime.js";
 
+/// The asset basename the runtime is copied to. An island route may not use it:
+/// `asset_name(name) == RUNTIME_ASSET` would have the runtime copy overwrite the
+/// page's own module, and the page would load successfully and mount nothing.
+const RUNTIME_ASSET: &str = "runtime";
+
+/// The stamp [`publish`] writes into every tree it publishes and requires before it
+/// replaces one. `--out` is a name, not a proof of ownership: without a stamp,
+/// `runai build --out src` renamed the source tree aside and deleted it.
+const STAMP: &str = ".runai-build";
+
+/// The scratch directory inside the temporary tree. It is removed before publish,
+/// so a route whose first segment is this name would be written and then deleted:
+/// [`route_name`] refuses it rather than shipping a 404 that built cleanly.
+const SCRATCH: &str = ".modules";
+
 /// The document shell. `{body}` is the prerendered HTML or an empty string.
 const SHELL_HEAD: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>runai</title></head><body><div id=\"app\">";
 
@@ -92,13 +136,26 @@ struct Prepared {
     source: String,
 }
 
-/// A route with every reason it cannot be built, before anything is written.
+/// A build failure and the exit status it owes the process.
+enum Failure {
+    /// A build that got far enough to be about the app: diagnostics, a render that
+    /// threw, a missing runtime. `1`.
+    Build(String),
+    /// A refused publish: `<out>` exists but is not a previous build. `2`, because
+    /// the invocation must change — but without the usage line, since the argument
+    /// was well formed and the directory was simply not ours.
+    Refused(String),
+}
+
 #[derive(Debug)]
 enum Refusal {
     /// Diagnostics, each already paired with the source that locates it.
     Diagnostics(Vec<(String, Diagnostic)>),
     /// One message, already a complete sentence about a system-level failure.
     Message(String),
+    /// Complete sentences, each about a different route-set defect, all printed
+    /// because a repair loop that fixes one collision at a time is expensive.
+    Messages(Vec<String>),
 }
 
 /// Run `runai build …` with the arguments that follow `build`.
@@ -141,6 +198,23 @@ pub fn run(args: &[String]) -> i32 {
 
     let out = PathBuf::from(out.unwrap_or(DEFAULT_OUT));
 
+    // `--out` is a name, so it must name a directory the build may own. `""`, `.`
+    // and `..` are usage errors, and so is a directory that already holds source
+    // files the build did not write: `runai build --out src` used to publish over
+    // the sources and delete them. See [`refuse_out`].
+    if let Err(message) = refuse_out(&out) {
+        eprintln!("error: {message}");
+        eprintln!("{USAGE}");
+        return 2;
+    }
+
+    // Before anything else: a crash between `publish`'s two renames leaves the good
+    // tree in `<out>.old` and `<out>` absent, so put it back. See [`recover`].
+    if let Err(message) = recover(&out) {
+        eprintln!("error: {message}");
+        return 1;
+    }
+
     // Phase one: find, read, and analyze every route. Nothing is written yet, so a
     // refusal here cannot leave a partial tree.
     let prepared = match prepare() {
@@ -155,17 +229,154 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("error: {message}");
             return 1;
         }
+        Err(Refusal::Messages(messages)) => {
+            for message in messages {
+                eprintln!("error: {message}");
+            }
+            return 1;
+        }
     };
 
     // Phase two: emit into `<out>.tmp`, then publish. Any failure cleans the
     // temporary tree and leaves `<out>` exactly as it was.
     match assemble(&out, &prepared) {
         Ok(()) => 0,
-        Err(message) => {
+        Err(Failure::Build(message)) => {
             eprintln!("error: {message}");
             1
         }
+        Err(Failure::Refused(message)) => {
+            eprintln!("error: {message}");
+            2
+        }
     }
+}
+
+/// Refuse an `--out` value that must not be published over.
+///
+/// `""`, `.` and `..` are refused by name. An existing directory is refused when it
+/// holds any `*.tsx` file the build did not write: that is the project's own source,
+/// and `runai build --out src` used to rename it aside and delete it. Everything else
+/// is left to [`publish`]'s stamp gate, which refuses to replace a non-empty
+/// directory that is not a previous build without deleting anything. A directory that
+/// does not exist yet, or is empty, is always acceptable.
+fn refuse_out(out: &Path) -> Result<(), String> {
+    let text = out.to_string_lossy();
+    if text.is_empty() {
+        return Err("`--out` needs a directory: it was empty".to_string());
+    }
+    // Checked on the raw text before any resolution: `.` and `..` resolve to
+    // directories that exist, but the message a user needs is about the argument.
+    let last = out
+        .components()
+        .next_back()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if last == "." || last == ".." || text == "." || text == ".." {
+        return Err(format!(
+            "`--out {text}` is not a build directory: it is the working tree or its parent"
+        ));
+    }
+
+    if !out.exists() {
+        return Ok(());
+    }
+    if !out.is_dir() {
+        return Err(format!(
+            "`--out {text}` already exists and is not a directory"
+        ));
+    }
+
+    if let Some(source) = first_tsx(out)? {
+        return Err(format!(
+            "`--out {text}` holds the source file `{}`, which this build did not write. \
+             Refusing to publish over the project's own sources; pick a new directory.",
+            source.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// The first `*.tsx` file under `dir`, recursively, or `None`.
+///
+/// Every deletion site uses this. `<out>`, `<out>.tmp` and `<out>.old` are names
+/// derived from an argument, and none of them proves the directory belongs to this
+/// tool — `runai build --out src` deleted the sources. A directory holding TypeScript
+/// is somebody's project, so it is never removed without asking.
+fn first_tsx(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            if let Some(found) = first_tsx(&path)? {
+                return Ok(Some(found));
+            }
+        } else if path.to_string_lossy().ends_with(".tsx") {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Put a stranded previous build back before anything else runs.
+///
+/// [`publish`] renames `<out>` to `<out>.old` and then `<out>.tmp` to `<out>`. A
+/// crash between the two leaves a complete, working tree in `<out>.old` and no
+/// `<out>` at all. Without this, the next build (which may itself fail) would leave
+/// that tree stranded forever. If both exist, `.old` is stale — a tree this tool
+/// published carries [`STAMP`] — so it is dropped.
+///
+/// `.old` is a name derived from `--out`, not a proof of ownership either. An
+/// unstamped `.old` is left exactly as it is: it is somebody else's directory.
+fn recover(out: &Path) -> Result<(), String> {
+    let backup = sibling(out, "old");
+    if !backup.exists() {
+        return Ok(());
+    }
+
+    if backup.join(STAMP).is_file() {
+        if out.exists() {
+            // Both present: `<out>` is the live tree, the backup is stale.
+            std::fs::remove_dir_all(&backup)
+                .map_err(|error| format!("cannot clear {}: {error}", backup.display()))?;
+        } else {
+            std::fs::rename(&backup, out).map_err(|error| {
+                format!(
+                    "cannot restore the previous build at {}: {error}",
+                    backup.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether `dir` has no entries. An unreadable directory is a build failure, not a
+/// reason to guess.
+fn is_empty(dir: &Path) -> Result<bool, Failure> {
+    let mut entries = std::fs::read_dir(dir).map_err(|error| {
+        Failure::Build(format!(
+            "cannot read {}: {error}; the build cannot tell whether it is empty",
+            dir.display()
+        ))
+    })?;
+    Ok(entries.next().is_none())
+}
+
+/// The error that a directory is not a previous build, for [`publish`].
+fn not_a_build(out: &Path) -> String {
+    format!(
+        "`{}` does not look like a previous build (no `{STAMP}`): refusing to replace it. \
+         Nothing was written or deleted.",
+        out.display()
+    )
 }
 
 /// The routes under [`ROUTES`], read, analyzed, and refused for `[param]` segments.
@@ -192,7 +403,12 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
     }
 
     let mut refused: Vec<(String, Diagnostic)> = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
     let mut prepared = Vec::new();
+    // name → the source path that claimed it first. Two files can derive the same
+    // route name (`about.page.tsx` and `about/index.page.tsx` both give `about`), and
+    // the build used to keep the last one silently, so the loser never shipped.
+    let mut claimed: HashMap<String, String> = HashMap::new();
 
     for file in files {
         let display = file.to_string_lossy().replace('\\', "/");
@@ -222,6 +438,31 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
             refused.push((source.clone(), diagnostic));
         }
 
+        // Two routes, one output path: whichever is written last wins and the other
+        // silently does not ship. Name both so the author can decide which is right.
+        if let Some(first) = claimed.get(&name) {
+            messages.push(format!(
+                "`{first}` and `{display}` both map to the route `{name}`: rename one, \
+                 because only one can be served and the other would silently not ship"
+            ));
+            continue;
+        }
+        claimed.insert(name.clone(), display.clone());
+
+        // The asset path `assets/runtime.js` is reserved: it is where the runtime is
+        // copied. A route that derives it would have its own module overwritten by
+        // that copy (or, in a static-only tree, claim a path the next island build
+        // needs), and the page would load and mount nothing.
+        if asset_name(&name) == RUNTIME_ASSET {
+            messages.push(format!(
+                "`{display}` maps to the route `{name}`, whose asset path is \
+                 `assets/{RUNTIME_ASSET}.js` — reserved for the runtime copy. That copy would \
+                 overwrite this route's module, so the page would load and mount nothing. \
+                 Rename the route."
+            ));
+            continue;
+        }
+
         prepared.push(Prepared {
             display,
             name,
@@ -229,18 +470,26 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
         });
     }
 
-    if refused.is_empty() {
-        Ok(prepared)
-    } else {
-        Err(Refusal::Diagnostics(refused))
+    if !refused.is_empty() {
+        return Err(Refusal::Diagnostics(refused));
     }
+    if !messages.is_empty() {
+        return Err(Refusal::Messages(messages));
+    }
+    Ok(prepared)
 }
 
 /// Every route file under `dir`, recursively.
 ///
 /// A name beginning with `_` is a component module (`_shell.tsx`) or a support
-/// directory, never a route, so it is skipped whole. Only a `*.page.tsx` file is a
-/// route; anything else is not built.
+/// directory, never a route, so it is skipped whole. A name beginning with `.` is
+/// hidden, never a route: without that skip `.page.tsx` became the root page and
+/// shipped its contents. Only a `*.page.tsx` file is a route; anything else is not
+/// built.
+///
+/// A hidden *directory* is descended into rather than ignored, so `.modules` reaches
+/// [`route_name`]'s refusal instead of vanishing: a route directory that is silently
+/// not built is the failure this project exists to prevent.
 ///
 /// An unreadable entry is an error rather than a skip: a build that quietly omits a
 /// route it could not read is a successful-looking build of the wrong site.
@@ -256,11 +505,12 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
 
         if file_type.is_dir() {
-            if !starts_with_underscore(&path) {
+            if !starts_with(&path, '_') {
                 walk(&path, files)?;
             }
         } else if file_type.is_file()
-            && !starts_with_underscore(&path)
+            && !starts_with(&path, '_')
+            && !starts_with(&path, '.')
             && path.to_string_lossy().ends_with(".page.tsx")
         {
             files.push(path);
@@ -270,10 +520,10 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the final component of `path` begins with `_`.
-fn starts_with_underscore(path: &Path) -> bool {
+/// Whether the final component of `path` begins with `prefix`.
+fn starts_with(path: &Path, prefix: char) -> bool {
     path.file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with('_'))
+        .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
 }
 
 /// The route name for a file under [`ROUTES`].
@@ -298,6 +548,22 @@ fn route_name(file: &Path) -> Result<String, Refusal> {
         return Err(Refusal::Message(format!(
             "`{}` has a relative route segment (`{segment}`): it would escape the output \
              directory, so it is not buildable",
+            file.display()
+        )));
+    }
+
+    // `SCRATCH` and `STAMP` are names this build owns inside its output tree. A
+    // route under one would either be deleted with the scratch tree or collide with
+    // the stamp, so it is refused here — before any write, and by name.
+    if let Some(segment) = without
+        .split('/')
+        .next()
+        .filter(|seg| *seg == SCRATCH || *seg == STAMP)
+    {
+        return Err(Refusal::Message(format!(
+            "`{}` is under `{segment}`, a name `runai build` reserves inside its output \
+             directory: the route could not be served, so it is not buildable. Rename the \
+             directory.",
             file.display()
         )));
     }
@@ -441,24 +707,38 @@ fn emit(prepared: &Prepared) -> Result<Emitted, Vec<Diagnostic>> {
 /// The temporary tree is removed on any failure, so `dist/` never exists in
 /// half-written form. `<out>` itself is only touched by [`publish`], which runs
 /// after every route has been written and every render has succeeded.
-fn assemble(out: &Path, prepared: &[Prepared]) -> Result<(), String> {
+///
+/// A leftover `<out>.tmp` is scratch from a crashed run — but the name is derived
+/// from the argument, so it is removed only when it holds no `*.tsx` file. A user
+/// who happens to have a `dist.tmp` project keeps it, and the build refuses clearly
+/// instead of deleting it.
+fn assemble(out: &Path, prepared: &[Prepared]) -> Result<(), Failure> {
     let tmp = sibling(out, "tmp");
     if tmp.exists() {
+        if let Some(source) = first_tsx(&tmp).map_err(Failure::Build)? {
+            return Err(Failure::Build(format!(
+                "the scratch path {} already holds the source file `{}`; refusing to delete \
+                 it. Build into a different `--out`.",
+                tmp.display(),
+                source.display()
+            )));
+        }
         std::fs::remove_dir_all(&tmp)
-            .map_err(|error| format!("cannot clear {}: {error}", tmp.display()))?;
+            .map_err(|error| Failure::Build(format!("cannot clear {}: {error}", tmp.display())))?;
     }
     if let Some(parent) = tmp.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Failure::Build(format!("cannot create {}: {error}", parent.display()))
+        })?;
     }
     std::fs::create_dir_all(&tmp)
-        .map_err(|error| format!("cannot create {}: {error}", tmp.display()))?;
+        .map_err(|error| Failure::Build(format!("cannot create {}: {error}", tmp.display())))?;
 
     match assemble_into(&tmp, prepared) {
         Ok(()) => publish(&tmp, out),
         Err(message) => {
             let _ = std::fs::remove_dir_all(&tmp);
-            Err(message)
+            Err(Failure::Build(message))
         }
     }
 }
@@ -468,7 +748,7 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
     // Modules live in a scratch directory inside `tmp` so one `remove_dir_all`
     // cleans everything, and so a crash cannot leave a `.mjs` in the published
     // tree. It is removed before publishing; nothing here is a route.
-    let modules = tmp.join(".modules");
+    let modules = tmp.join(SCRATCH);
     let mut rendered: Vec<(usize, Emitted)> = Vec::new();
 
     for (index, route) in prepared.iter().enumerate() {
@@ -553,6 +833,15 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
         std::fs::remove_dir_all(&modules)
             .map_err(|error| format!("cannot clear {}: {error}", modules.display()))?;
     }
+
+    // The stamp must be the last thing written into the temporary tree: its presence
+    // is the only claim that this directory is a complete build, and [`publish`]
+    // refuses to replace any directory that lacks it.
+    let stamp = tmp.join(STAMP);
+    write_file(
+        &stamp,
+        &format!("runai {} build\n", runai_compiler::VERSION),
+    )?;
 
     Ok(())
 }
@@ -706,22 +995,48 @@ fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
 /// On Linux `rename(tmp, out)` fails when `out` is a non-empty directory, so `out`
 /// is moved aside first. If the second rename fails the old tree is moved back, so
 /// the failure mode is "the previous build is still there", never "no dist at all".
-fn publish(tmp: &Path, out: &Path) -> Result<(), String> {
+///
+/// `out` is replaced only when it carries [`STAMP`]. The name of a directory is not
+/// proof that this tool built it: without this gate `runai build --out src` moved the
+/// source tree aside and deleted it. An unstamped `out` is refused with nothing
+/// written and nothing deleted.
+fn publish(tmp: &Path, out: &Path) -> Result<(), Failure> {
     let backup = sibling(out, "old");
 
-    if backup.exists() {
-        std::fs::remove_dir_all(&backup)
-            .map_err(|error| format!("cannot clear {}: {error}", backup.display()))?;
+    // The stamp gate comes first so a refusal happens before anything is removed.
+    // An *empty* unstamped directory is allowed: there is no content to destroy, and
+    // `mkdir dist && runai build` is a normal CI shape. Anything with content and no
+    // stamp is not a build and is refused.
+    let had_previous = out.exists();
+    if had_previous && !out.join(STAMP).is_file() && !is_empty(out)? {
+        let _ = std::fs::remove_dir_all(tmp);
+        return Err(Failure::Refused(not_a_build(out)));
     }
 
-    let had_previous = out.exists();
+    // `.old` is another derived name, so it is removed only when it is a tree this
+    // tool published. Anything else is left alone and the build stops rather than
+    // destroying a directory it cannot identify.
+    if backup.exists() {
+        if !backup.join(STAMP).is_file() {
+            let _ = std::fs::remove_dir_all(tmp);
+            return Err(Failure::Build(format!(
+                "{} exists but is not a previous build (no `{STAMP}`), so it will not be \
+                 removed. Rename it and build again.",
+                backup.display()
+            )));
+        }
+        std::fs::remove_dir_all(&backup).map_err(|error| {
+            Failure::Build(format!("cannot clear {}: {error}", backup.display()))
+        })?;
+    }
+
     if had_previous {
         std::fs::rename(out, &backup).map_err(|error| {
             let _ = std::fs::remove_dir_all(tmp);
-            format!(
+            Failure::Build(format!(
                 "cannot move the previous `{}` aside ({error}); it was left untouched",
                 out.display()
-            )
+            ))
         })?;
     }
 
@@ -732,7 +1047,10 @@ fn publish(tmp: &Path, out: &Path) -> Result<(), String> {
             let _ = std::fs::rename(&backup, out);
         }
         let _ = std::fs::remove_dir_all(tmp);
-        return Err(format!("cannot publish {}: {error}", out.display()));
+        return Err(Failure::Build(format!(
+            "cannot publish {}: {error}",
+            out.display()
+        )));
     }
 
     if had_previous {
@@ -794,6 +1112,75 @@ mod tests {
     fn a_relative_route_segment_is_refused() {
         let error = route_name(Path::new("src/routes/../escape.page.tsx"));
         assert!(matches!(error, Err(Refusal::Message(message)) if message.contains("escape")));
+    }
+
+    // The scratch directory is deleted before publishing, so a route under it would
+    // vanish. Checked on the first segment, before the `index` strip, so both
+    // `.modules.page.tsx` and `.modules/x.page.tsx` are caught.
+    #[test]
+    fn a_route_under_a_reserved_name_is_refused() {
+        for path in [
+            "src/routes/.modules.page.tsx",
+            "src/routes/.modules/x.page.tsx",
+            "src/routes/.runai-build.page.tsx",
+        ] {
+            let error = route_name(Path::new(path));
+            assert!(
+                matches!(error, Err(Refusal::Message(message)) if message.contains("reserves")),
+                "{path}"
+            );
+        }
+        // A later segment with the same name is not the scratch directory and is fine.
+        assert_eq!(
+            route_name(Path::new("src/routes/blog/.modules.page.tsx")).unwrap(),
+            "blog/.modules"
+        );
+    }
+
+    // `.` and `..` are refused on any segment, including one that is not the first.
+    #[test]
+    fn a_dot_segment_anywhere_is_refused() {
+        assert!(matches!(
+            route_name(Path::new("src/routes/blog/../x.page.tsx")),
+            Err(Refusal::Message(_))
+        ));
+    }
+
+    // The degenerate `--out` values are usage errors before any resolution, because
+    // resolving `.` would land on a directory that does exist.
+    #[test]
+    fn degenerate_out_values_are_refused_by_name() {
+        for out in ["", ".", ".."] {
+            assert!(refuse_out(Path::new(out)).is_err(), "{out:?}");
+        }
+        // A path whose last component is `..` is the same shape. `dist/.` is not:
+        // `Path` normalizes it to `dist`, which is a legitimate target.
+        assert!(refuse_out(Path::new("dist/..")).is_err());
+        assert_eq!(Path::new("dist/."), Path::new("dist"));
+    }
+
+    // A non-existent directory and a stamped one are both acceptable; the stamp is
+    // what separates "a previous build" from "the project".
+    #[test]
+    fn a_missing_or_stamped_out_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("dist");
+        assert!(refuse_out(&out).is_ok(), "a fresh path must be accepted");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join(STAMP), "runai 0.1.0 build\n").unwrap();
+        assert!(refuse_out(&out).is_ok(), "a stamped tree must be accepted");
+    }
+
+    // The stamp is a dotfile inside `<out>` so serving is unaffected, and its text
+    // names the tool and version — that is what makes it recognisable in a tree.
+    #[test]
+    fn the_stamp_is_a_dotfile_naming_the_version() {
+        assert!(STAMP.starts_with('.'));
+        // The written text is `format!("runai {} build\n", runai_compiler::VERSION)`;
+        // assert the shape it must have without duplicating assemble_into here.
+        let text = format!("runai {} build\n", runai_compiler::VERSION);
+        assert!(text.starts_with("runai "));
+        assert!(text.ends_with(" build\n"));
     }
 
     #[test]
