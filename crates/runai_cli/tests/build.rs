@@ -70,6 +70,35 @@ fn a_static_route_cannot_ship_an_inline_handler() {
 }
 
 #[test]
+fn a_static_route_cannot_ship_a_capitalised_inline_handler() {
+    // The HTML tokenizer lowercases attribute names, so each of these is a live
+    // `onclick` in the served page. Before this round `check` was clean, the build
+    // exited 0, and the HTML carried the attribute verbatim.
+    for attribute in [
+        "Onclick=\"alert(1)\"",
+        "ONCLICK=\"alert(1)\"",
+        "oNclick=\"alert(1)\"",
+        "ONCLICK={1}",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_app(
+            tmp.path(),
+            &format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <button {attribute}>x</button> }}\n"
+            ),
+        );
+        let out = run(&["build", "--out", "dist"], tmp.path());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{attribute}: {stderr}");
+        assert!(stderr.contains("RA010"), "{attribute}: {stderr}");
+        assert!(
+            !tmp.path().join("dist").exists(),
+            "{attribute}: nothing is written"
+        );
+    }
+}
+
+#[test]
 fn a_static_route_cannot_ship_a_literal_script_element() {
     let tmp = tempfile::tempdir().unwrap();
     write_app(
@@ -645,8 +674,41 @@ fn dynamic_segment_is_ra014_not_silent_output() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("RA014_NOT_SUPPORTED_YET"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("RA014_NOT_SUPPORTED_YET"));
     assert!(!tmp.path().join("dist").exists());
+
+    // Round 1 removed a duplicate report — `build` used to print this diagnostic
+    // and `analyze` printed it again. The count is what pins that: the header line
+    // appears once for the one offending route.
+    assert_eq!(
+        stderr
+            .matches("error[RA014_NOT_SUPPORTED_YET]: dynamic route segments are not supported yet")
+            .count(),
+        1,
+        "the diagnostic must be reported exactly once:\n{stderr}"
+    );
+}
+
+// A directory that merely contains a bracket is a literal path, not a dynamic
+// segment: it is servable as `dist/a[b]/index.html`, so the build must produce it.
+#[test]
+fn a_literal_bracketed_directory_is_built_not_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("hi"));
+    std::fs::create_dir_all(tmp.path().join("src/routes/a[b]")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/a[b]/x.page.tsx"),
+        "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>literal</p> }\n",
+    )
+    .unwrap();
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        tmp.path().join("dist/a[b]/x/index.html").is_file(),
+        "a literal bracket directory is a real route: {stderr}"
+    );
 }
 
 // A leftover scratch directory with content and NO marker is not ours, so it is never

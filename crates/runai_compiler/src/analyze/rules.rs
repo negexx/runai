@@ -144,14 +144,14 @@ pub fn check_signal_rules(
 ///   reads the bindings rather than the text;
 /// - [`AccessorCall::write`] — `count(next)`. The declaration it writes was already
 ///   reported as its own primitive call, at its own span;
-/// - an `on…` JSX attribute that names a listener. Two spellings are handlers and
-///   both are refused: `on` + an uppercase letter (`onClick`, `onMount`, the
-///   existing React-style convention), and `on` + one of the HTML inline-handler
-///   event names ([`INLINE_HANDLER_EVENTS`], e.g. `onclick`) when it carries a
-///   value. An `onclick` attribute is inline JavaScript — the case is a naming
-///   convention, not a semantic difference — so the page would run code the 0 KB
-///   guarantee says it does not ship, whether the value is written literally or
-///   interpolated from a string;
+/// - an `on…` JSX attribute. A static page has no runtime, so an `on…` attribute
+///   there is either dead or live inline JavaScript, and both are refused: the rule
+///   is a **prefix**, matched on the lowercased name because that is the name the
+///   HTML tokenizer produces (`Onclick`, `ONCLICK`, and `oNclick` all reach the page
+///   as a live `onclick`). It is deliberately not an enumerated event list — such a
+///   list cannot be complete and nothing fails when it drifts. The accepted cost is
+///   that `once="x"` and `onwards="x"` are refused in a static route; an island
+///   still accepts them. See [`handler_form`];
 /// - a literal `<script>` element. A static page ships no JavaScript, so a script
 ///   element is refused whether it is inline or pulls a file in. `<style>` is
 ///   deliberately **not** refused: CSS is not a runtime, and the guarantee is
@@ -262,124 +262,26 @@ fn static_script(span: (u32, u32)) -> Diagnostic {
     )
 }
 
-/// The HTML inline-handler event names: the suffix of every standard `on…`
-/// content attribute (`onclick`, `onchange`, …).
-///
-/// This list exists because the uppercase convention alone is not the whole rule.
-/// A browser runs `onclick="…"` on a static page, so the attribute is code
-/// whatever the case of its name — but `on` + *any* lowercase word would also flag
-/// `once` and `onwards`, which are ordinary attributes. The explicit list is the
-/// honest line: these are the names HTML defines as handlers, and a name outside
-/// it is an attribute. An `on…` name this list has not heard of still falls to the
-/// uppercase rule, which is the project's existing convention.
-const INLINE_HANDLER_EVENTS: &[&str] = &[
-    "abort",
-    "afterprint",
-    "auxclick",
-    "beforeinput",
-    "beforeprint",
-    "beforeunload",
-    "blur",
-    "cancel",
-    "canplay",
-    "canplaythrough",
-    "change",
-    "click",
-    "close",
-    "contextmenu",
-    "copy",
-    "cuechange",
-    "cut",
-    "dblclick",
-    "drag",
-    "dragend",
-    "dragenter",
-    "dragleave",
-    "dragover",
-    "dragstart",
-    "drop",
-    "durationchange",
-    "ended",
-    "error",
-    "focus",
-    "focusin",
-    "focusout",
-    "formdata",
-    "hashchange",
-    "input",
-    "invalid",
-    "keydown",
-    "keypress",
-    "keyup",
-    "languagechange",
-    "load",
-    "loadeddata",
-    "loadedmetadata",
-    "loadstart",
-    "message",
-    "messageerror",
-    "mousedown",
-    "mouseenter",
-    "mouseleave",
-    "mousemove",
-    "mouseout",
-    "mouseover",
-    "mouseup",
-    "offline",
-    "online",
-    "pagehide",
-    "pageshow",
-    "paste",
-    "pause",
-    "play",
-    "playing",
-    "pointercancel",
-    "pointerdown",
-    "pointerenter",
-    "pointerleave",
-    "pointermove",
-    "pointerout",
-    "pointerover",
-    "pointerup",
-    "popstate",
-    "progress",
-    "ratechange",
-    "rejectionhandled",
-    "reset",
-    "resize",
-    "scroll",
-    "scrollend",
-    "securitypolicyviolation",
-    "seeked",
-    "seeking",
-    "select",
-    "selectionchange",
-    "selectstart",
-    "slotchange",
-    "stalled",
-    "storage",
-    "submit",
-    "suspend",
-    "timeupdate",
-    "toggle",
-    "unhandledrejection",
-    "unload",
-    "volumechange",
-    "waiting",
-    "wheel",
-];
-
 /// Whether this attribute is a handler in a `"use static"` route, and how the
 /// emitted markup treats it.
 ///
-/// Two spellings are handlers:
+/// **The static rule is a prefix, not a list.** A static page has no runtime, so an
+/// `on…` attribute there is one of two things: dead, or live inline JavaScript. The
+/// first is harmless to refuse and the second must be refused, so both are refused.
+/// Any identifier whose name starts with `on` and has an event after it
+/// (`onclick`, `onClick`, `Onclick`, `ONCLICK`, `oNclick`, …) is a handler.
 ///
-/// - `on` + an uppercase letter (`onClick`, `onMount`) — the project's existing
-///   convention, refused with any value form;
-/// - `on` + one of [`INLINE_HANDLER_EVENTS`] (`onclick`, `onchange`) — the HTML
-///   inline-handler spelling, refused when it carries a value. A lowercase `on…`
-///   name outside the list (`once`, `onwards`) is an ordinary attribute, which is
-///   why the list is explicit rather than "any lowercase `on…`".
+/// The name is matched **lowercased**, because it is the HTML tokenizer's name: it
+/// lowercases an attribute, so `ONCLICK="…"` reaches the served page as a live
+/// `onclick` and must be refused as one. The as-written spelling is kept only for
+/// the [`HandlerForm`] split below, which mirrors what the emitter does with it.
+///
+/// This is deliberately **not** an enumerated event list. Such a list cannot be
+/// complete — `onemptied`, `onanimationstart`, `onbeforetoggle`, `oncontextlost`,
+/// `onbeforematch`, and `onpointerrawupdate` were all missing from one — and nothing
+/// fails when it drifts. The accepted trade is that `once="x"` and `onwards="x"`, two
+/// ordinary attributes that happen to start with `on`, are refused in a static route.
+/// They are vanishingly rare next to a live-JS hole, and an island still accepts them.
 ///
 /// A namespaced attribute (`foo:onClick`, `xml:lang`) is never this shape.
 fn handler_form(attribute: &oxc_ast::ast::JSXAttribute<'_>) -> Option<HandlerForm> {
@@ -387,11 +289,14 @@ fn handler_form(attribute: &oxc_ast::ast::JSXAttribute<'_>) -> Option<HandlerFor
         return None;
     };
     let spelling = name.name.as_str();
-    let uppercase = is_uppercase_handler_name(spelling);
-    let lowercase_event = inline_handler_event(spelling).is_some();
-    if !uppercase && !lowercase_event {
+    let lowercased = spelling.to_ascii_lowercase();
+    // `on` alone names no event, so it is an ordinary attribute. Anything longer is
+    // an `on…` handler however its letters are capitalised.
+    if !lowercased.starts_with("on") || lowercased.len() == 2 {
         return None;
     }
+
+    let uppercase = is_uppercase_handler_name(spelling);
 
     let literal = matches!(
         attribute.value.as_ref(),
@@ -401,16 +306,11 @@ fn handler_form(attribute: &oxc_ast::ast::JSXAttribute<'_>) -> Option<HandlerFor
         attribute.value.as_ref(),
         Some(oxc_ast::ast::JSXAttributeValue::ExpressionContainer(_))
     );
-    // A bare lowercase `onclick` carries nothing and is not refused; a bare
-    // uppercase `onClick` keeps the existing refusal.
-    if !literal && !expression && !uppercase {
-        return None;
-    }
 
-    // The emitter's own split, mirrored: a string literal is a static attribute,
-    // and an expression is a static attribute unless `event_name` makes it a
-    // listener — which needs `on` + a capital. So an uppercase expression is the
-    // one form the prerender emitter drops.
+    // The emitter's own split, mirrored: a string literal is a static attribute, and
+    // an expression is a static attribute unless `event_name` makes it a listener —
+    // which needs `on` + a capital *as written*. So an uppercase expression is the one
+    // form the prerender emitter drops; a bare attribute carries no value to evaluate.
     let carried = literal || (expression && !uppercase);
     Some(if carried {
         HandlerForm::ShipsCode
@@ -429,23 +329,23 @@ enum HandlerForm {
     /// attribute) all land in the served page as live code.
     ShipsCode,
     /// The prerender emitter writes nothing for it (`Binding::Event`), so there is
-    /// no listener on the page: `onClick={fn}` and a bare `onClick`.
+    /// no listener on the page: `onClick={fn}`, and a bare `onClick` (or `onclick`)
+    /// with no value to carry.
     NeverAttached,
 }
 
-/// Whether `name` is `on` followed by an uppercase letter — the React-style
-/// handler convention this project already uses.
+/// Whether `name` starts with a lowercase `on` followed by an uppercase letter
+/// (`onClick`) — the React-style convention this project already uses.
+///
+/// Used **only** for the [`HandlerForm`] split, never to decide whether something
+/// is a handler: the emitter's [`crate::ir::event_name`] uses the same
+/// case-sensitive prefix, so this is the one fact that predicts whether an
+/// expression-valued attribute becomes a listener. Deciding the attribute is a
+/// handler happens on the lowercased name, above.
 fn is_uppercase_handler_name(name: &str) -> bool {
     name.strip_prefix("on")
         .and_then(|rest| rest.chars().next())
         .is_some_and(char::is_uppercase)
-}
-
-/// The lowercase event name when `name` is `on` + one of
-/// [`INLINE_HANDLER_EVENTS`].
-fn inline_handler_event(name: &str) -> Option<&str> {
-    name.strip_prefix("on")
-        .filter(|rest| INLINE_HANDLER_EVENTS.contains(rest))
 }
 
 /// Every refused handler attribute and literal `<script>` element in the file.

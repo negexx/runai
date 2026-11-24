@@ -311,14 +311,22 @@ pub(crate) fn is_page(path: &str) -> bool {
     !name.starts_with('_') && name.ends_with(".page.tsx")
 }
 
-/// Whether any segment of `path` is a `[param]` segment.
+/// Whether any segment of `path` is a **whole** `[param]` segment.
 ///
-/// Splits on both separators so a Windows path is not one giant segment, and
-/// looks for the bracket in either half of the pair: `[slug]` and a malformed
-/// `[slug` are both refused, because neither names a path the build can emit.
+/// Splits on both separators so a Windows path is not one giant segment, drops the
+/// `.page.tsx` suffix (which belongs to the file, not the segment's shape), and
+/// requires the segment to begin with `[` and end with `]`: `[slug]` and
+/// `blog/[slug]` are refused, while a literal directory that merely contains a
+/// bracket (`a[b]`, `prefix[slug]`, `[slug]s`) names a real path the build emits
+/// (`dist/a[b]/index.html`) and is not dynamic at all.
 fn has_dynamic_segment(path: &str) -> bool {
-    path.split(['/', '\\'])
-        .any(|segment| segment.contains(['[', ']']))
+    path.split(['/', '\\']).any(|segment| {
+        // The page suffix is part of the file name, not the segment's shape:
+        // `[slug].page.tsx` is the `[slug]` segment.
+        let segment = segment.strip_suffix(".page.tsx").unwrap_or(segment);
+        // `[]` names no parameter, so it is a literal (if odd) directory name.
+        segment.len() > 2 && segment.starts_with('[') && segment.ends_with(']')
+    })
 }
 
 /// The one sentence `build` and `check` both report for a `[param]` path segment.
@@ -2314,24 +2322,148 @@ mod tests {
         }
     }
 
-    /// `once` is the near miss the explicit event list exists for: it begins with
-    /// `on` but is not a listener, with either value form.
+    /// **Every** capitalisation of an inline-handler name is refused, because the
+    /// HTML tokenizer lowercases attribute names: `Onclick`, `ONCLICK`, and
+    /// `oNclick` all reach the served page as a live `onclick`. Measured on the
+    /// previous round: all four below were CLEAN and the HTML carried the
+    /// attribute verbatim, so the browser ran it.
     #[test]
-    fn once_is_an_attribute_not_a_handler_in_a_static_route() {
+    fn every_capitalisation_of_an_inline_handler_is_ra010() {
         for attribute in [
+            "onclick=\"alert(1)\"",
+            "Onclick=\"alert(1)\"",
+            "ONCLICK=\"alert(1)\"",
+            "oNclick=\"alert(1)\"",
+            "ONCLICK={1}",
+        ] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <button {attribute}>x</button> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+            assert!(
+                d[0].message.contains("ships no JavaScript"),
+                "{attribute}: the HTML keeps this attribute, so it ships code: {}",
+                d[0].message
+            );
+        }
+    }
+
+    /// The uppercase expression form keeps its own sentence: the prerender emitter
+    /// writes no listener for `onClick={fn}`, so "ships code" would be false for it.
+    #[test]
+    fn an_uppercase_expression_handler_says_it_is_never_attached() {
+        for attribute in ["onClick={() => {}}", "onMount={() => {}}"] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <button {attribute}>x</button> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+            assert!(
+                d[0].message.contains("would never be attached"),
+                "{attribute}: the emitter drops this one, so it never fires: {}",
+                d[0].message
+            );
+        }
+    }
+
+    /// A static route refuses **any** `on…` attribute whose value the emitted HTML
+    /// keeps, because the page has no runtime: such an attribute is either dead and
+    /// harmless to refuse, or live inline JavaScript and required to be refused.
+    /// There is no list to drift, which is the whole point — a hand-written event
+    /// list let `onemptied`, `onanimationstart`, and five others through while
+    /// nothing failed.
+    ///
+    /// The cost is the near miss: `once="x"` and `onwards="x"` are refused in a
+    /// static route. They are ordinary attributes, but they are vanishingly rare
+    /// next to a live-JS hole, and the rule cannot be incomplete.
+    #[test]
+    fn any_on_attribute_with_a_kept_value_is_refused_in_a_static_route() {
+        for attribute in [
+            "onemptied=\"x\"",
+            "onanimationstart=\"x\"",
+            "ontransitionend=\"x\"",
+            "onbeforetoggle=\"x\"",
+            "oncontextlost=\"x\"",
+            "onbeforematch=\"x\"",
+            "onpointerrawupdate=\"x\"",
             "once=\"x\"",
             "once={1}",
             "onwards=\"x\"",
-            "data-onClick=\"x\"",
         ] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+        }
+    }
+
+    /// A bare `on…` attribute is refused the same way in either capitalisation.
+    /// The two spellings differ only in case, which is the whole point of matching
+    /// the lowercased name: a rule that refused `onClick` and accepted `onclick`
+    /// would be the very gap this round closes.
+    #[test]
+    fn a_bare_handler_attribute_is_refused_in_either_capitalisation() {
+        for attribute in ["onClick", "onclick", "ONCLICK", "oNclick"] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <button {attribute}>x</button> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+            assert!(
+                d[0].message.contains("would never be attached"),
+                "{attribute}: a bare attribute carries no code: {}",
+                d[0].message
+            );
+        }
+        // `on` alone names no event, so it stays an ordinary attribute.
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div on>x</div> }\n";
+        assert!(analyze(src, "src/routes/index.page.tsx").is_empty());
+    }
+
+    /// The rule is about the name's *prefix*, so an `on…` substring further in
+    /// (`data-onClick`) is an ordinary data attribute and stays clean.
+    #[test]
+    fn a_data_attribute_that_contains_on_is_not_an_handler() {
+        for attribute in ["data-onClick=\"x\"", "data-onwards={1}", "id=\"once\""] {
             let src = format!(
                 "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
             );
             assert!(
                 analyze(&src, "src/routes/index.page.tsx").is_empty(),
-                "{attribute} is not a handler"
+                "{attribute} does not start with `on`"
             );
         }
+    }
+
+    /// An island has a runtime, so `once`/`onwards` and an inline handler are all
+    /// legal there: the static-route refusal must not leak across the directive.
+    #[test]
+    fn an_island_keeps_on_attributes_and_inline_handlers_clean() {
+        for attribute in [
+            "once=\"x\"",
+            "onwards=\"x\"",
+            "onclick=\"alert(1)\"",
+            "ONCLICK=\"alert(1)\"",
+        ] {
+            let src = format!(
+                "\"use island\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
+            );
+            assert!(
+                analyze(&src, "src/routes/index.page.tsx").is_empty(),
+                "{attribute}: an island ships a runtime"
+            );
+        }
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <div><script>alert(1)</script></div> }\n";
+        assert!(
+            analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "an island may carry a script element"
+        );
     }
 
     /// A literal `<script>` element is JavaScript the static route promised not to
@@ -2399,6 +2531,34 @@ mod tests {
             analyze(src, "src/routes/[slug]/_shell.tsx").is_empty(),
             "a `_`-prefixed module is not a route"
         );
+    }
+
+    /// Only a **whole** bracketed segment is a `[param]` segment. A literal
+    /// directory that merely contains a bracket (`a[b]`) names a real, servable
+    /// path — `dist/a[b]/index.html` — so calling it "dynamic" is false.
+    #[test]
+    fn a_literal_bracketed_directory_is_not_a_dynamic_segment() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>x</p> }\n";
+        for path in [
+            "src/routes/a[b]/x.page.tsx",
+            "src/routes/[slug]s/x.page.tsx",
+            "src/routes/prefix[slug]/x.page.tsx",
+        ] {
+            assert!(
+                analyze(src, path).is_empty(),
+                "{path} names a literal directory, not a dynamic segment"
+            );
+        }
+        // The whole bracketed segment is still refused, at either depth.
+        for path in [
+            "src/routes/[slug].page.tsx",
+            "src/routes/blog/[slug].page.tsx",
+            "src/routes/[slug]/index.page.tsx",
+        ] {
+            let d = analyze(src, path);
+            assert_eq!(d.len(), 1, "{path}: {d:?}");
+            assert_eq!(d[0].message, super::DYNAMIC_ROUTE_SEGMENT_MESSAGE, "{path}");
+        }
     }
 
     /// The returned list reads top-to-bottom in the file, and no `(code, span)`
