@@ -1,0 +1,3 @@
+[test]
+# Microtask helpers and the template clone in the runtime tests need a DOM.
+preload = ["./test/setup.js"]

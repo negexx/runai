@@ -1,0 +1,2650 @@
+//! `RA014` for a route file whose own names collide with the names the emitted
+//! module declares.
+//!
+//! The prerender module is three names — `_esc`, `_attr`, `render` — and
+//! [`crate::ir::PRERENDER_NAMES`] is the one list of them. A route file that
+//! declares one of those names, exports one, or references one would shadow the
+//! helper the template calls, or export `render` twice:
+//!
+//! ```tsx
+//! const render = 1                          // the emitted module exports `render`
+//! export { x as render }                    // the emitted module exports `render` twice
+//! function P() { const _esc = …; … }        // every `${_esc(…)}` calls the local
+//! function P() { return <p>{_esc("x")}</p> } // an undeclared `_esc` resolves to ours
+//! ```
+//!
+//! `render` is the **one** reserved name the artifact also exports
+//! ([`crate::ir::PRERENDER_EXPORTS`]), so exporting it is the only case that is a
+//! genuine duplicate export. Exporting `_esc` or `_attr`, or any reserved name in
+//! an island — which exports nothing of the compiler's ([`crate::ir::ISLAND_EXPORTS`])
+//! — collides with a name the module reserves without duplicating an export, and
+//! the two messages say which.
+//!
+//! The reserved set has **two** reasons in it, and every message keeps them apart
+//! (Task 15 fix round 4): a name the **emitter** writes (`_esc`, `_attr`, `render`,
+//! the island locals, the helpers the artifact calls), and a name **this file
+//! imports** from `"runai"`, which the emitter also writes because it writes its own
+//! import list. Presenting the author's own alias — `import { owner as myOwner }` —
+//! as "one of the names the generated module reserves for itself" was a false
+//! sentence: an agent cannot tell whether to rename the import or drop the export.
+//! [`Reserved`] holds the split, and [`Reserved::is_own_name`] is what the export
+//! arm asks: an imported name is reserved against a *declaration*, which would
+//! shadow the import, but not against an *export*, because a local may legitimately
+//! be exported under a name the file also imports.
+//!
+//! The last one is the sharpest: an undeclared `_esc` in the template resolves to
+//! the compiler's own helper and renders its **source text**, silently. That is
+//! why a reference is refused, not only a declaration.
+//!
+//! # Three shapes, in three regions
+//!
+//! 1. a **declaration** in an emitted module statement
+//!    ([`crate::ir::emitted_module_parts`]) or an emitted body statement
+//!    ([`crate::ir::emitted_body_statements`]) whose bound name is reserved;
+//! 2. an **export specifier** whose *local binding* collides with the emitted
+//!    module. The question is the local, not the exported name (Task 15 fix
+//!    round 5): `export { v as render }` exports a local under a name the
+//!    artifact also exports, so it is a duplicate; `export { owner }` beside
+//!    `import { owner }` exports the import the module also writes; but
+//!    `export { v as owner }` beside that same import exports `v`, a value this
+//!    file declares, and is valid ESM — matching the exported name alone refused
+//!    it as a false positive. `export const render = …` is shape 1's declaration
+//!    and 2's exported name in one statement, and one row is enough;
+//! 3. a **reference** to a reserved name, in the markup, the body, or the module
+//!    level — but only when the reserved name is **in scope at the emitted call
+//!    site**: unresolved, or declared at module scope. A route component named a
+//!    reserved name is declared at module scope too, so it lands in that same arm;
+//!    the row an agent reads for it is [`crate::analyze::reachable`]'s, which owns
+//!    the "the component is not a binding in the artifact" wording. A reference
+//!    to any deeper scope (`items.map((render) => …)`, a nested function's local,
+//!    a block `const`) is legal JavaScript shadowing the emitted module preserves.
+//!
+//! # The declaration rule, and why the reference walk is not it
+//!
+//! Shapes 1 and 3 both see declarations, but neither is the rule this module is
+//! really enforcing: **a reserved name bound in the route component's own scope
+//! is in scope at the emitted call site**, because the emitter copies the body
+//! into `render()`. Shape 1 walks only the *top level* of the emitted statements,
+//! and shape 3 needs a reference to exist at all — so an unreferenced `var` in a
+//! nested block slipped through both and emitted a module that threw
+//! `TypeError: _esc is not a function` at build time while `check` was clean.
+//!
+//! [`check_scope_bindings`] is the direct statement of that rule: it reads the
+//! route component's own scope out of the semantic pass and refuses every
+//! reserved name bound there. The three shapes above stay, because they own rows
+//! this one cannot produce:
+//!
+//! - **shape 1** names a declaration the agent must rename where it is *written*,
+//!   in a module statement or the body's top level;
+//! - **shape 3** is the only row for a name the file never declares (an undeclared
+//!   `_esc` in the markup silently resolving to the compiler's helper), and it is
+//!   the row that points at the offending *use*.
+//!
+//! So a file that declares and reads a reserved name gets two rows for one
+//! problem — one at each site to edit — which is the same shape the module-scope
+//! arm already had. Deleting either walk would lose a site, not a duplicate.
+//!
+//! # What is deliberately not refused
+//!
+//! - **a type alias** named `render` — `strip_types` erases it, so nothing is
+//!   emitted under that name. Refusing it would be the false positive Task 9's
+//!   review round 2 proved. The test is "type-only", not "a type": a `type _esc`
+//!   beside a `var _esc` is *one* symbol whose unioned flags report a type, and
+//!   the value declaration in it is refused — see [`check_scope_bindings`];
+//! - **a member property** (`o.render`) or an **object key** (`{ render: 1 }`) —
+//!   neither is a binding, and refusing them would reject an ordinary page;
+//! - **a deeper-scope local** named a reserved name — an arrow parameter, a
+//!   nested function's local, a block `const`. Its nearest enclosing function is
+//!   not `render()`, so the template's call site cannot reach it, and the calls
+//!   still reach the module-level helper;
+//! - **a reserved name in a component module** (`_shell.tsx`, or a `.tsx` with no
+//!   route) — nothing is emitted from such a file, so there is no helper to
+//!   shadow. The same boundary [`crate::analyze::reachable`] draws;
+//! - **a component's own name in a named function expression** — one shape binds
+//!   it in the component's own scope (`export default (function render(props)
+//!   {…})`), another binds a *declarator* beside it (`const Page = function
+//!   render(props) {…}`). In both the emitter rebuilds the component from
+//!   `RouteIr` and never writes the expression, so the name is not in the
+//!   artifact; `SymbolFlags::FunctionExpression` identifies them without a skip by
+//!   name (a genuine body `var render` keeps refusing);
+//! - **a binding after the route's `return`** — unreachable code the emitter never
+//!   writes, because it slices exactly [`crate::ir::emitted_body_statements`], which
+//!   stops at `return_span`.
+//!
+//! The reference walk is [`crate::analyze::reachable`]'s, shared rather than
+//! reimplemented, so "a type-only reference is not a value" has one definition in
+//! the crate.
+
+use oxc_ast::ast::{Declaration, ModuleExportName, Program, Statement};
+use oxc_ast_visit::Visit;
+use oxc_semantic::SemanticBuilder;
+use oxc_span::GetSpan;
+
+use crate::analyze::component::find_route_component;
+use crate::analyze::jsx::route_render;
+use crate::analyze::reachable::references;
+use crate::diagnostic::{Code, Diagnostic};
+use crate::ir::{emitted_body_statements, emitted_module_parts};
+use crate::source::Mode;
+
+/// `RA014` for every declaration, export, or reference that collides with a name
+/// the emitted module declares for itself.
+///
+/// `mode` picks the reserved list: a `"use static"` route emits
+/// [`crate::ir::PRERENDER_NAMES`], and Task 11 adds the island module's names to
+/// the same constant. `program` is the typed tree `analyze` parsed, so the spans
+/// are the agent's own — a name `strip_types` would erase is a type declaration in
+/// this tree and is recognized by node kind rather than guessed at.
+///
+/// Returns an empty list for a file with no route component: nothing is emitted
+/// from such a file, so no name can collide. This mirrors
+/// [`crate::analyze::reachable`], which draws the same boundary.
+pub fn check_emitted_names(mode: Mode, source: &str, program: &Program<'_>) -> Vec<Diagnostic> {
+    let Some(route) = find_route_component(program) else {
+        return Vec::new();
+    };
+    let Some(render) = route_render(program) else {
+        return Vec::new();
+    };
+    let reserved = reserved_names(mode, source, program);
+    let reserved: &Reserved = &reserved;
+
+    // Every symbol a `"runai"` import binds. A reference that resolves to one of
+    // these is the **legitimate** import the module writes, not a collision — the
+    // island reserved set includes those names precisely so a *declaration* of one
+    // is refused, but the import's own use must stay legal. `check_declaration` and
+    // `check_scope_bindings` judge the declarations; only this reference walk needs
+    // the exemption.
+    let runai: Vec<oxc_semantic::SymbolId> = crate::analyze::signals::runai_imports(program)
+        .into_iter()
+        .map(|import| import.symbol)
+        .collect();
+    let runai: &[oxc_semantic::SymbolId] = &runai;
+
+    // One semantic build for the reference walk, which judges a name by its
+    // binding. A type-only reference is filtered there, exactly as
+    // `check_reachable_expressions` filters it.
+    let semantic = SemanticBuilder::new().build(program).semantic;
+    let scoping = semantic.scoping();
+
+    // The one scope the emitted `render()` copy shares with the source: the route
+    // component's own function scope. A binding here is in scope at every emitted
+    // call site, because the emitter copies the body into `render()` and the
+    // template's calls sit at the end of that same function. This is why `var` is
+    // the sharp case: it hoists to this scope from anywhere in the body — a nested
+    // block, a `for` init, a `try`/`catch` — while the block-scoped `const` beside
+    // it stays in its block and does not reach the call site at all.
+    //
+    // The cell fails **closed**. `None` means the semantic build never filled the
+    // cell that this rule was added to read, which is a compiler defect, not a
+    // clean file: treating it as "no scope, nothing in scope" would silently
+    // disable the declaration rule below for a whole route shape. Naming the
+    // limitation is the loud failure.
+    let Some(route_scope) = render.scope_id.get() else {
+        debug_assert!(
+            false,
+            "the semantic build must fill the route component's scope cell"
+        );
+        return vec![Diagnostic::new(
+            Code::RA014,
+            route.body_span,
+            "the compiler could not resolve the route component's own scope, so it cannot tell \
+             whether the body declares `_esc`, `_attr`, or `render` — the names the generated \
+             module declares for itself. This is a limitation of the compiler, not of this file: \
+             rerun the build, and report it if it persists.",
+        )];
+    };
+
+    let mut diagnostics = Vec::new();
+
+    // (0) A name the source exports twice. Two exports of one name is a syntax
+    // error in ESM (`SyntaxError: Duplicate export of 's'`), so there is no legal
+    // case to protect and no artifact to emit: the emitter copies an `export`
+    // statement verbatim, so both reach the module. Refused before anything else
+    // because it is not about names the *emitter* chose — it is about the file's
+    // own exports.
+    diagnostics.extend(duplicate_exports(program));
+
+    // (1) Declarations in the two emitted scopes: an emitted module statement
+    // (including the declarators a multi-declarator route statement leaves
+    // behind), and an emitted body statement.
+    for part in emitted_module_parts(program, &route) {
+        check_part(&part, reserved, mode, scoping, runai, &mut diagnostics);
+    }
+    if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
+        for statement in emitted_body_statements(body, return_span) {
+            check_declaration(statement, reserved, &mut diagnostics);
+        }
+    }
+
+    // (1b) **Every** name bound in the route component's own scope, whether or
+    // not the file references it. This is the declaration rule proper, and the
+    // reference walk below was only ever a proxy for it: a `var` hoists into this
+    // scope from a nested block, a `for` init, or a `try`/`catch`, so it is in
+    // scope at the template's call site even when the top level of the body never
+    // mentions it. `check_declaration` above cannot see it — it walks the top
+    // level of the emitted statements — and a reference walk cannot see a name
+    // nothing references. Under `f2b2dea` this exact shape emitted
+    // `return \`<p>${_esc(1 + 1)}</p>\`` under a `var _esc = 1`, and the module
+    // threw `TypeError: _esc is not a function` at build time with `check` clean.
+    //
+    // `get_binding`, not `find_binding`: a binding is in this map only when it is
+    // **declared in this scope**, which is exactly "hoisted into the emitted
+    // function's scope". `find_binding` walks ancestors and would refuse every
+    // module-level name too.
+    check_scope_bindings(
+        scoping,
+        route_scope,
+        &route,
+        &render,
+        reserved,
+        &mut diagnostics,
+    );
+
+    // (3) References in the three emitted regions.
+    //
+    // This row is **not** redundant with (1b): a declaration is refused wherever
+    // it is written, but only a reference tells an agent which *use* must change,
+    // and it is the only row for a name the file never declares (an undeclared
+    // `_esc` in the markup, which silently resolves to the compiler's own
+    // helper). (1b) owns "a binding hoisted into `render()`'s scope"; (3) owns
+    // "a use that reaches a shadow at the emitted call site".
+    //
+    // A reference is refused when the reserved name is **in scope at the emitted
+    // call site**, which is the template's `${_esc(…)}` / `${_attr(…)}` and the
+    // module-level `render`:
+    //
+    // - **unresolved** (`symbol` is `None`): the name is declared nowhere, so in
+    //   the template it resolves to the compiler's own helper or to `render()`.
+    //   This is the silent case the rule exists for.
+    // - **module scope** (the symbol's declaration scope is the root): a module
+    //   binding named `render` collides with `export function render()`, and one
+    //   named `_esc` shadows the helper for every statement and for the template.
+    // - **the route component's own function scope**: the emitter copies the body
+    //   into `render()`, so a binding in that scope is in scope at the call site.
+    //   This is the `var` case — a `var` hoists here from a nested block, a `for`
+    //   init, or a `try`/`catch`. It is *not* "declared at root": round 1's
+    //   predicate, which missed this case and emitted a module that rendered
+    //   `<p>hijacked</p>`.
+    // - **the route component itself** when its name is reserved: the emitters
+    //   rebuild it, so the name is not a binding in the artifact. The row for that
+    //   case is `analyze::reachable`'s; this walk lands on the module-scope arm
+    //   above and `analyze` keeps one row per span.
+    //
+    // A reference that resolves to any **other** scope — an arrow parameter, a
+    // local of a nested function, a block's `const` — is ordinary JavaScript
+    // shadowing of a legal local, and the emitted module preserves it: the
+    // template's own `${_esc(…)}` still reaches the module-level helper, because
+    // the shadow's nearest enclosing function is not `render()`'s. Refusing it
+    // would reject `<p>{items.map((render) => render.name)}</p>`, which is why
+    // [`reference_collision`] asks "is it in scope at the call site" rather than
+    // "is it declared at root".
+    for reference in references(scoping, |visitor| visitor.visit_expression(render.root)) {
+        if let Some(row) =
+            reference_collision(scoping, &reference, &route, route_scope, reserved, runai)
+        {
+            diagnostics.push(row);
+        }
+    }
+    if let (Some(body), Some(return_span)) = (render.body, render.return_span) {
+        for statement in emitted_body_statements(body, return_span) {
+            for reference in references(scoping, |visitor| visitor.visit_statement(statement)) {
+                if let Some(row) =
+                    reference_collision(scoping, &reference, &route, route_scope, reserved, runai)
+                {
+                    diagnostics.push(row);
+                }
+            }
+        }
+    }
+    for reference in emitted_reference_roots(program, &route, scoping) {
+        if let Some(row) =
+            reference_collision(scoping, &reference, &route, route_scope, reserved, runai)
+        {
+            diagnostics.push(row);
+        }
+    }
+    diagnostics.sort_by_key(|diagnostic| diagnostic.span.0);
+    diagnostics
+}
+
+/// `RA014` for `reference` if it names something in scope at the emitted call
+/// site, or `None` when it is an ordinary shadow the emitted module preserves.
+///
+/// The predicate is "is the reserved name in scope where `render()` calls its
+/// helpers", not "is it declared at root":
+///
+/// - an unresolved name resolves to the emitter's own helper — refused;
+/// - a binding in the module scope is one the emitter also writes — refused;
+/// - a binding in the route component's own function scope is in scope at the
+///   call site, because the emitter copies the body there — refused. This is the
+///   `var` arm: `var` hoists to this scope from nested blocks, `for` inits, and
+///   `try`/`catch`;
+/// - a binding in any deeper scope (an arrow parameter, a nested function's
+///   local, a block `const`) is not in scope at the call site — allowed.
+///
+/// A reserved-named route component is declared at module scope, so it lands in
+/// the module-scope arm here; the row an agent sees for it is
+/// [`crate::analyze::reachable`]'s, which owns the "the component is not a
+/// binding in the artifact" wording, and `analyze` dedupes one problem to one row.
+fn reference_collision(
+    scoping: &oxc_semantic::Scoping,
+    reference: &crate::analyze::reachable::Reference,
+    route: &crate::analyze::ComponentInfo<'_>,
+    route_scope: oxc_semantic::ScopeId,
+    reserved: &Reserved,
+    runai: &[oxc_semantic::SymbolId],
+) -> Option<Diagnostic> {
+    if !reserved.contains(&reference.name) {
+        return None;
+    }
+
+    // A reference that resolves to a `"runai"` import is the legitimate binding the
+    // module writes, not a shadow of it. This arm is island-only in practice: the
+    // island reserved set includes `signal`, `mount`, and the helpers because a
+    // *declaration* of one must be refused, but the import's own use must stay
+    // legal. `check_declaration`/`check_scope_bindings` judge the declarations.
+    if reference
+        .symbol
+        .is_some_and(|symbol| runai.contains(&symbol))
+    {
+        return None;
+    }
+
+    let Some(symbol) = reference.symbol else {
+        // Undeclared: in the emitted template it resolves to the compiler's own
+        // helper or to `render()`, which is the silent case this rule exists for.
+        return Some(reference_refusal(
+            reference.span,
+            &reference.name,
+            ShadowKind::Undeclared,
+            route,
+            reserved,
+        ));
+    };
+
+    let declaration_scope = scoping.symbol_scope_id(symbol);
+
+    // Module scope: a binding there is one the emitter would also declare
+    // (`render`) or one that shadows a helper for the whole module (`_esc`). A
+    // route component named a reserved name is also declared here; its row is
+    // `analyze::reachable`'s, which owns the "the component is not a binding in
+    // the artifact" wording, and `analyze` dedupes one problem to one row.
+    if declaration_scope == scoping.root_scope_id() {
+        return Some(reference_refusal(
+            reference.span,
+            &reference.name,
+            ShadowKind::ModuleScope,
+            route,
+            reserved,
+        ));
+    }
+
+    // The route component's own function scope: the emitter copies the body into
+    // `render()`, so a binding here is in scope at the template's call site. A
+    // `var` lands here from any depth, which is exactly the defect this arm
+    // closes.
+    if declaration_scope == route_scope {
+        return Some(reference_refusal(
+            reference.span,
+            &reference.name,
+            ShadowKind::BodyScope,
+            route,
+            reserved,
+        ));
+    }
+
+    // Any other nested-scope binding is an ordinary local the emitted function
+    // keeps: its nearest enclosing function is not `render()`, so the template's
+    // calls still reach the module-level helper.
+    None
+}
+
+/// Refuse every reserved name **bound in the route component's own scope**.
+///
+/// This is the declaration rule the reference walk was a proxy for. A name in
+/// this scope's binding table is one the emitted `render()` declares at its own
+/// top level, because the emitter copies the component body into that function —
+/// so it shadows `_esc`, `_attr`, or `render` at the call site inside the
+/// template, whether or not anything in the file references it.
+///
+/// `get_binding` is the right lookup, not `find_binding`: the map holds only the
+/// names **declared in this scope**, which is exactly "hoisted into the emitted
+/// function's scope". `find_binding` walks ancestors and would also refuse every
+/// module-level name — a different rule, and a different row.
+///
+/// What lands here: a `var` from anywhere in the body (a nested block, a `for`
+/// init, a `try`/`catch`, a destructuring pattern), and a top-level `const`,
+/// `let`, `class`, or `function` of the body. What does **not**, because the
+/// binder puts it in a deeper scope: a nested-block `const`/`let`, a block-level
+/// `function` declaration (ESM is strict), a nested function's or arrow's own
+/// locals and parameters, and a `catch` parameter.
+///
+/// Two bindings in this map are not this rule's: the route parameter, which
+/// [`crate::analyze::reachable`] already refuses when it is named something other
+/// than `props` (refusing it here too would be two rows for one problem), and a
+/// named function expression's own name in the one shape that binds it here —
+/// there is nothing to shadow, because the emitter never writes the expression.
+///
+/// Three things about this walk are narrower than the first version's, and each
+/// was a defect a review round found:
+///
+/// - **each declaration's own flags**, not the symbol's union: Oxc's binder merges
+///   declarations that share a name in one scope into one symbol and unions their
+///   flags, so `type _esc = 1; if (false) { var _esc = 1 }` is one symbol that
+///   reports a type. Judging the union let the `var` hide behind the alias, and
+///   the artifact carried `var _esc = 1` above `${_esc(1 + 1)}` — `TypeError:
+///   _esc is not a function` at build time. [`declarations_of`] reads each site.
+/// - **the returned range**, not the whole body: the emitter writes
+///   [`crate::ir::emitted_body_statements`] only, which stops at `return_span`.
+///   A `var _esc` after the `return` is unreachable code nothing writes, so
+///   refusing it would be a false positive. This filter reads the same bound the
+///   emitter does rather than reimplementing it.
+/// - **`SymbolFlags::FunctionExpression`**, not the name: a function expression's
+///   own name is bound in the function's own scope, which for a route is this one,
+///   and the emitter rebuilds the component from `RouteIr` instead of writing the
+///   expression. `route.name_span` is the *declarator* (`const Page = function
+///   render(…)` binds `render` at a different span), so the flag is what
+///   identifies the shape. It is deliberately not a skip by name: a genuine
+///   `var render` in the body keeps refusing.
+fn check_scope_bindings(
+    scoping: &oxc_semantic::Scoping,
+    route_scope: oxc_semantic::ScopeId,
+    route: &crate::analyze::ComponentInfo<'_>,
+    render: &crate::analyze::jsx::RouteRender<'_>,
+    reserved: &Reserved,
+    out: &mut Vec<Diagnostic>,
+) {
+    let params = render.params.span;
+    // The bound the emitter writes up to: `render()` carries only the statements
+    // before the JSX `return`, so a binding declared at or after it is not in the
+    // artifact. A concise body (`(props) => <p/>`) has no statements at all, so
+    // nothing is emitted and nothing can be shadowed.
+    let Some(return_span) = render.return_span else {
+        return;
+    };
+    for name in &reserved.all {
+        let Some(symbol) =
+            scoping.get_binding(route_scope, oxc_ast::ast::Ident::from(name.as_str()))
+        else {
+            continue;
+        };
+        // The declarations of this **name**, each with its own flags. Oxc's
+        // binder merges declarations that share a name in one scope into one
+        // symbol and unions their flags onto it, so the symbol's flags cannot
+        // answer "is there a value here, and where is it written": a `type _esc`
+        // and a `var _esc` in the same scope are one symbol whose union reports a
+        // type, and whose span is whichever declaration came first. Reading the
+        // redeclaration list keeps each site's own span and meaning.
+        for (span, flags) in declarations_of(scoping, symbol) {
+            // Only a **value** declaration can shadow the helper. A type alias or
+            // interface is erased by `strip_types`, so nothing is emitted under
+            // the name. `is_type()` alone is not the test: the union above reports
+            // a type for the `var` too, which is how the `var` hid behind the
+            // alias and emitted `TypeError: _esc is not a function`.
+            if !flags.is_value() {
+                continue;
+            }
+            // A function expression's own name is bound in the function's own
+            // scope, which for a route is this one, and the emitter rebuilds the
+            // component from `RouteIr` instead of writing the expression — so the
+            // name is not in the artifact. The flag, not the name, identifies the
+            // shape: `route.name_span` is the **declarator**
+            // (`const Page = function render(…)` binds `render` elsewhere), while
+            // a genuine `var render` in the body must keep refusing.
+            if flags.contains(oxc_syntax::symbol::SymbolFlags::FunctionExpression) {
+                continue;
+            }
+            // Unreachable code after the route's `return` is not emitted. This
+            // bound mirrors `crate::ir::emitted_body_statements`, the one
+            // definition of "emitted" the slicer filters with.
+            if span.start >= return_span.start {
+                continue;
+            }
+            // The route parameter: `analyze::reachable` already refuses a
+            // differently-named one, so refusing it here would be a second row.
+            if span.start >= params.start && span.end <= params.end {
+                continue;
+            }
+            // The component's own name in `export default (function render(…))`:
+            // its span *is* the name span, and the emitter never writes it.
+            if (span.start, span.end) == route.name_span {
+                continue;
+            }
+            out.push(scope_binding_refusal(
+                (span.start, span.end),
+                name,
+                reserved,
+            ));
+        }
+    }
+}
+
+/// Every declaration of `symbol`, each with that declaration's own flags.
+///
+/// [`oxc_semantic::Scoping::symbol_redeclarations`] is empty for a name declared
+/// once; when it is not, it already holds the first declaration followed by each
+/// redeclaration, each with the flags it was declared with. Reading that list
+/// instead of the symbol's unioned flags is what lets a `type` alias and a `var`
+/// of one name be judged separately — the union cannot say which site is which.
+fn declarations_of(
+    scoping: &oxc_semantic::Scoping,
+    symbol: oxc_syntax::symbol::SymbolId,
+) -> Vec<(oxc_span::Span, oxc_syntax::symbol::SymbolFlags)> {
+    let redeclarations = scoping.symbol_redeclarations(symbol);
+    if redeclarations.is_empty() {
+        return vec![(scoping.symbol_span(symbol), scoping.symbol_flags(symbol))];
+    }
+    let mut declarations: Vec<_> = redeclarations
+        .iter()
+        .map(|redeclaration| (redeclaration.span, redeclaration.flags))
+        .collect();
+    declarations.sort_by_key(|(span, _)| span.start);
+    declarations
+}
+
+/// `RA014` for a reserved name bound in the route component's own scope.
+///
+/// The repair is the rename the declaration row already gives, and the reason is
+/// the **hoist**: a `var` reaches this scope from a nested block even when the
+/// file never mentions it, so "nothing references it" is not a defence.
+fn scope_binding_refusal(span: (u32, u32), name: &str, reserved: &Reserved) -> Diagnostic {
+    // The consequence differs by why the name is reserved: an imported name has no
+    // compiler helper to reach, so saying the call "reaches it instead of the
+    // generated helper" would be a second false sentence in the same paragraph.
+    let message = match reserved.import_reason(name) {
+        Some(reason) => format!(
+            "{reason}, so a use of `{name}` would reach this local instead of the import. The \
+             binding is declared in the route component's own scope, which the emitter copies \
+             into the generated component. A `var` reaches this scope from any nested block, \
+             `for` init, or `try`/`catch`, even when nothing references it. Rename `{name}`."
+        ),
+        None => format!(
+            "`{name}` is one of the names the generated module declares for itself{names}. \
+             This binding is declared in the route component's own scope, which the emitter copies \
+             into the generated component, so the template's `{name}(…)` call reaches it instead \
+             of the generated helper. A `var` reaches this scope from any nested block, `for` \
+             init, or `try`/`catch`, even when nothing references it. Rename `{name}`.",
+            names = reserved.own_names_clause(),
+        ),
+    };
+    Diagnostic::new(Code::RA014, span, message)
+}
+
+/// The names [`check_emitted_names`] refuses, and **why** each one is reserved.
+///
+/// The refusal set merges two different facts, and a message that conflated them
+/// was a shipped false diagnostic (Task 15 fix round 4): `import { owner as myOwner
+/// } from "runai"; export { myOwner }` reported that `myOwner` "is one of the names
+/// the generated module reserves for itself", listing the author's own alias beside
+/// `_a` and `_c`. An agent cannot act on that — rename the import, or drop the
+/// export? — because it says the compiler chose a name the author chose.
+///
+/// So the set keeps the two apart:
+///
+/// - `all` — every name that is refused, which is
+///   [`crate::codegen::island_reserved_names`] for an island (its own locals,
+///   `mount`, `template`, the helpers the artifact calls, **and** every name the
+///   file imports) and [`crate::ir::PRERENDER_NAMES`] for a static route;
+/// - `imported` — the subset bound by a named `import` from `"runai"` in this file.
+///   The reason such a name is refused is that the module writes its own import
+///   list, not that the compiler picked the name.
+///
+/// [`Self::own_names`] is `all` minus `imported` — the names the emitter itself
+/// writes — and is the only list a message may present as "the compiler's". An
+/// import that happens to reuse one of the emitter's always-written names
+/// (`mount`) is reported through the import arm: the sentence is still true, and
+/// the list stays free of the file's own aliases.
+#[derive(Debug)]
+struct Reserved {
+    all: Vec<String>,
+    imported: Vec<String>,
+}
+
+impl Reserved {
+    fn contains(&self, name: &str) -> bool {
+        self.all.iter().any(|candidate| candidate == name)
+    }
+
+    fn is_imported(&self, name: &str) -> bool {
+        self.imported.iter().any(|candidate| candidate == name)
+    }
+
+    /// Whether the **emitter itself** writes `name`, as opposed to reserving it
+    /// because this file imports it.
+    ///
+    /// This is the predicate the export arm needs. An imported name is reserved for
+    /// a *declaration* (which would shadow the import the module writes), but
+    /// exporting a local under that name collides with nothing: the import and the
+    /// export live in different namespaces in the emitted module. So the export arm
+    /// refuses only names the emitter chose.
+    fn is_own_name(&self, name: &str) -> bool {
+        self.contains(name) && !self.is_imported(name)
+    }
+
+    /// The emitter's own names, joined for a message.
+    ///
+    /// Never includes a name this file imports: those are the author's, and
+    /// presenting one as the compiler's is the defect this split exists to stop.
+    fn own_names(&self) -> String {
+        self.all
+            .iter()
+            .filter(|name| !self.is_imported(name))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("`, `")
+    }
+
+    /// [`Self::own_names`] wrapped as a parenthetical **clause**, or empty when the
+    /// list would be.
+    ///
+    /// E3: a message that interpolated `(` … `)` around an empty join printed a
+    /// dangling `` (` `) ``. Whether the list can be empty depends on the reserved
+    /// set for the mode, which is data, so the guard lives here rather than in a
+    /// caller that cannot know.
+    fn own_names_clause(&self) -> String {
+        let names = self.own_names();
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!(" (`{names}`)")
+        }
+    }
+
+    /// The clause that says **why** `name` is reserved, when this file imports it.
+    ///
+    /// `Some` means the name is the author's alias, so no message may present it as
+    /// one the compiler chose; `None` means the emitter writes it.
+    fn import_reason(&self, name: &str) -> Option<String> {
+        self.is_imported(name).then(|| {
+            format!(
+                "`{name}` is bound by an `import` from \"runai\" in this file, and the generated \
+                 module writes its own import list from the runtime"
+            )
+        })
+    }
+
+    /// The opening clause of a refusal: **why** `name` is reserved.
+    ///
+    /// The import fact and the emitter fact are different, so each message arm
+    /// starts from this and adds its own consequence.
+    fn reason(&self, name: &str) -> String {
+        self.import_reason(name).unwrap_or_else(|| {
+            format!(
+                "`{name}` is one of the names the generated module declares for itself{names}",
+                names = self.own_names_clause()
+            )
+        })
+    }
+}
+
+/// The names the module for `mode` declares or imports, split by why each is
+/// reserved — see [`Reserved`].
+///
+/// For `Static` the set is the fixed [`crate::ir::PRERENDER_NAMES`], and no name is
+/// reserved *because* of an import: the prerender module writes none. For `Island`
+/// it is [`crate::codegen::island_reserved_names`] — [`crate::ir::ISLAND_LOCALS`]
+/// plus the merged import list, which is data rather than a constant because it
+/// depends on the route. `imported` is read from the same specifier walk
+/// [`crate::codegen::island_reserved_names`] uses, so "the module imports this name"
+/// and "this name is refused because of the import" cannot disagree.
+///
+/// `source` is only read by the island arm, for the tree-dependent helpers.
+fn reserved_names(mode: Mode, source: &str, program: &Program<'_>) -> Reserved {
+    match mode {
+        Mode::Static => Reserved {
+            all: crate::ir::PRERENDER_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            imported: Vec::new(),
+        },
+        Mode::Island => {
+            let mut imported: Vec<String> = crate::analyze::signals::runai_specifiers(program)
+                .into_iter()
+                .filter(|(_, named)| *named)
+                .map(|(specifier, _)| {
+                    crate::analyze::signals::named_specifier_names(specifier)
+                        .1
+                        .to_string()
+                })
+                .collect();
+            imported.sort();
+            imported.dedup();
+            Reserved {
+                all: crate::codegen::island_reserved_names(source, program),
+                imported,
+            }
+        }
+    }
+}
+
+/// `RA014` for a name the source exports more than once.
+///
+/// Two exports of the same name in one module is a **syntax error** in ESM, not a
+/// style question: `node --check` rejects the module with `SyntaxError: Duplicate
+/// export of 's'`. Before this rule existed, `check` returned `[]` and `build`
+/// exited 0 for
+///
+/// ```tsx
+/// "use island"
+/// export const s = signal(0)
+/// export { s }
+/// ```
+///
+/// because the emitter copies an `export` statement verbatim *and* appends the
+/// specifier, so the artifact carried both and could not load. Since the
+/// duplicate is a syntax error in every case, there is no legal file to protect
+/// and the refusal is unconditional.
+///
+/// The row lands on the **second** export site, which is the statement to delete,
+/// and at the exported *name*'s span inside a specifier — not the specifier's own
+/// span, because the reserved-name arm already owns that span for
+/// `export { x as _attr }`, and `analyze`'s dedup would drop one of the two rows.
+fn duplicate_exports(program: &Program<'_>) -> Vec<Diagnostic> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    for statement in &program.body {
+        for site in export_sites(statement) {
+            match seen.iter().find(|(name, _)| *name == site.name) {
+                Some((_, first)) => out.push(duplicate_export_refusal(&site, first)),
+                None => seen.push((site.name.clone(), site.phrase.clone())),
+            }
+        }
+    }
+    out
+}
+
+/// One exported name in the source, the statement that exports it, and a short
+/// phrase naming that statement for the diagnostic.
+struct ExportSite {
+    name: String,
+    phrase: String,
+    span: (u32, u32),
+}
+
+/// Every name `statement` exports, in source order.
+///
+/// A type alias, an interface, and a `type` specifier are erased before emission,
+/// so they export nothing and are skipped — the same "type-only is not a value"
+/// predicate the rest of the crate uses.
+fn export_sites(statement: &Statement<'_>) -> Vec<ExportSite> {
+    let mut sites = Vec::new();
+    match statement {
+        Statement::ExportDeclaration(exported) => match &exported.declaration {
+            Declaration::VariableDeclaration(declaration) => {
+                let kind = match declaration.kind {
+                    oxc_ast::ast::VariableDeclarationKind::Const => "const",
+                    oxc_ast::ast::VariableDeclarationKind::Let => "let",
+                    oxc_ast::ast::VariableDeclarationKind::Var => "var",
+                    oxc_ast::ast::VariableDeclarationKind::Using => "using",
+                    oxc_ast::ast::VariableDeclarationKind::AwaitUsing => "await using",
+                };
+                for declarator in &declaration.declarations {
+                    for identifier in declarator.id.get_binding_identifiers() {
+                        let name = identifier.name.as_str().to_string();
+                        sites.push(ExportSite {
+                            phrase: format!("export {kind} {name}"),
+                            name,
+                            span: (identifier.span.start, identifier.span.end),
+                        });
+                    }
+                }
+            }
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(identifier) = &function.id {
+                    let name = identifier.name.as_str().to_string();
+                    sites.push(ExportSite {
+                        phrase: format!("export function {name}"),
+                        name,
+                        span: (identifier.span.start, identifier.span.end),
+                    });
+                }
+            }
+            Declaration::ClassDeclaration(class) => {
+                if let Some(identifier) = &class.id {
+                    let name = identifier.name.as_str().to_string();
+                    sites.push(ExportSite {
+                        phrase: format!("export class {name}"),
+                        name,
+                        span: (identifier.span.start, identifier.span.end),
+                    });
+                }
+            }
+            Declaration::TSEnumDeclaration(enumeration) => {
+                let name = enumeration.id.name.as_str().to_string();
+                sites.push(ExportSite {
+                    phrase: format!("export enum {name}"),
+                    name,
+                    span: (enumeration.id.span.start, enumeration.id.span.end),
+                });
+            }
+            Declaration::TSNamespaceDeclaration(namespace) => {
+                let name = namespace.id.name.as_str().to_string();
+                sites.push(ExportSite {
+                    phrase: format!("export namespace {name}"),
+                    name,
+                    span: (namespace.id.span.start, namespace.id.span.end),
+                });
+            }
+            Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {}
+            _ => {}
+        },
+        Statement::ExportNamedDeclaration(named) => {
+            for specifier in &named.specifiers {
+                if specifier.export_kind == oxc_ast::ast::ImportOrExportKind::Type {
+                    continue;
+                }
+                let exported = specifier.exported.name().as_str().to_string();
+                let local = specifier.local.name().as_str().to_string();
+                let phrase = if local == exported {
+                    format!("export {{ {exported} }}")
+                } else {
+                    format!("export {{ {local} as {exported} }}")
+                };
+                let span = specifier.exported.span();
+                sites.push(ExportSite {
+                    name: exported,
+                    phrase,
+                    span: (span.start, span.end),
+                });
+            }
+        }
+        // `export default …` exports the name `default`, whatever the declaration
+        // is called. The parser catches two of them only when both are literal
+        // `export default`; `export { P as default }` beside one is accepted and is
+        // what the duplicate rule catches.
+        Statement::ExportDefaultDeclaration(default) => sites.push(ExportSite {
+            name: "default".to_string(),
+            phrase: "export default".to_string(),
+            span: (default.span.start, default.span.end),
+        }),
+        _ => {}
+    }
+    sites
+}
+
+/// `RA014` for `site`, the second export of its name, naming the first one too.
+///
+/// Both halves are facts about the file the agent can check: the two statements
+/// that export the name, and ESM's one-export-per-name rule.
+///
+/// The message deliberately does **not** say the generated module carries both.
+/// The emitter copies an `export` statement verbatim, so for `export const s` beside
+/// `export { s }` it does — but `export default function P` and `export { P as
+/// default }` are both emitter-owned statements the artifact drops entirely, so a
+/// claim about the artifact would be false for that shape even though the file's own
+/// export list is still invalid ESM. What is true for every shape is the rule.
+fn duplicate_export_refusal(site: &ExportSite, first: &str) -> Diagnostic {
+    let name = &site.name;
+    Diagnostic::new(
+        Code::RA014,
+        site.span,
+        format!(
+            "`{name}` is exported twice: once by `{first}` and once by `{second}`, and an ES \
+             module may export a name once. Delete one of the two exports, or export one of them \
+             under a different name.",
+            second = site.phrase,
+        ),
+    )
+}
+
+/// One emitted module part: a whole statement, or the declarators a route
+/// statement leaves behind.
+///
+/// [`emitted_module_parts`] is the one definition of "emitted" at module scope, so
+/// this walk cannot check a statement the module omits, nor skip one it carries.
+fn check_part(
+    part: &crate::ir::EmittedModulePart<'_, '_>,
+    reserved: &Reserved,
+    mode: Mode,
+    scoping: &oxc_semantic::Scoping,
+    runai: &[oxc_semantic::SymbolId],
+    out: &mut Vec<Diagnostic>,
+) {
+    match part {
+        crate::ir::EmittedModulePart::Statement(statement) => {
+            check_declaration(statement, reserved, out);
+            // (2) Export names on the same statement. `export { x as render }`
+            // exports a reserved name without declaring one; `export const
+            // render` is caught by the declaration walk, so the specifier walk
+            // reports only the shapes that declare nothing reserved.
+            check_export_names(statement, reserved, mode, scoping, runai, out);
+        }
+        crate::ir::EmittedModulePart::Declarators { declarators, .. } => {
+            for declarator in declarators {
+                for identifier in declarator.id.get_binding_identifiers() {
+                    refuse_if_reserved(identifier.name.as_str(), identifier.span(), reserved, out);
+                }
+            }
+        }
+    }
+}
+
+/// The module-level statements the emitters write, in source order.
+///
+/// [`emitted_module_parts`] is the one definition of "emitted" at module scope,
+/// but it can also hand back the declarators a route statement leaves behind, so
+/// the reference walk needs those declarators as roots too. A statement is walked
+/// whole; a declarator alone is walked declarator by declarator, which is exactly
+/// what [`crate::ir::EmittedModulePart::visit`] does for the same span.
+fn emitted_reference_roots<'a>(
+    program: &Program<'a>,
+    route: &crate::analyze::ComponentInfo<'a>,
+    scoping: &oxc_semantic::Scoping,
+) -> Vec<crate::analyze::reachable::Reference> {
+    let mut found = Vec::new();
+    for part in emitted_module_parts(program, route) {
+        found.extend(references(scoping, |visitor| part.visit(visitor)));
+    }
+    found
+}
+
+/// Every name `statement` **declares**, refusing a reserved one.
+///
+/// Only declarations, not every statement: a reference is shape 3's question, and
+/// walking both here would report a name twice when it is declared and read. A
+/// `type` declaration, an `interface`, and an `enum` are not value declarations
+/// in the way this rule means — but `enum` and `namespace` **do** emit a runtime
+/// binding, so they are declarations here. A type alias and an interface are
+/// erased by `strip_types` and are skipped, which is the false positive this rule
+/// must never make.
+fn check_declaration(statement: &Statement<'_>, reserved: &Reserved, out: &mut Vec<Diagnostic>) {
+    match statement {
+        Statement::VariableDeclaration(declaration) => {
+            for declarator in &declaration.declarations {
+                for identifier in declarator.id.get_binding_identifiers() {
+                    refuse_if_reserved(identifier.name.as_str(), identifier.span(), reserved, out);
+                }
+            }
+        }
+        Statement::FunctionDeclaration(function) => {
+            if let Some(identifier) = &function.id {
+                refuse_if_reserved(identifier.name.as_str(), identifier.span(), reserved, out);
+            }
+        }
+        Statement::ClassDeclaration(class) => {
+            if let Some(identifier) = &class.id {
+                refuse_if_reserved(identifier.name.as_str(), identifier.span(), reserved, out);
+            }
+        }
+        Statement::TSEnumDeclaration(enumeration) => {
+            refuse_if_reserved(
+                enumeration.id.name.as_str(),
+                enumeration.id.span(),
+                reserved,
+                out,
+            );
+        }
+        Statement::TSNamespaceDeclaration(namespace) => {
+            refuse_if_reserved(
+                namespace.id.name.as_str(),
+                namespace.id.span(),
+                reserved,
+                out,
+            );
+        }
+        Statement::ExportDeclaration(exported) => {
+            match &exported.declaration {
+                Declaration::VariableDeclaration(declaration) => {
+                    for declarator in &declaration.declarations {
+                        for identifier in declarator.id.get_binding_identifiers() {
+                            refuse_if_reserved(
+                                identifier.name.as_str(),
+                                identifier.span(),
+                                reserved,
+                                out,
+                            );
+                        }
+                    }
+                }
+                Declaration::FunctionDeclaration(function) => {
+                    if let Some(identifier) = &function.id {
+                        refuse_if_reserved(
+                            identifier.name.as_str(),
+                            identifier.span(),
+                            reserved,
+                            out,
+                        );
+                    }
+                }
+                Declaration::ClassDeclaration(class) => {
+                    if let Some(identifier) = &class.id {
+                        refuse_if_reserved(
+                            identifier.name.as_str(),
+                            identifier.span(),
+                            reserved,
+                            out,
+                        );
+                    }
+                }
+                Declaration::TSEnumDeclaration(enumeration) => {
+                    refuse_if_reserved(
+                        enumeration.id.name.as_str(),
+                        enumeration.id.span(),
+                        reserved,
+                        out,
+                    );
+                }
+                // A `type` alias and an `interface` are erased before emission, so
+                // nothing exists under that name in the artifact.
+                Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
+                }
+                _ => {}
+            }
+        }
+        // A type alias, an interface, and a bodyless overload signature are erased
+        // by `strip_types`; they declare nothing in the emitted module.
+        Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {}
+        _ => {}
+    }
+}
+
+/// Refuse `name` at `span` when it is reserved.
+fn refuse_if_reserved(
+    name: &str,
+    span: oxc_span::Span,
+    reserved: &Reserved,
+    out: &mut Vec<Diagnostic>,
+) {
+    if reserved.contains(name) {
+        out.push(declaration_refusal((span.start, span.end), name, reserved));
+    }
+}
+
+/// Refuse every **export specifier** in `statement` whose *local* binding
+/// collides with the emitted module.
+///
+/// The question is the **specifier's local binding**, not its exported name.
+/// `export { v as _attr }` exports a value this file declares under a name the
+/// artifact reserves — that collides, because the artifact would export `_attr`
+/// beside its own binding. `export { myOwner }` beside `import { owner as myOwner
+/// }` exports the *import*, which the emitter also writes — that collides too.
+/// But `export { v as myOwner }` beside the same import exports `v`, a value this
+/// file declares, under a name that merely happens to be imported locally; the
+/// emitted module is valid ESM (`import { owner as myOwner } …; export { v as
+/// myOwner }` loads), so it must stay clean. Judging the exported name alone was a
+/// false positive (Task 15 fix round 5): it could not tell "exporting the import
+/// itself" from "exporting a local under a name that is also imported".
+///
+/// So the rule resolves the local name and asks which of two things it binds:
+///
+/// 1. **the `"runai"` import symbol** — exporting it would export the import, which
+///    the emitted module's own import list already binds; refused, with the import
+///    as the reason;
+/// 2. **anything else this file declares** — refused only when the artifact
+///    reserves the *exported* name, because the artifact would then export that
+///    name beside its own binding (`_attr`, `render`). A local exported under an
+///    ordinary name is legal and is not this rule's shape.
+///
+/// The two arms give different repairs: the emitter-own arm (2) may not say
+/// "export a value this file declares instead", because that is exactly what the
+/// file already does for the local — the legal repairs there are dropping or
+/// renaming the export. The import arm (1) can offer it, because the value exists
+/// and is not the import.
+fn check_export_names(
+    statement: &Statement<'_>,
+    reserved: &Reserved,
+    mode: Mode,
+    scoping: &oxc_semantic::Scoping,
+    runai: &[oxc_semantic::SymbolId],
+    out: &mut Vec<Diagnostic>,
+) {
+    let Statement::ExportNamedDeclaration(exported) = statement else {
+        return;
+    };
+    for specifier in &exported.specifiers {
+        let exported_name: &str = match &specifier.exported {
+            ModuleExportName::IdentifierName(identifier) => identifier.name.as_str(),
+            ModuleExportName::IdentifierReference(identifier) => identifier.name.as_str(),
+            ModuleExportName::StringLiteral(literal) => literal.value.as_str().unwrap_or(""),
+        };
+
+        // The local binding the specifier exports. A string-literal local is not a
+        // reference this file can bind (`export { "x" as y }` has no local name at
+        // all), so it never names an import symbol; it is judged by the emitted
+        // name alone, like a plain alias.
+        let local_name: Option<&str> = match &specifier.local {
+            ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str()),
+            ModuleExportName::IdentifierName(identifier) => Some(identifier.name.as_str()),
+            ModuleExportName::StringLiteral(_) => None,
+        };
+        let local_symbol = match &specifier.local {
+            ModuleExportName::IdentifierReference(identifier) => identifier
+                .reference_id
+                .get()
+                .and_then(|id| scoping.get_reference(id).symbol_id()),
+            ModuleExportName::IdentifierName(_) | ModuleExportName::StringLiteral(_) => None,
+        };
+
+        // Arm (1): the specifier exports the `"runai"` import symbol itself. The
+        // reason names the **local** binding (`owner` in `export { owner as other
+        // }`), because that is the thing bound by the import; the exported name is
+        // only where it would land.
+        if local_symbol.is_some_and(|symbol| runai.contains(&symbol)) {
+            let local = local_name.unwrap_or(exported_name);
+            let reason = reserved.import_reason(local).unwrap_or_else(|| {
+                format!(
+                    "`{local}` is bound by an `import` from \"runai\" in this file, and the \
+                     generated module writes its own import list from the runtime"
+                )
+            });
+            let lands = if local == exported_name {
+                format!("exporting `{local}` here would export that import")
+            } else {
+                format!("exporting it as `{exported_name}` here would export that import")
+            };
+            out.push(Diagnostic::new(
+                Code::RA014,
+                (specifier.span.start, specifier.span.end),
+                format!(
+                    "{reason}, so {lands} rather than a value this file declares. Export a value \
+                     this file declares instead, or drop the export."
+                ),
+            ));
+            continue;
+        }
+
+        // Arm (2): a local value exported under a name the emitter itself writes.
+        // A name that is only in the reserved set *because this file imports it* is
+        // not reserved as an export name: `export { v as owner }` beside
+        // `import { owner }` is valid ESM, and the artifact loads, so it stays clean
+        // (E1). Only a name the emitter declares for itself (`_esc`, `_attr`,
+        // `render`, the island locals) collides here.
+        if !reserved.is_own_name(exported_name) {
+            continue;
+        }
+        let owns_export = match mode {
+            Mode::Static => crate::ir::PRERENDER_EXPORTS.contains(&exported_name),
+            Mode::Island => crate::ir::ISLAND_EXPORTS.contains(&exported_name),
+        };
+        // The repair here may not be "export a value this file declares instead":
+        // the file already exports one, and for `_attr`/`render` a declaration of
+        // that name is itself refused, so naming it would be advice that cannot be
+        // followed (E2). Renaming the export name or dropping the export both work.
+        let message = if owns_export {
+            format!(
+                "the generated module exports `{exported_name}` of its own, so exporting \
+                 `{exported_name}` here would export `{exported_name}` twice and the module cannot \
+                 load. Rename the exported name, or drop the export."
+            )
+        } else {
+            format!(
+                "`{exported_name}` is one of the names the generated module declares for itself\
+                 {names}, so exporting a value under that name would export the generated module's \
+                 binding rather than this file's. Rename the exported name, or drop the export.",
+                names = reserved.own_names_clause()
+            )
+        };
+        out.push(Diagnostic::new(
+            Code::RA014,
+            (specifier.span.start, specifier.span.end),
+            message,
+        ));
+    }
+}
+
+/// `RA014` for a declaration that binds a reserved name.
+///
+/// The reason is split the same way the export arm's is (Task 15 fix round 4): a
+/// name the file **imports** is refused because the generated module writes its own
+/// import list, not because the compiler chose the name — listing the author's alias
+/// among the emitter's own names is the defect that split fixed.
+fn declaration_refusal(span: (u32, u32), name: &str, reserved: &Reserved) -> Diagnostic {
+    let message = match reserved.import_reason(name) {
+        Some(reason) => format!(
+            "{reason}, so a declaration of `{name}` here would collide with that import. Rename \
+             `{name}`."
+        ),
+        None => format!(
+            "`{name}` is one of the names the generated module declares for itself{names}, \
+             so a declaration here would shadow it and the template's call would reach the \
+             wrong binding. Rename `{name}`.",
+            names = reserved.own_names_clause(),
+        ),
+    };
+    Diagnostic::new(Code::RA014, span, message)
+}
+
+/// `RA014` for a reference to a reserved name.
+///
+/// The message distinguishes the kinds, because they are different defects with
+/// different repairs, and the repair must be legal when applied verbatim:
+///
+/// - [`ShadowKind::Undeclared`]: the name is declared nowhere, so in the emitted
+///   template it resolves to the compiler's own helper and renders its source
+///   text. This is the silent case the rule exists for.
+/// - [`ShadowKind::ModuleScope`] and [`ShadowKind::BodyScope`]: the name is
+///   declared here, so the declaration row already reports the rename; this row
+///   says the *use* names the shadow, so the agent updates it too rather than only
+///   the declaration.
+fn reference_refusal(
+    span: (u32, u32),
+    name: &str,
+    kind: ShadowKind,
+    route: &crate::analyze::ComponentInfo<'_>,
+    reserved: &Reserved,
+) -> Diagnostic {
+    let message = match kind {
+        ShadowKind::Undeclared => format!(
+            "{reason}, and nothing in `{route}` declares it, so in the emitted template it \
+             resolves to the compiler's own helper and renders its source text. Declare the \
+             value under a different name.",
+            reason = reserved.reason(name),
+            route = route.display_name(),
+        ),
+        ShadowKind::ModuleScope => format!(
+            "{reason}. This use names a module-level binding the file declares, which collides \
+             with {collides}. Rename it here and at its declaration.",
+            reason = reserved.reason(name),
+            collides = if reserved.is_imported(name) {
+                "the `import` from \"runai\" this file writes".to_string()
+            } else {
+                format!("the emitted module's own `{name}`")
+            },
+        ),
+        ShadowKind::BodyScope => format!(
+            "{reason}. This use names a binding the route body declares, and the body is copied \
+             into the generated component, so `{name}` is in scope at the generated call site and \
+             shadows {collides} there. Rename the body binding here and at its declaration.",
+            reason = reserved.reason(name),
+            collides = if reserved.is_imported(name) {
+                "the `import` from \"runai\" this file writes".to_string()
+            } else {
+                format!("the module's own `{name}`")
+            },
+        ),
+    };
+    Diagnostic::new(Code::RA014, span, message)
+}
+
+/// How a reserved-name reference collides with the emitted module, which decides
+/// the reason [`reference_refusal`] gives.
+///
+/// A reference that resolves to an ordinary nested-scope local is none of these
+/// and is not refused; see [`reference_collision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowKind {
+    /// Declared nowhere: it resolves to the compiler's own helper or `render()`.
+    Undeclared,
+    /// Declared at the file's module scope, where the emitter also declares
+    /// `render` and its helpers.
+    ModuleScope,
+    /// Declared in the route component's own function scope — the scope the
+    /// emitter copies into `render()`. A `var` hoists here from a nested block, a
+    /// `for` init, or a `try`/`catch`, so the emitted call site reaches it.
+    BodyScope,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_module_declaration_named_render_is_ra014() {
+        let src = "\"use static\"\nconst render = 1\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(d[0].message.contains("render"), "{}", d[0].message);
+    }
+
+    /// The module would export `render` twice: once by its own `export function
+    /// render()`, once by this alias. The row is at the specifier, which is the
+    /// statement to edit — the local `x` is fine and needs no rename.
+    ///
+    /// `render` is the **one** reserved name the artifact also exports, so it is
+    /// the only name whose export is a true duplicate; the message must say so,
+    /// while an export of any other reserved name must not claim it.
+    #[test]
+    fn an_export_alias_named_render_is_ra014() {
+        let src = "\"use static\"\nconst x = 1\nexport { x as render }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter().any(|diagnostic| diagnostic.code == Code::RA014
+                && diagnostic.message.contains("exports `render` of its own")),
+            "{d:?}"
+        );
+        let row = d
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("twice"))
+            .unwrap();
+        assert_eq!(
+            &src[row.span.0 as usize..row.span.1 as usize],
+            "x as render",
+            "the span is the specifier to rewrite: {row:?}"
+        );
+    }
+
+    /// The false statement F1 removed, pinned from the other side: exporting a
+    /// reserved name that is **not** `render` collides with a binding, it does not
+    /// duplicate an export. `_attr` is declared in a prerender module but never
+    /// exported, so a message claiming a duplicate export for it would be false —
+    /// the same defect as the removed `"runai"` re-export clause.
+    #[test]
+    fn a_reserved_export_other_than_render_claims_no_duplicate() {
+        let src = "\"use static\"\nconst x = 1\nexport { x as _attr }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        let row = d
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::RA014)
+            .unwrap_or_else(|| panic!("exporting `_attr` must be refused: {d:?}"));
+        for false_claim in ["duplicate export", "twice", "cannot load"] {
+            assert!(
+                !row.message.contains(false_claim),
+                "exporting `_attr` is not a duplicate export: {}",
+                row.message
+            );
+        }
+        assert!(
+            row.message.contains("declares for itself") && row.message.contains("`_attr`"),
+            "the reason names the collision with the module's binding: {}",
+            row.message
+        );
+    }
+
+    /// The body binding would shadow the escaper the template calls: every
+    /// `${_esc(…)}` in the emitted `render()` would reach this local.
+    #[test]
+    fn a_body_binding_named_esc_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { const _esc = (v: string) => \"no\"; const name = \"<Ada>\"; return <p>{name}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(d[0].message.contains("_esc"), "{}", d[0].message);
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    /// The sharpest case: `_esc` is not declared anywhere, so in the emitted
+    /// template it resolves to the compiler's own helper and renders its source
+    /// text. Refusing the reference is the only way to stop that being silent.
+    #[test]
+    fn a_reference_to_a_reserved_name_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{_esc(\"x\")}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("_esc"),
+            "the message names the colliding name: {}",
+            d[0].message
+        );
+    }
+
+    /// The false positive this rule must never make: `strip_types` erases a type
+    /// alias, so nothing is emitted under that name.
+    #[test]
+    fn a_type_alias_named_render_is_allowed() {
+        let src = "\"use static\"\ntype render = 1\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n";
+        assert!(crate::analyze::analyze(src, "src/routes/about.page.tsx").is_empty());
+    }
+
+    /// A property name is not a binding. Refusing it would reject an ordinary page.
+    #[test]
+    fn a_member_property_named_render_is_allowed() {
+        let src = "\"use static\"\nconst o = { render: \"x\" }\nexport default function P(props: Record<never, never>) { return <p>{o.render}</p> }\n";
+        assert!(crate::analyze::analyze(src, "src/routes/about.page.tsx").is_empty());
+    }
+
+    /// A nested arrow parameter named `render` shadows nothing the emitter
+    /// declares: it is an ordinary local of a callback in the markup, and every
+    /// `${_esc(…)}` in the template still reaches the module-level helper. The
+    /// reference resolves to that parameter, which the file itself declares, so it
+    /// is a legitimate local, not a collision. Refusing it was a false positive on
+    /// a legal page.
+    #[test]
+    fn a_nested_arrow_parameter_named_render_is_allowed() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{items.map((render) => render.render).join(\",\")}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "an arrow parameter is an ordinary shadow: {d:?}"
+        );
+    }
+
+    /// The control for the test above: an **undeclared** `render` is still
+    /// refused, because it resolves to the compiler's own `export function
+    /// render()` and the template would call it. Loosening the rule for a real
+    /// shadow must not loosen it for the silent case.
+    #[test]
+    fn an_undeclared_render_reference_is_still_refused() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>{render}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter().any(|row| row.code == Code::RA014),
+            "an undeclared `render` resolves to the emitted `render()`: {d:?}"
+        );
+    }
+
+    /// A `var` in a **nested block** of the route body is hoisted to the
+    /// component's own function scope — the scope the emitter copies into
+    /// `render()` — so the template's `_esc(…)` reaches it. Round 1 judged a
+    /// reference by "is its symbol declared at module scope", which is the wrong
+    /// question for `var`: this emitted a module that rendered `<p>hijacked</p>`
+    /// with no diagnostic, because the nested block is not module scope.
+    ///
+    /// The predicate is now "is the reserved name in scope at the emitted call
+    /// site", i.e. does the reference resolve to a binding whose nearest
+    /// enclosing function is the route component itself.
+    #[test]
+    fn a_var_in_a_nested_block_that_reaches_the_call_site_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const on = true; if (on) { var _esc = (v: unknown) => \"hijacked\"; }\n  return <p>{_esc(\"x\")}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        // Two rows for one problem, the same shape the module-scope arm has: the
+        // declaration is where the rename happens, the use is where the agent reads
+        // why. The declaration row is `check_scope_bindings`'s; the other is the
+        // reference walk's. Both rows are pinned, not "at least one": each names a
+        // distinct edit, and dropping either would hide a site.
+        assert_eq!(d.len(), 2, "a declaration row and a reference row: {d:?}");
+
+        let declaration = d
+            .iter()
+            .find(|row| {
+                row.message
+                    .contains("declared in the route component's own scope")
+            })
+            .unwrap_or_else(|| panic!("the declaration row is missing: {d:?}"));
+        assert_eq!(declaration.code, Code::RA014);
+        assert_eq!(
+            &src[declaration.span.0 as usize..declaration.span.1 as usize],
+            "_esc",
+            "the declaration row points at the binding to rename: {declaration:?}"
+        );
+
+        let reference = d
+            .iter()
+            .find(|row| row.message.contains("body declares"))
+            .unwrap_or_else(|| panic!("the reference row is missing: {d:?}"));
+        assert_eq!(reference.code, Code::RA014);
+        assert_eq!(
+            &src[reference.span.0 as usize..reference.span.1 as usize],
+            "_esc",
+            "the span is the hijacking call: {reference:?}"
+        );
+    }
+
+    /// A `for (var …)` initialiser hoists to the function scope just as a nested
+    /// block does. This shape emitted a module that threw at build time
+    /// (`TypeError: _esc is not a function`) while every test in the crate passed.
+    #[test]
+    fn a_var_in_a_for_initialiser_that_reaches_the_call_site_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  for (var _esc = 1; false;) {}\n  return <p>{_esc(\"x\")}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter()
+                .any(|row| row.code == Code::RA014 && row.message.contains("body declares")),
+            "a `var` in a `for` init reaches the call site: {d:?}"
+        );
+    }
+
+    /// A block-scoped `const` in a nested block does **not** reach the call site:
+    /// in the emitted template the reference resolves to nothing, which is the
+    /// silent-helper case the round-1 message already covers. Refusing it stays
+    /// correct, and the reason is the reference, not the declaration.
+    #[test]
+    fn a_nested_block_const_that_does_not_reach_the_call_site_is_still_refused() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  { const _esc = 1; }\n  return <p>{_esc(\"x\")}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.iter()
+                .any(|row| row.code == Code::RA014
+                    && row.message.contains("nothing in `P` declares it")),
+            "the reference resolves to nothing at the call site: {d:?}"
+        );
+    }
+
+    /// A `var` inside a **nested function** never reaches the emitted call site:
+    /// its nearest enclosing function is that nested function, so the emitted
+    /// module's `_esc` is untouched. Nothing in the markup names it, so the file
+    /// is clean. This is the guard that keeps the hoisting rule from refusing
+    /// every helper that happens to use the name.
+    #[test]
+    fn a_var_in_a_nested_function_that_nothing_references_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  function f() { var _esc = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a nested function's local never reaches render()'s call site: {d:?}"
+        );
+    }
+
+    /// The route component always names something in the emitted module: the
+    /// emitters rebuild it as `export function render()`, so a component named
+    /// `render` is legal. The row an agent sees for a reserved-named component is
+    /// `reachable`'s, which owns the "the component is not a binding in the
+    /// artifact" wording; `emitted_names` must not add a second row for the same
+    /// problem. Exactly one row, not "at least one": the claim is one problem, one
+    /// row.
+    #[test]
+    fn a_reserved_named_route_component_is_named_by_the_reachable_rule() {
+        let src = "\"use static\"\nexport default function render(props: Record<never, never>) { return <p>{render.name}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "one problem, one row: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("route's own component"),
+            "the row is `reachable`'s: {}",
+            d[0].message
+        );
+    }
+
+    /// The declaration rule proper: an **unreferenced** `var` in a nested block
+    /// still hoists into the route component's own scope, which the emitter copies
+    /// into `render()`. Nothing in the file names `_esc`, so the reference walk
+    /// has nothing to say — and `check_declaration` only walks the *top level* of
+    /// the emitted body, so a nested `if` swallowed it. The artifact this emitted
+    /// under `f2b2dea` was `return \`<p>${_esc(1 + 1)}</p>\`` with `var _esc = 1`
+    /// above it, i.e. `TypeError: _esc is not a function` at build time while
+    /// `check` was clean.
+    #[test]
+    fn an_unreferenced_var_in_a_nested_block_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { var _esc = 1 }\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_esc`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    /// The same defect through the dynamic-attribute helper: an unreferenced
+    /// `var _attr` is in scope where `${_attr("class", …)}` runs, so the emitted
+    /// module would throw on the attribute instead of the slot.
+    #[test]
+    fn an_unreferenced_var_for_a_dynamic_attribute_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const cls = \"a\"\n  if (false) { var _attr = 1 }\n  return <p class={cls}>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_attr`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// The scope cell is populated from a different AST node for an arrow route
+    /// (`ArrowFunctionExpression` rather than `Function`), so the declaration rule
+    /// is exercised through that node too. `f2b2dea` judged only a *reference's*
+    /// scope, so this fixture was clean and the artifact threw.
+    #[test]
+    fn an_unreferenced_var_in_an_arrow_route_is_ra014() {
+        let src = "\"use static\"\nconst P = (props: Record<never, never>) => {\n  if (false) { var _esc = 1 }\n  return <p>{1 + 1}</p>\n}\nexport default P\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_esc`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// ESM is strict, so a **block-level function declaration** is scoped to its
+    /// block; it does not hoist out to `render()`. `oxc_semantic`'s binder agrees
+    /// (the block is its own scope), so this is legal and the artifact must still
+    /// be emitted.
+    #[test]
+    fn a_block_level_function_declaration_is_not_hoisted_out_of_its_block() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { function _esc() {} }\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a block-level function declaration stays in its block: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx").is_ok(),
+            "the artifact is still emitted"
+        );
+    }
+
+    /// A block-scoped `const` is declared in the block's own scope, not the
+    /// route component's, so with nothing referencing it there is no collision at
+    /// all.
+    #[test]
+    fn an_unreferenced_nested_block_const_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { const _esc = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "a block `const` stays in its block: {d:?}");
+    }
+
+    /// The declaration rule reads the route component's own scope, and one shape
+    /// binds a name *there* without shadowing anything: a named **function
+    /// expression** route. Its name is the component's, and the emitter rebuilds
+    /// the component from `RouteIr` rather than writing the expression, so the
+    /// name never appears in the artifact. Refusing it would be a false positive
+    /// on a legal page — the same class of mistake the arrow-parameter control
+    /// guards.
+    #[test]
+    fn a_named_function_expression_route_is_clean() {
+        let src = "\"use static\"\nexport default (function render(props: Record<never, never>) { return <p>hi</p> })\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "the component's own name is not a binding in the artifact: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx").is_ok(),
+            "the artifact is still emitted"
+        );
+    }
+
+    /// A nested function expression's own name is declared in *its* scope, not the
+    /// route component's, so it cannot reach the emitted call site.
+    #[test]
+    fn a_named_nested_function_expression_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const f = function _esc() {};\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a nested function expression owns its name: {d:?}"
+        );
+    }
+
+    /// A `var` declared through a destructuring pattern hoists exactly like a
+    /// plain `var`: the pattern binds `_esc` in the component's scope. Nothing
+    /// references it, so only the declaration rule can see it.
+    #[test]
+    fn an_unreferenced_destructured_var_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { var { _esc } = { _esc: 1 } }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a destructured `var` hoists too: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`_esc`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// A `try`/`catch` body's `var` hoists out of the `catch` block in the same
+    /// way a nested `if` does, so the same rule catches it.
+    #[test]
+    fn an_unreferenced_var_in_a_catch_block_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  try {} catch (e) { var _esc = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a `catch` block's `var` hoists: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+    }
+
+    /// A `catch` parameter is scoped to the `catch` block, not the route function,
+    /// so it never reaches the emitted call site.
+    #[test]
+    fn a_catch_parameter_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  try {} catch (_esc) {}\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a `catch` parameter stays in its block: {d:?}"
+        );
+    }
+
+    /// A `for (let …)` head is block-scoped to the loop, so it is not the route
+    /// function's binding. The control for the `for (var …)` case.
+    #[test]
+    fn an_unreferenced_for_let_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  for (let _esc = 1; false;) {}\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "a `let` is scoped to its loop: {d:?}");
+    }
+
+    /// A `type` alias or `interface` in the body binds a symbol in the route
+    /// scope's type space, but `strip_types` erases it, so nothing is emitted
+    /// under the name. The declaration rule must not refuse what the binder puts
+    /// there for a type.
+    #[test]
+    fn an_unreferenced_type_alias_in_the_body_is_clean() {
+        for declaration in ["type _esc = 1", "interface _esc { a: 1 }"] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{\n  {declaration};\n  return <p>hi</p>\n}}\n"
+            );
+            let d = crate::analyze::analyze(&src, "src/routes/about.page.tsx");
+            assert!(
+                d.is_empty(),
+                "a type is erased before emission: {declaration}: {d:?}"
+            );
+        }
+    }
+
+    /// N2: the `scope_id` cell fails **closed**, and this pins that it is
+    /// populated for both route shapes — the shape that made the old `None` arm a
+    /// silent no-op. `None` would mean the walk never visited the component, which
+    /// the `debug_assert!` in `check_emitted_names` turns into a refusal rather
+    /// than a quiet pass.
+    #[test]
+    fn the_route_scope_cell_is_populated_for_both_route_shapes() {
+        for src in [
+            "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+            "\"use static\"\nconst P = (props: Record<never, never>) => <p>hi</p>\nexport default P\n",
+        ] {
+            let alloc = oxc_allocator::Allocator::default();
+            let program = crate::source::parse_tsx(&alloc, src).unwrap();
+            let render = crate::analyze::jsx::route_render(program).unwrap();
+            let semantic = oxc_semantic::SemanticBuilder::new().build(program).semantic;
+            assert!(
+                render.scope_id.get().is_some(),
+                "the semantic build fills the route scope cell: {src}"
+            );
+            drop(semantic);
+        }
+    }
+
+    /// A component module is not emitted by this milestone, so there is no helper
+    /// to shadow. Without this control, dropping the route guard would refuse
+    /// every `_shell.tsx` that happens to name `render`.
+    #[test]
+    fn a_component_module_may_name_a_reserved_name() {
+        let src = "const render = 1\nexport function Header(props: Record<never, never>) { return <h1>{render}</h1> }\n";
+        assert!(
+            crate::analyze::analyze(src, "src/routes/_shell.tsx").is_empty(),
+            "nothing is emitted from a component module"
+        );
+    }
+
+    /// Run `module` as an ESM file under `node` and return what `render()` prints.
+    ///
+    /// The point of the clean-fixture controls below is the **artifact**, not the
+    /// diagnostic list: a module can be clean and still throw, which is exactly how
+    /// earlier rounds found their defects. `node` is the engine the build uses.
+    /// `None` means `node` is not installed, in which case the caller still proves
+    /// the artifact is a module (it was emitted and parses); shelling out is the
+    /// extra evidence, not the only evidence.
+    fn render_under_node(module: &str) -> Option<String> {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "runai-emitted-names-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("route.mjs");
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(module.as_bytes()))
+            .expect("write the emitted module");
+        let output = std::process::Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(format!(
+                "const {{ pathToFileURL }} = await import(\"node:url\"); \
+                 const m = await import(pathToFileURL(\"{}\").href); \
+                 process.stdout.write(m.render());",
+                path.display()
+            ))
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match output {
+            Ok(output) if output.status.success() => {
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            Ok(output) => panic!(
+                "the emitted module must run under node: {module}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("could not run node: {error}"),
+        }
+    }
+
+    /// Assert that `module` renders `expected` — running it under `node` when it is
+    /// installed, and otherwise asserting it parses as ESM, so the check never
+    /// silently disappears.
+    fn assert_renders(module: &str, expected: &str) {
+        match render_under_node(module) {
+            Some(html) => assert_eq!(html, expected, "the artifact renders: {module}"),
+            None => {
+                let alloc = oxc_allocator::Allocator::default();
+                let ret =
+                    oxc_parser::Parser::new(&alloc, module, oxc_span::SourceType::mjs()).parse();
+                assert!(
+                    ret.diagnostics.is_empty(),
+                    "node is unavailable; the artifact must at least parse: {module}\n{:?}",
+                    ret.diagnostics
+                );
+                eprintln!("node is not installed: asserted the artifact parses instead");
+            }
+        }
+    }
+
+    /// NEW-3: a body `type` alias beside a `var` of the same reserved name. Oxc's
+    /// binder unions the nested `var`'s flags onto the type-alias symbol for the
+    /// name, so the union reports a type — and skipping "any symbol whose flags
+    /// look like a type" hid the **value** binding with it. The `var` alone is a
+    /// real hoist into `render()`'s scope: the artifact carried `var _esc = 1`
+    /// above `${_esc(1 + 1)}` and threw `TypeError: _esc is not a function`.
+    #[test]
+    fn a_var_beside_a_type_alias_of_the_same_name_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  type _esc = 1; if (false) { var _esc = 1 }\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "the `var` is a value binding: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message
+                .contains("declared in the route component's own scope"),
+            "the row is the declaration rule's: {}",
+            d[0].message
+        );
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx").is_err(),
+            "the file is refused, so no module with `var _esc = 1` is written"
+        );
+    }
+
+    /// The control for NEW-3: `type _esc = 1` **alone** is erased by
+    /// `strip_types`, so nothing is emitted under the name. The ruling is "skip
+    /// only when the symbol is type-only", not "skip when it is a type".
+    #[test]
+    fn a_body_type_alias_alone_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  type _esc = 1\n  return <p>{1 + 1}</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "a type is erased before emission: {d:?}");
+        let module = crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx")
+            .expect("a type alias alone emits");
+        assert!(
+            !module.contains("_esc = 1"),
+            "the type alias is not written: {module}"
+        );
+        assert_renders(&module, "<p>2</p>");
+    }
+
+    /// The pin for the shape that already refused: a `type` alias and a top-level
+    /// `var` of the same reserved name in the same scope. Oxc merges them into one
+    /// symbol whose flags are both type and value; the declaration rule must see
+    /// the value half. One row, because both walks land on the same identifier.
+    #[test]
+    fn a_top_level_var_beside_a_type_alias_of_the_same_name_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  type _esc = 1; var _esc = 1\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "one problem, one row: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    /// NEW-1: a **declarator-named** function-expression component. The binder
+    /// puts the function expression's own name (`render`) in the function's own
+    /// scope — which is the route scope — while `ComponentInfo::name_span` records
+    /// the **declarator** (`Page`), so the `route.name_span` skip misses it. The
+    /// emitter rebuilds the component from `RouteIr` and never writes the function
+    /// expression's name, so this is a false positive on a legal page — and the
+    /// artifact it refused was fine, which the `node` run below proves.
+    #[test]
+    fn a_declarator_named_function_expression_route_is_clean() {
+        let src = "\"use static\"\nconst Page = function render(props: Record<never, never>) { return <p>hi</p> }\nexport default Page\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "the function expression's own name is not a binding in the artifact: {d:?}"
+        );
+        let module = crate::codegen::emit_prerender_checked(src, "src/routes/about.page.tsx")
+            .expect("the artifact is emitted");
+        assert!(
+            !module.contains("function render(props)"),
+            "the function expression itself is not written: {module}"
+        );
+        assert_renders(&module, "<p>hi</p>");
+    }
+
+    /// The control for the ruling's "do not widen the skip by name": a function
+    /// expression whose own name is an ordinary identifier stays clean.
+    #[test]
+    fn a_declarator_named_function_expression_with_an_ordinary_name_is_clean() {
+        let src = "\"use static\"\nconst Page = function helper(props: Record<never, never>) { return <p>hi</p> }\nexport default Page\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(d.is_empty(), "an ordinary own name is clean: {d:?}");
+    }
+
+    /// The other half of NEW-1's ruling: `SymbolFlags::FunctionExpression` must
+    /// not become a blanket skip. A genuine `var render` in a nested block of a
+    /// block-body route is a real hoist into `render()`'s scope and keeps refusing.
+    #[test]
+    fn a_genuine_nested_var_named_render_is_still_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  if (false) { var render = 1 }\n  return <p>hi</p>\n}\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "a hoisted `var render` is refused: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`render`"),
+            "the message names the reserved name: {}",
+            d[0].message
+        );
+    }
+
+    /// NEW-2: a reserved binding **after** the JSX `return` is never emitted —
+    /// [`crate::ir::emitted_body_statements`] stops at `return_span`, so the
+    /// artifact has no shadow and the only defect would be a false positive.
+    #[test]
+    fn a_reserved_var_after_the_return_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p>; var _esc = 1 }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a binding after the return is never emitted: {d:?}"
+        );
+    }
+
+    /// The same rule for a `const`, which is not hoisted anywhere the emitter
+    /// writes: unreachable code after the `return` is not copied into `render()`.
+    #[test]
+    fn a_reserved_const_after_the_return_is_clean() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hi</p>; const _attr = 1 }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert!(
+            d.is_empty(),
+            "a binding after the return is never emitted: {d:?}"
+        );
+    }
+
+    /// The control for NEW-2: move the same binding **before** the return and it is
+    /// emitted into `render()`, so it refuses. Narrowing the rule to the emitted
+    /// range must not narrow it past the range.
+    #[test]
+    fn a_reserved_var_before_the_return_is_ra014() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { var _esc = 1; return <p>hi</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+        assert_eq!(d.len(), 1, "the emitted range includes this binding: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "_esc",
+            "the span is the binding to rename: {d:?}"
+        );
+    }
+
+    // --- The island reserved set (Task 11, Step 4) ---------------------------
+
+    /// An island module declares `signal`, `mount`, `template`, the helpers it
+    /// uses, and its own `_el`/`_a`/`_t0`/`_c`. A route file that declares one of
+    /// those names would shadow the import or the emitter local, so it is `RA014`.
+    #[test]
+    fn island_reserved_names_are_refused_for_each_shape() {
+        for (src, name) in [
+            // A module-level `const mount` collides with the import the module
+            // writes (`Identifier 'mount' has already been declared`).
+            (
+                "\"use island\"\nconst mount = 1\nexport default function P(props: Record<never, never>) { return <p>{mount}</p> }\n",
+                "mount",
+            ),
+            // A module-level `const signal` beside the `signal` import.
+            (
+                "\"use island\"\nimport { signal } from \"runai\"\nconst signal = 1\nexport default function P(props: Record<never, never>) { return <p>{signal}</p> }\n",
+                "signal",
+            ),
+            // A body `const _a` collides with the emitter's marker list.
+            (
+                "\"use island\"\nexport default function P(props: Record<never, never>) { const _a = 1; return <p>{_a}</p> }\n",
+                "_a",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            assert!(
+                d.iter().any(
+                    |row| row.code == Code::RA014 && row.message.contains(&format!("`{name}`"))
+                ),
+                "{name}: the reserved name is refused and named: {d:?}"
+            );
+        }
+    }
+
+    /// The same names are legal in a **static** route except the prerender set:
+    /// a static module has no import and no `_el`, so `mount`/`signal`/`_a` are
+    /// ordinary names there.
+    #[test]
+    fn island_reserved_names_are_legal_in_a_static_route() {
+        for src in [
+            "\"use static\"\nconst mount = 1\nexport default function P(props: Record<never, never>) { return <p>{mount}</p> }\n",
+            "\"use static\"\nconst signal = 1\nexport default function P(props: Record<never, never>) { return <p>{signal}</p> }\n",
+            "\"use static\"\nexport default function P(props: Record<never, never>) { const _a = 1; return <p>{_a}</p> }\n",
+        ] {
+            assert!(
+                crate::analyze::analyze(src, "src/routes/about.page.tsx").is_empty(),
+                "an island name is legal in a static route: {src}"
+            );
+        }
+    }
+
+    /// A name the route **never imports** is not reserved — refusing `derived` on a
+    /// page that does not import it would be a false positive on a legal route. The
+    /// reserved set is data (the merged import list), not a fixed superset.
+    #[test]
+    fn a_name_the_route_does_not_import_is_not_refused() {
+        // `derived` is not imported, so a body local of that name is legal.
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { const derived = 1; return <p>{derived}</p> }\n";
+        assert!(
+            crate::analyze::analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "a name the module does not import is not reserved"
+        );
+    }
+
+    // --- The reason a reserved name is reserved (Task 15, fix round 4) -------
+
+    /// An **aliased** import is the shape that exposed the false sentence: the
+    /// reserved set is a merge of the emitter's own names and every local name this
+    /// file imports, so a name that is only there *because the file imports it* was
+    /// listed as one of "the names the generated module declares for itself". The
+    /// author's `myOwner` is not a name the compiler chose, and an agent reading the
+    /// old text could not tell whether to rename the import or drop the export.
+    ///
+    /// Both halves are asserted: the positive facts (the reason is the `import`
+    /// from `"runai"`, and a repair is given) and the absence of the false claim. A
+    /// blacklist alone would pass a differently-worded falsehood, which is how the
+    /// previous two rounds went wrong.
+    #[test]
+    fn an_exported_aliased_import_names_the_import_as_the_reason() {
+        let src = "\"use island\"\nimport { owner as myOwner } from \"runai\"\nexport { myOwner }\nexport default function P(props: Record<never, never>) { return <p/> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        let rows: Vec<&Diagnostic> = d.iter().filter(|row| row.code == Code::RA014).collect();
+        assert_eq!(rows.len(), 1, "one refusal for the exported import: {d:?}");
+        let message = &rows[0].message;
+        assert_eq!(
+            &src[rows[0].span.0 as usize..rows[0].span.1 as usize],
+            "myOwner",
+            "the span is the export specifier to fix: {rows:?}"
+        );
+
+        // Positive facts: the real reason and a legal repair.
+        assert!(
+            message.contains("`myOwner`"),
+            "the message names the exported binding: {message}"
+        );
+        assert!(
+            message.contains("import") && message.contains("\"runai\""),
+            "the reason is the import from `\"runai\"` this file writes: {message}"
+        );
+        assert!(
+            message.contains("Export a value this file declares instead"),
+            "the repair is legal when applied verbatim: {message}"
+        );
+        assert!(
+            message.contains("drop the export"),
+            "the other legal repair is offered: {message}"
+        );
+
+        // The false claim: `myOwner` is the author's name, not the compiler's.
+        for false_claim in [
+            "reserves for itself",
+            "declares for itself",
+            "one of the names the generated module",
+        ] {
+            assert!(
+                !message.contains(false_claim),
+                "`myOwner` is bound by this file's own import, not chosen by the compiler; \
+                 the message says `{false_claim}`: {message}"
+            );
+        }
+    }
+
+    /// The sibling arm: `check_declaration` builds the same list by joining the
+    /// merged set, so a declaration of a name the file **imports** was presented as
+    /// one of the compiler's own. The list can contain an author's name there too,
+    /// and the reason is the import, not the emitter's locals.
+    #[test]
+    fn a_declaration_of_an_imported_name_names_the_import_as_the_reason() {
+        for src in [
+            // A module-level declaration beside the import of the same name.
+            "\"use island\"\nimport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\nconst owner = 1\n",
+            // A body `const` and a hoisted `var`, which the emitter copies into
+            // the generated component.
+            "\"use island\"\nimport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { const owner = 1; return <p/> }\n",
+            "\"use island\"\nimport { owner } from \"runai\"\nexport default function P(props: Record<never, never>) { if (false) { var owner = 1 } return <p/> }\n",
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014)
+                .unwrap_or_else(|| panic!("a declaration of an imported name is refused: {d:?}"));
+            assert!(
+                row.message.contains("import") && row.message.contains("\"runai\""),
+                "the reason is the import this file writes: {}",
+                row.message
+            );
+            assert!(
+                !row.message.contains("declares for itself")
+                    && !row.message.contains("reserves for itself"),
+                "`owner` is the file's own import, not a compiler name: {}",
+                row.message
+            );
+            assert!(
+                row.message.contains("Rename `owner`"),
+                "the repair is legal when applied verbatim: {}",
+                row.message
+            );
+        }
+    }
+
+    /// The controls for the two tests above, both directions:
+    ///
+    /// - a **local** export is clean and the built module carries it, so the repair
+    ///   the message offers is not refused elsewhere;
+    /// - a name the emitter itself chose (`_attr`, `render`) still refuses, and its
+    ///   message may name the compiler's list — that list is the compiler's.
+    ///
+    /// The local here is a plain `const` with a specifier, not `export const s`
+    /// beside `export { s }`: the latter exports `s` twice, which is D1's defect and
+    /// is refused at its own row since round 6. The `export const` shape alone —
+    /// one export — is the second control below, and it is clean and valid ESM.
+    #[test]
+    fn the_export_arm_still_accepts_locals_and_refuses_the_emitters_own_names() {
+        let local = "\"use island\"\nimport { signal } from \"runai\"\nconst s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        assert!(
+            crate::analyze::analyze(local, "src/routes/index.page.tsx").is_empty(),
+            "a local export is legal"
+        );
+        let module =
+            crate::codegen::emit_client_checked(local, "src/routes/index.page.tsx", "/r.js")
+                .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { s };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
+
+        // The other single-export shape: the declaration itself carries `export`,
+        // with no specifier beside it. Also clean and valid ESM.
+        let declared = "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        assert!(
+            crate::analyze::analyze(declared, "src/routes/index.page.tsx").is_empty(),
+            "one `export const` and no specifier exports `s` once"
+        );
+        let module =
+            crate::codegen::emit_client_checked(declared, "src/routes/index.page.tsx", "/r.js")
+                .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export const s = signal(0);"),
+            "the artifact carries the declared export: {module}"
+        );
+        assert_valid_esm(&module);
+
+        for (src, name) in [
+            (
+                "\"use static\"\nconst x = 1\nexport { x as _attr }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                "_attr",
+            ),
+            (
+                "\"use static\"\nconst x = 1\nexport { x as render }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                "render",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/about.page.tsx");
+            assert!(
+                d.iter().any(
+                    |row| row.code == Code::RA014 && row.message.contains(&format!("`{name}`"))
+                ),
+                "exporting `{name}` is still refused: {d:?}"
+            );
+        }
+    }
+
+    /// The positive control for the test above: import `derived` and a body local of
+    /// the same name **is** refused, because the module now writes that import.
+    #[test]
+    fn an_imported_name_is_refused_even_when_only_the_import_uses_it() {
+        let src = "\"use island\"\nimport { derived } from \"runai\"\nexport default function P(props: Record<never, never>) { const derived = 1; return <p>{derived}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d[0].code, Code::RA014, "{d:?}");
+        assert!(
+            d.iter().any(|row| row.message.contains("`derived`")),
+            "the message names it: {d:?}"
+        );
+    }
+
+    // --- The exported name is not the question; the local binding is (round 5) --
+
+    /// Assert that `module` is valid ESM as `node` defines it, by writing it to a
+    /// file and running `node --check`.
+    ///
+    /// This is the test the reviewer's evidence used: `import { owner as myOwner }
+    /// … ; export { v as myOwner }` is valid ESM, and a diagnostic claiming it is
+    /// not has to be measured against the parser that defines ESM. `node --check`
+    /// catches a duplicate export without needing a DOM, which the island module
+    /// requires at evaluation time.
+    ///
+    /// Returns `false` when `node` is not installed, like [`render_under_node`], so
+    /// the check is skipped loudly rather than silently.
+    fn assert_valid_esm(module: &str) {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "runai-emitted-names-esm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("module.mjs");
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(module.as_bytes()))
+            .expect("write the emitted module");
+        let output = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        match output {
+            Ok(output) => assert!(
+                output.status.success(),
+                "the emitted module must be valid ESM.\nmodule:\n{module}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("node is not installed: the ESM check was skipped");
+            }
+            Err(error) => panic!("could not run node: {error}"),
+        }
+    }
+
+    /// E1 (round 5): exporting a **local** under a name that is also imported is
+    /// legal ESM and must be clean.
+    ///
+    /// The old rule matched the reserved set on the **exported** name only, so it
+    /// could not tell "exporting the import itself" from "exporting a local under a
+    /// name that happens to be imported". Both halves of the old message were
+    /// false: the code exports `v`, a value this file declares, and the emitted
+    /// shape loads under node. The rule now resolves the specifier's local binding.
+    #[test]
+    fn an_aliased_local_export_under_an_imported_name_is_clean() {
+        let src = "\"use island\"\nimport { owner as myOwner } from \"runai\"\nconst v = 1\nexport { v as myOwner }\nexport default function P(props: Record<never, never>) { return <p>{v}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert!(
+            d.is_empty(),
+            "exporting the local `v` under the imported alias `myOwner` is valid ESM: {d:?}"
+        );
+        let module = crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+            .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { v as myOwner };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
+    }
+
+    /// The unaliased form of the same shape: `import { owner }` + `export { v as
+    /// owner }` is valid ESM, and refusing it was the same false positive.
+    #[test]
+    fn an_unaliased_local_export_under_an_imported_name_is_clean() {
+        let src = "\"use island\"\nimport { owner } from \"runai\"\nconst v = 1\nexport { v as owner }\nexport default function P(props: Record<never, never>) { return <p>{v}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert!(
+            d.is_empty(),
+            "exporting the local `v` under the imported name `owner` is valid ESM: {d:?}"
+        );
+        let module = crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+            .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { v as owner };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
+    }
+
+    /// The control for the two tests above: exporting **the import itself** is still
+    /// refused, and the reason is the import — not a name the compiler chose. The
+    /// repair offered there is legal, because a local value can be exported instead
+    /// (proven by the two tests above).
+    #[test]
+    fn exporting_the_import_itself_is_still_refused_with_the_import_reason() {
+        for (src, local) in [
+            (
+                "\"use island\"\nimport { owner } from \"runai\"\nexport { owner }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+                "owner",
+            ),
+            // The same statement under a different exported name: still the import.
+            (
+                "\"use island\"\nimport { owner as myOwner } from \"runai\"\nexport { myOwner as other }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+                "myOwner",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            let rows: Vec<&Diagnostic> = d.iter().filter(|row| row.code == Code::RA014).collect();
+            assert_eq!(rows.len(), 1, "one refusal for the exported import: {d:?}");
+            let message = &rows[0].message;
+            assert!(
+                message.contains("import") && message.contains("\"runai\""),
+                "the reason is the import this file writes: {message}"
+            );
+            assert!(
+                message.contains(&format!("`{local}`")),
+                "the reason names the bound local `{local}`: {message}"
+            );
+            assert!(
+                !message.contains("declares for itself")
+                    && !message.contains("reserves for itself"),
+                "`{local}` is the file's own import, not a compiler name: {message}"
+            );
+            assert!(
+                message.contains("Export a value this file declares instead")
+                    && message.contains("drop the export"),
+                "both repairs are offered and both are reachable here: {message}"
+            );
+        }
+    }
+
+    /// E2 (round 5): the repair in the **emitter-own** arm must be reachable.
+    ///
+    /// "Export a value this file declares instead" is illegal advice for `_attr` and
+    /// `render`: a declaration of either name is refused by
+    /// [`check_declaration`], so that repair cannot be applied. The only working
+    /// repairs are dropping or renaming the export, and the message must offer
+    /// those — and must **not** offer the one that cannot be followed.
+    #[test]
+    fn the_emitter_own_export_arm_offers_only_reachable_repairs() {
+        for (src, name) in [
+            (
+                "\"use static\"\nconst x = 1\nexport { x as _attr }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                "_attr",
+            ),
+            (
+                "\"use static\"\nconst x = 1\nexport { x as render }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }\n",
+                "render",
+            ),
+            (
+                // An island's own local, which no import introduces.
+                "\"use island\"\nconst x = 1\nexport { x as _a }\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+                "_a",
+            ),
+        ] {
+            let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014 && row.message.contains(&format!("`{name}`")))
+                .unwrap_or_else(|| panic!("exporting `{name}` must be refused: {d:?}"));
+            assert!(
+                !row.message
+                    .contains("Export a value this file declares instead"),
+                "the repair names a declaration that is itself refused (RA014) for `{name}`, so it \
+                 cannot be applied: {}",
+                row.message
+            );
+            assert!(
+                row.message.contains("drop the export"),
+                "the reachable repair must be offered for `{name}`: {}",
+                row.message
+            );
+            assert!(
+                row.message.contains("Rename the exported name"),
+                "renaming the export is the other reachable repair for `{name}`: {}",
+                row.message
+            );
+        }
+    }
+
+    /// E3 (round 5): `own_names()` can be empty — the reserved set is data, and a
+    /// future mode could reserve only imported names — and interpolating it as a
+    /// parenthetical would print a dangling `` (` `) ``. The clause must vanish
+    /// instead.
+    #[test]
+    fn the_own_names_clause_omits_an_empty_parenthetical() {
+        let empty = Reserved {
+            all: Vec::new(),
+            imported: Vec::new(),
+        };
+        assert_eq!(
+            empty.own_names_clause(),
+            "",
+            "an empty list prints no parenthetical at all"
+        );
+        let all_imported = Reserved {
+            all: vec!["owner".to_string()],
+            imported: vec!["owner".to_string()],
+        };
+        assert_eq!(
+            all_imported.own_names_clause(),
+            "",
+            "a set whose every name is imported has no emitter names to list"
+        );
+        let one = Reserved {
+            all: vec!["_esc".to_string()],
+            imported: Vec::new(),
+        };
+        assert_eq!(
+            one.own_names_clause(),
+            " (`_esc`)",
+            "a non-empty list keeps the parenthetical"
+        );
+    }
+
+    /// `import { _a } from "runai"` is refused in every form, because `_a` is not a
+    /// runtime export.
+    ///
+    /// Round 5 pinned this as a *measured false negative*: `_a` is an island emitter
+    /// local (the marker list), so the emitted `import { _a, … }` named a binding the
+    /// runtime does not provide, and the artifact threw `SyntaxError: The requested
+    /// module … does not provide an export named '_a'`. The unused spelling was
+    /// erased by type stripping, so whether the file was valid depended on whether
+    /// the agent later referenced the name — the accept-then-reject class.
+    ///
+    /// Round 6 closes it at the specifier, in both spellings, so the verdict no
+    /// longer depends on a use that has not been written yet. The runtime-side fact
+    /// is asserted from the shipped file as well, so the fixture and the package
+    /// cannot disagree.
+    #[test]
+    fn an_import_of_the_emitters_own_local_name_is_refused() {
+        for fixture in [
+            "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p/> }\n",
+            "\"use island\"\nimport { _a } from \"runai\"\nexport default function P(props: Record<never, never>) { return <p>{_a}</p> }\n",
+        ] {
+            let d = crate::analyze::analyze(fixture, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014)
+                .unwrap_or_else(|| panic!("`_a` is not a runtime export: {d:?}"));
+            assert!(
+                row.message.contains("`_a`") && row.message.contains("does not export"),
+                "the message names the specifier and the reason: {}",
+                row.message
+            );
+            assert!(
+                !row.message.contains("Did you mean"),
+                "no runtime name is close to `_a`, so no suggestion is invented: {}",
+                row.message
+            );
+            assert!(
+                crate::codegen::emit_client_checked(fixture, "src/routes/index.page.tsx", "/r.js")
+                    .is_err(),
+                "a module that cannot link must not be built"
+            );
+        }
+
+        // The durable fact behind the refusal: the runtime has no such export, so
+        // the list this rule reads must not gain one without the rule changing.
+        let runtime = include_str!("../../../../packages/runai/runtime.js");
+        assert!(
+            !runtime.contains("export function _a(") && !runtime.contains("export const _a "),
+            "the shipped runtime exports no `_a`, so importing it can never link"
+        );
+    }
+
+    /// Test 6's control, stated on its own: a local export under an ordinary name
+    /// is clean, and the built module carries `export { s };` verbatim.
+    ///
+    /// The declaration here is a plain `const`, not `export const`: the emitter
+    /// copies a module statement verbatim **and** appends the export specifier, so
+    /// `export const s = …; export { s }` emits a duplicate export that `node
+    /// --check` rejects. That is a pre-existing false negative in this rule (it does
+    /// not refuse a local declared `export` and re-exported), recorded in the round-5
+    /// report as open rather than fixed here.
+    #[test]
+    fn a_local_export_under_an_ordinary_name_is_clean_and_built() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nconst s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        assert!(
+            crate::analyze::analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "a local export under an ordinary name is legal"
+        );
+        let module = crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+            .unwrap_or_else(|d| panic!("the module must build: {d:?}"));
+        assert!(
+            module.contains("export { s };"),
+            "the artifact carries the local export: {module}"
+        );
+        assert_valid_esm(&module);
+    }
+
+    // --- D1: a name exported twice is a syntax error, not a style issue -------
+
+    /// The exact fixture the round-6 review reproduced: `check` was `[]`, `build`
+    /// exited 0, and the emitted module carried both `export const s = …;` and
+    /// `export { s };`, which `node --check` rejects with `SyntaxError: Duplicate
+    /// export of 's'`.
+    ///
+    /// An ES module may export a name once, so there is no legal case to protect:
+    /// the file is refused before an artifact exists.
+    #[test]
+    fn a_declared_name_exported_again_by_a_specifier_is_ra014() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d.len(), 1, "one row for one duplicate: {d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert!(
+            d[0].message.contains("`s`") && d[0].message.contains("twice"),
+            "the message names the name and says it is exported twice: {}",
+            d[0].message
+        );
+        assert!(
+            d[0].message.contains("export const s") && d[0].message.contains("export { s }"),
+            "the message names both exports so the agent knows which to drop: {}",
+            d[0].message
+        );
+        // The span is the specifier that duplicates, not the declaration that is
+        // already correct: `export { s }` is the statement to delete.
+        assert_eq!(
+            &src[d[0].span.0 as usize..d[0].span.1 as usize],
+            "s",
+            "the row points at the duplicated name in `export {{ s }}`: {d:?}"
+        );
+        assert!(
+            crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js").is_err(),
+            "a file whose module cannot load must not produce an artifact"
+        );
+    }
+
+    /// Every shape that duplicates an export, and the legal neighbours beside
+    /// them. Each refusal is one row whose message says "twice"; each neighbour is
+    /// clean and its artifact is valid ESM, so the rule cannot be passing by
+    /// refusing every export.
+    #[test]
+    fn every_duplicate_export_shape_is_refused() {
+        // (a) `export function f(){}` + `export { f }`.
+        // (b) `export default function P(){}` + `export { P as default }`.
+        // (c) two `export { x }` statements.
+        // (d) a name exported under an alias that collides:
+        //     `export const a = 1; export { a as b }; export const b = 2`.
+        let duplicates = [
+            "export function f() { return 1 }\nexport { f }",
+            "function Q(props: Record<never, never>) { return <p>hi</p> }\nexport { Q as default }\nexport default function P(props: Record<never, never>) { return <p>hi</p> }",
+            "const x = 1\nexport { x }\nexport { x }",
+            "export const a = 1\nexport { a as b }\nexport const b = 2",
+        ];
+        for body in duplicates {
+            let src = format!(
+                "\"use island\"\n{body}\nexport default function R(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            // Shape (b) already has its own `export default` in the fixture, so the
+            // shared tail would be a second one; that shape is complete without it.
+            let src = if body.contains(" as default ") {
+                format!("\"use island\"\n{body}\n")
+            } else {
+                src
+            };
+            let d = crate::analyze::analyze(&src, "src/routes/index.page.tsx");
+            let row = d
+                .iter()
+                .find(|row| row.code == Code::RA014 && row.message.contains("twice"))
+                .unwrap_or_else(|| panic!("{body}: no duplicate-export row: {d:?}"));
+            assert!(
+                row.message.contains("exported twice") && row.message.contains("may export"),
+                "{body}: the reason is ESM's one-export-per-name rule: {}",
+                row.message
+            );
+            let check =
+                crate::codegen::emit_client_checked(&src, "src/routes/index.page.tsx", "/r.js");
+            assert!(check.is_err(), "{body}: build must refuse: {check:?}");
+        }
+
+        // The legal neighbours, each of which exports a name once: a declaration
+        // exported under a *different* name, and a plain local with one specifier.
+        for body in [
+            "export function f() { return 1 }\nexport { f as g }",
+            "const x = 1\nexport { x }",
+        ] {
+            let src = format!(
+                "\"use island\"\n{body}\nexport default function R(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+            );
+            assert!(
+                crate::analyze::analyze(&src, "src/routes/index.page.tsx").is_empty(),
+                "{body}: exporting distinct names is legal"
+            );
+            let module =
+                crate::codegen::emit_client_checked(&src, "src/routes/index.page.tsx", "/r.js")
+                    .unwrap_or_else(|d| panic!("{body}: must build: {d:?}"));
+            assert_valid_esm(&module);
+        }
+    }
+
+    /// `analyze` drops identical `(code, span)` pairs, so the duplicate row must
+    /// sit on a span no other rule claims. This fixture makes both rules fire on
+    /// the same specifier (`_a` is a reserved island local *and* a duplicate) and
+    /// asserts both rows survive — the reserved row on the specifier, the
+    /// duplicate row on the exported name.
+    #[test]
+    fn the_duplicate_row_is_not_swallowed_by_analyzes_dedup() {
+        let src = "\"use island\"\nconst x = 1\nexport { x as _a }\nexport { x as _a }\nexport default function P(props: Record<never, never>) { return <p>{x}</p> }\n";
+        let d = crate::analyze::analyze(src, "src/routes/index.page.tsx");
+        let rows = d
+            .iter()
+            .filter(|row| row.code == Code::RA014)
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.message.contains("exported twice")),
+            "the duplicate row survives the dedup: {d:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.message.contains("twice"))
+                && d.iter()
+                    .filter(|row| row.message.contains("exported twice"))
+                    .count()
+                    == 1,
+            "exactly one duplicate row: {d:?}"
+        );
+    }
+
+    /// The property D1 violated, asserted directly: every export surface a route
+    /// may legally write emits a module that `node --check` accepts.
+    ///
+    /// Before this round no test ran `node --check` over a module whose source had
+    /// an export *declaration* beside a specifier, so the duplicate shipped.
+    #[test]
+    fn every_emitted_export_surface_is_valid_esm() {
+        // Each fixture is legal (the rule above proves the duplicates are not).
+        let legal = [
+            // The single-export control: `node --check` accepted this even before
+            // the rule, which is why the defect hid.
+            "\"use island\"\nimport { signal } from \"runai\"\nexport const s = signal(0)\nexport default function P(props: Record<never, never>) { return <p>{s()}</p> }\n",
+            // A declaration exported under a second name, plus a function export.
+            "\"use island\"\nexport const a = 1\nexport { a as b }\nexport function f() { return a }\nexport default function P(props: Record<never, never>) { return <p>{f()}{b}</p> }\n",
+            // A plain local and one specifier.
+            "\"use island\"\nconst s = 1\nexport { s }\nexport default function P(props: Record<never, never>) { return <p>{s}</p> }\n",
+        ];
+        for src in legal {
+            let module =
+                crate::codegen::emit_client_checked(src, "src/routes/index.page.tsx", "/r.js")
+                    .unwrap_or_else(|d| panic!("must build: {d:?}"));
+            assert_valid_esm(&module);
+        }
+    }
+}

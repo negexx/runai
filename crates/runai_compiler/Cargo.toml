@@ -1,0 +1,17 @@
+[package]
+name = "runai_compiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+oxc_parser = "=0.159.0"
+oxc_ast = "=0.159.0"
+oxc_ast_visit = "=0.159.0"
+oxc_allocator = "=0.159.0"
+oxc_span = "=0.159.0"
+oxc_syntax = "=0.159.0"
+oxc_semantic = "=0.159.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+oxc_transformer = "=0.159.0"
+oxc_codegen = "=0.159.0"
