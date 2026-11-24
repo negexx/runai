@@ -20,9 +20,9 @@
 //! is hidden and also not a route, while a hidden *directory* is descended into so
 //! it can be refused rather than silently dropped. A `[param]` segment is `RA014`
 //! because this milestone has no router: silently emitting `dist/[slug]/index.html`
-//! would serve a 404 and look like a successful build. A route whose first segment
-//! begins with `.` is refused for the same class of reason: many static servers 404
-//! a dot-prefixed path, so `dist/.cache/index.html` would build cleanly and never be
+//! would serve a 404 and look like a successful build. A route any of whose segments
+//! begins with `.` is refused for the same class of reason: many static servers 404 a
+//! dot-prefixed path, so `dist/.cache/index.html` would build cleanly and never be
 //! served. `.modules` and `.runai-build` are specific instances of that rule and keep
 //! their own messages because the repair differs.
 //!
@@ -55,8 +55,12 @@
 //! (`--out src/dist` does not exist yet, so scanning `<out>` alone would miss it).
 //!
 //! `<out>.tmp` and `<out>.old` are derived names too, not proof of ownership. A
-//! pre-existing `<out>.tmp` is scratch only when it carries the stamp; anything else
-//! is refused with exit `2` at the start of the build instead of being deleted.
+//! pre-existing `<out>.tmp` is scratch only when it carries the ownership marker
+//! [`OWNER`], written before any route content: anything else is refused with exit `2`
+//! at the start of the build instead of being deleted. A leftover that has the marker
+//! but not the completeness stamp [`STAMP`] is this tool's own interrupted run, and is
+//! deleted and rebuilt rather than refused — otherwise one `Ctrl-C` would wedge every
+//! later build.
 //!
 //! # The exit status of the child is not a failure signal
 //!
@@ -128,10 +132,23 @@ const RUNTIME_URL: &str = "/assets/runtime.js";
 /// page's own module, and the page would load successfully and mount nothing.
 const RUNTIME_ASSET: &str = "runtime";
 
-/// The stamp [`publish`] writes into every tree it publishes and requires before it
-/// replaces one. `--out` is a name, not a proof of ownership: without a stamp,
-/// `runai build --out src` renamed the source tree aside and deleted it.
+/// The completeness stamp. Written **last** into `<out>.tmp`, and required in `<out>`
+/// before [`publish`] replaces it: it means "this tree is a complete build". `--out`
+/// is a name, not a proof of ownership: without a stamp, `runai build --out src`
+/// renamed the source tree aside and deleted it.
 const STAMP: &str = ".runai-build";
+
+/// The ownership marker. Written into `<out>.tmp` **immediately after the directory is
+/// created and before any route content**, so its presence means "this scratch
+/// directory is ours" and it is what licenses deleting a leftover one.
+///
+/// It is deliberately a second file rather than the same fact as [`STAMP`]. A build
+/// killed mid-flight (Ctrl-C, OOM, power loss) leaves the marker and no completeness
+/// stamp; treating that leftover as foreign wedged every later build with "rename it
+/// and build again" — advice about a directory this tool created and abandoned. The
+/// two facts license two different actions: the marker licenses *deleting* scratch,
+/// the stamp licenses *publishing over* `<out>`.
+const OWNER: &str = ".runai-scratch";
 
 /// The scratch directory inside the temporary tree. It is removed before publish,
 /// so a route whose first segment is this name would be written and then deleted:
@@ -373,18 +390,35 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
 ///
 /// The name is derived from `--out`, not proof of ownership: a pre-existing
 /// `dist.tmp` is somebody's directory, and the build used to delete it with its
-/// contents and exit 0. A tree this build wrote carries [`STAMP`] (written last), so
-/// only that may be removed. Exit `2`, because the invocation must change.
+/// contents and exit 0. A scratch tree this build wrote carries [`OWNER`], written
+/// before any route content, so only that may be removed. The completeness stamp
+/// [`STAMP`] is irrelevant here: a run killed before it was written is still ours, and
+/// [`assemble`] deletes and rebuilds it. Exit `2`, because the invocation must change.
 fn refuse_scratch(out: &Path) -> Result<(), String> {
     let tmp = sibling(out, "tmp");
-    if !tmp.exists() || is_stamped(&tmp) {
+    if !tmp.exists() || is_scratch(&tmp) {
         return Ok(());
     }
     Err(format!(
         "`{}` already exists and does not look like a previous build's scratch space \
-         (no `{STAMP}`): refusing to delete it. Rename it and build again.",
+         (no `{OWNER}`): refusing to delete it. Rename it and build again.",
         tmp.display()
     ))
+}
+
+/// Whether `dir` is scratch this build created.
+///
+/// The ownership marker is written first and the completeness stamp last, so both
+/// together cover every point a run can be killed: the marker alone is an interrupted
+/// build, and a tree carrying the completeness stamp is one that got further. Either
+/// is ours; a directory with neither is somebody else's.
+fn is_scratch(dir: &Path) -> bool {
+    is_owned(dir) || is_stamped(dir)
+}
+
+/// Whether `dir` carries the ownership marker — the sign that this build created it.
+fn is_owned(dir: &Path) -> bool {
+    dir.join(OWNER).is_file()
 }
 
 /// Whether `dir` carries the build stamp.
@@ -510,6 +544,12 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
     // one silently, so the loser never shipped. The comparison is case-insensitive
     // because on macOS and Windows `About/index.html` and `about/index.html` are one
     // file: a byte-exact guard would pass here and silently overwrite there.
+    //
+    // Known boundary: `to_ascii_lowercase` folds ASCII only, so on a case-insensitive
+    // filesystem `Über.page.tsx` and `über/index.page.tsx` can still collide into one
+    // output (APFS is case-insensitive on macOS; NTFS on Windows is too). Closing that
+    // needs Unicode case folding or normalization, and a half-right rule is worse than
+    // a documented boundary, so non-ASCII names are not guarded here.
     let mut claimed: HashMap<String, (String, String)> = HashMap::new();
 
     for file in files {
@@ -680,14 +720,15 @@ fn route_name(file: &Path) -> Result<String, String> {
         ));
     }
 
-    // Any other dot-prefixed first segment is refused too. `walk` skips dot-prefixed
-    // *files* but descends into dot-prefixed *directories*, so `src/routes/.cache/x`
-    // reached the build and shipped `dist/.cache/x/index.html` — a path many static
-    // servers 404. The rule is general rather than a list of two names: a hidden
-    // directory is not a route directory, whatever it is called.
-    if let Some(segment) = without.split('/').next().filter(|seg| seg.starts_with('.')) {
+    // Any dot-prefixed segment is refused, not just the first. `walk` skips
+    // dot-prefixed *files* but descends into dot-prefixed *directories*, so
+    // `src/routes/.cache/x` reached the build and shipped `dist/.cache/x/index.html` —
+    // a path many static servers 404. `a/.b/c.page.tsx` shipped `dist/a/.b/c/index.html`
+    // for the same reason: the refusal is about **any** segment of the output path, so
+    // checking only the first left the identical defect one level deeper.
+    if let Some(segment) = without.split('/').find(|segment| segment.starts_with('.')) {
         return Err(format!(
-            "`{}` is under `{segment}`, a hidden directory: its output would be a \
+            "`{}` is under `{segment}`, a hidden directory: its output would contain a \
              dot-prefixed path, which many static servers refuse to serve. Rename the \
              directory.",
             file.display()
@@ -835,16 +876,19 @@ fn emit(prepared: &Prepared) -> Result<Emitted, Vec<Diagnostic>> {
 /// after every route has been written and every render has succeeded.
 ///
 /// A leftover `<out>.tmp` is scratch from a crashed run — but the name is derived from
-/// the argument, so it is removed only when it carries the stamp that says this tool
-/// wrote it. [`refuse_scratch`] has already refused an unstamped one with exit `2`;
-/// the check here keeps that true if the order ever changes.
+/// the argument, so it is removed only when it carries the ownership marker that says
+/// this tool created it. [`refuse_scratch`] has already refused an unowned one with
+/// exit `2`; the check here keeps that true if the order ever changes. A leftover with
+/// the marker is this tool's own aborted run (it may or may not have reached the
+/// completeness stamp) and is deleted: refusing would wedge every build after one
+/// interrupted one.
 fn assemble(out: &Path, prepared: &[Prepared]) -> Result<(), Failure> {
     let tmp = sibling(out, "tmp");
     if tmp.exists() {
-        if !is_stamped(&tmp) {
+        if !is_scratch(&tmp) {
             return Err(Failure::Refused(format!(
                 "`{}` already exists and does not look like a previous build's scratch space \
-                 (no `{STAMP}`): refusing to delete it.",
+                 (no `{OWNER}`): refusing to delete it.",
                 tmp.display()
             )));
         }
@@ -858,6 +902,15 @@ fn assemble(out: &Path, prepared: &[Prepared]) -> Result<(), Failure> {
     }
     std::fs::create_dir_all(&tmp)
         .map_err(|error| Failure::Build(format!("cannot create {}: {error}", tmp.display())))?;
+
+    // The ownership marker goes in before anything else is written, so a build killed
+    // at any later point leaves scratch this tool can identify and replace. Written
+    // last instead, a crashed build left a directory nobody could claim.
+    write_file(
+        &tmp.join(OWNER),
+        &format!("runai {} build\n", runai_compiler::VERSION),
+    )
+    .map_err(Failure::Build)?;
 
     match assemble_into(&tmp, prepared) {
         Ok(()) => publish(&tmp, out),
@@ -987,6 +1040,16 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
         &stamp,
         &format!("runai {} build\n", runai_compiler::VERSION),
     )?;
+
+    // The ownership marker has done its job and is not part of the site: the published
+    // tree carries the completeness stamp only. Removed *after* the stamp is written,
+    // so a crash in this window leaves a tree that is still recognisably ours either
+    // way; removed before it would reopen the unclaimed-leftover window.
+    let owner = tmp.join(OWNER);
+    if owner.exists() {
+        std::fs::remove_file(&owner)
+            .map_err(|error| format!("cannot clear {}: {error}", owner.display()))?;
+    }
 
     Ok(())
 }
@@ -1290,11 +1353,30 @@ mod tests {
                 "{path}: {error:?}"
             );
         }
-        // A later segment with the same name is not the scratch directory and is fine:
-        // the rule is about the output path's first component.
+        // A later segment with the same name is not the scratch directory, but it IS a
+        // dot-prefixed output component, so the general rule refuses it: it used to
+        // build `dist/blog/.modules/index.html`, which many static servers 404.
+        let error = route_name(Path::new("src/routes/blog/.modules.page.tsx"));
+        assert!(
+            matches!(&error, Err(message) if message.contains("hidden directory")),
+            "{error:?}"
+        );
+    }
+
+    // The dot rule scans every segment of the *relative route path*, not just the
+    // first: `a/.b/c.page.tsx` shipped `dist/a/.b/c/index.html` while the first-segment
+    // check passed, because the defect and the reason are about the output path.
+    #[test]
+    fn a_dot_segment_below_the_first_is_refused() {
+        let error = route_name(Path::new("src/routes/a/.b/c.page.tsx"));
+        assert!(
+            matches!(&error, Err(message) if message.contains(".b") && message.contains("hidden directory")),
+            "{error:?}"
+        );
+        // A normal nested route is unaffected: no segment begins with a dot.
         assert_eq!(
-            route_name(Path::new("src/routes/blog/.modules.page.tsx")).unwrap(),
-            "blog/.modules"
+            route_name(Path::new("src/routes/blog/x.page.tsx")).unwrap(),
+            "blog/x"
         );
     }
 

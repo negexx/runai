@@ -453,8 +453,75 @@ fn a_route_named_assets_still_places_its_script_where_the_html_points() {
     assert!(tmp.path().join("dist/assets/assets.js").is_file());
 }
 
-// `mkdir dist && runai build` is a normal CI shape. An empty directory holds nothing
-// to destroy, so it is replaced and stamped; the gate is about content, not names.
+// D: the dot-*file* skip in `walk` is what stops `.page.tsx` becoming the root route
+// and shipping its contents (that was a real defect). It is a different rule from the
+// hidden-directory refusal above, so it needs its own end-to-end pin: with both files
+// present, the REAL `index.page.tsx` must build and no route may come from the dot file.
+#[test]
+fn a_dot_page_file_beside_the_real_index_ships_only_the_real_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("REAL INDEX"));
+    std::fs::write(
+        tmp.path().join("src/routes/.page.tsx"),
+        static_route("DOT FILE"),
+    )
+    .unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let html = std::fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
+    assert!(html.contains("<p>REAL INDEX</p>"), "{html}");
+    assert!(
+        !html.contains("DOT FILE"),
+        "the dot file must not ship: {html}"
+    );
+    assert_eq!(
+        tree(&tmp.path().join("dist")),
+        vec![".runai-build", "index.html"]
+    );
+}
+
+// B: the dot rule covers every segment of the relative route path. `a/.b/c.page.tsx`
+// shipped `dist/a/.b/c/index.html` while only the first segment was checked, which is
+// the same "static servers 404 a dot-prefixed path" defect one level deeper.
+#[test]
+fn a_dot_segment_below_the_first_is_refused_and_a_normal_route_still_builds() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("root"));
+    std::fs::create_dir_all(tmp.path().join("src/routes/a/.b")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/a/.b/c.page.tsx"),
+        static_route("hidden"),
+    )
+    .unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(".b"), "{stderr}");
+    assert!(stderr.contains("hidden directory"), "{stderr}");
+    assert!(!tmp.path().join("dist").exists());
+
+    // The same tree without the hidden segment builds: the rule is about the segment,
+    // not about nesting.
+    std::fs::remove_dir_all(tmp.path().join("src/routes/a/.b")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes/blog")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/blog/x.page.tsx"),
+        static_route("post"),
+    )
+    .unwrap();
+    let ok = run(&["build", "--out", "dist"], tmp.path());
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(tmp.path().join("dist/blog/x/index.html").is_file());
+}
+
 #[test]
 fn an_empty_existing_out_directory_is_built_over() {
     let tmp = tempfile::tempdir().unwrap();
@@ -504,8 +571,9 @@ fn dynamic_segment_is_ra014_not_silent_output() {
 }
 
 // N3: `<out>.tmp` is scratch for THIS build, but its name is derived from `--out`.
-// A pre-existing `dist.tmp` that is not a stamped leftover is somebody's directory,
-// and the old build deleted it with everything in it (exit 0).
+// A pre-existing `dist.tmp` that carries neither marker is somebody's directory, and
+// the old build deleted it with everything in it (exit 0). It must be refused, and it
+// must survive untouched.
 #[test]
 fn a_preexisting_unstamped_scratch_directory_is_refused_and_left_intact() {
     let tmp = tempfile::tempdir().unwrap();
@@ -524,6 +592,67 @@ fn a_preexisting_unstamped_scratch_directory_is_refused_and_left_intact() {
         "keep me\n"
     );
     assert!(tmp.path().join("dist.tmp/src/main.rs").exists());
+    assert!(!tmp.path().join("dist").exists());
+}
+
+// Regression from round 2: a build killed mid-flight (Ctrl-C, OOM, power loss) leaves
+// `<out>.tmp` with the ownership marker but no completeness stamp, because the stamp is
+// written last. Round 2 read that as a foreign directory and exited 2 on every later
+// build — advice about a directory this tool created. It must be deleted and rebuilt.
+#[test]
+fn a_crashed_builds_scratch_is_replaced_not_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("rebuilt"));
+
+    // The window a real crash leaves: ownership marker present, route-ish content
+    // present, `.modules/` scratch present, completeness stamp absent.
+    std::fs::create_dir_all(tmp.path().join("dist.tmp/.modules")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("dist.tmp/assets")).unwrap();
+    std::fs::write(
+        tmp.path().join("dist.tmp/.runai-scratch"),
+        "runai 0.1.0 build\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("dist.tmp/index.html"), "abandoned\n").unwrap();
+    std::fs::write(tmp.path().join("dist.tmp/.modules/route0.mjs"), "partial\n").unwrap();
+    std::fs::write(tmp.path().join("dist.tmp/assets/index.js"), "partial\n").unwrap();
+    assert!(!tmp.path().join("dist.tmp/.runai-build").exists());
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let html = std::fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
+    assert!(html.contains("<p>rebuilt</p>"), "{html}");
+    assert!(
+        !tmp.path().join("dist.tmp").exists(),
+        "scratch must be gone"
+    );
+    assert!(tmp.path().join("dist/.runai-build").is_file());
+    // The ownership marker is scratch bookkeeping, not site content.
+    assert!(!tmp.path().join("dist/.runai-scratch").exists());
+}
+
+// The other half of the same decision table: a directory carrying neither marker is
+// still somebody else's. The build refuses it with exit 2 and does not touch it.
+#[test]
+fn a_leftover_scratch_without_any_marker_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("hi"));
+    std::fs::create_dir_all(tmp.path().join("dist.tmp/keep")).unwrap();
+    std::fs::write(tmp.path().join("dist.tmp/keep/notes.md"), "mine\n").unwrap();
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("dist.tmp"), "{stderr}");
+    assert!(
+        stderr.contains("Rename it"),
+        "the message must name the directory to rename: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("dist.tmp/keep/notes.md")).unwrap(),
+        "mine\n"
+    );
     assert!(!tmp.path().join("dist").exists());
 }
 
