@@ -8,8 +8,9 @@
 //!   screen is the value at first render — the silently frozen value.
 //! - `RA002_EFFECT_WRITE`: a write whose nearest function is the function passed to
 //!   an `effect`. The effect re-runs for the signals it reads, and the write runs
-//!   as part of that run; when the effect reads the signal it writes, each run
-//!   schedules the next, which is the loop.
+//!   as part of that run; when the effect reads the signal it writes, the write
+//!   queues the effect that is already running, and `execute`'s guard **throws**
+//!   `effect cycle` rather than looping.
 //! - `RA009_IMPLICIT_EFFECT`: a write whose nearest function is a component body.
 //! - `RA010_STATIC_VIOLATION`: any of the above in a `"use static"` route, where
 //!   there is no runtime at all — see [`check_static_mode`].
@@ -301,15 +302,29 @@ fn untracked_read(call: &AccessorCall, component: &ComponentInfo<'_>) -> Diagnos
 
 /// `RA002_EFFECT_WRITE`: a write inside an `effect(...)` argument.
 fn effect_write(call: &AccessorCall) -> Diagnostic {
-    Diagnostic::new(
-        Code::RA002,
-        call.span,
-        format!(
-            "`{name}` is written inside an `effect(...)` argument; an effect re-runs for the \
-             signals it reads, so this write runs as part of an effect run instead of deriving \
-             a value",
-            name = call.name,
-        ),
+    Diagnostic::new(Code::RA002, call.span, effect_write_message(&call.name))
+}
+
+/// The `RA002` message for a signal named `name`, exposed so the RA002 text test
+/// in [`crate::diagnostic`] can read the exact string this rule composes rather
+/// than a copy of it.
+#[cfg(test)]
+pub(crate) fn ra002_message_for_test(name: &str) -> String {
+    effect_write_message(name)
+}
+
+/// The one place the `RA002` message is written.
+///
+/// It states only what is unconditionally true: the effect re-runs for the
+/// signals it reads, and the write executes as part of that run. It deliberately
+/// makes **no** claim about a loop — the runtime throws instead — because
+/// `rules.rs` flags a write whether or not the effect reads that signal, so a
+/// self-referential description is false for `effect(() => { n(1) })`.
+fn effect_write_message(name: &str) -> String {
+    format!(
+        "`{name}` is written inside an `effect(...)` argument; an effect re-runs for the \
+         signals it reads, so this write runs as part of an effect run instead of deriving \
+         a value"
     )
 }
 

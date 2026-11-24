@@ -62,6 +62,32 @@ pub(crate) const RA009_FALSE_CLAIMS: [&str; 5] = [
     "already rendered",
 ];
 
+/// Every claim about a self-writing effect that `packages/runai/runtime.js`
+/// disproves, matched as a case-insensitive substring.
+///
+/// The runtime does not loop: `execute` throws `effect cycle: an effect wrote a
+/// signal it reads` when it is asked to run an effect that is already running
+/// (`runtime.js:167-171`), and `flush` throws the same error when effects keep
+/// invalidating each other past the wave limit (`:195-200`). A same-value write is
+/// an early return in the setter (`:246`), so it does not notify at all.
+///
+/// Each entry is a sentence this project's RA002 text actually carried:
+///
+/// - `causes the next run in turn` — the explain's round-1 wording.
+/// - `schedules the next one` / `which is a loop` — the skill's round-1 wording.
+/// - `each run schedules` — the `rules.rs` module doc's version.
+#[cfg(test)]
+pub(crate) const RA002_FALSE_CLAIMS: [&str; 4] = [
+    "causes the next run in turn",
+    "schedules the next one",
+    "each run schedules",
+    "which is a loop",
+];
+
+/// The sentence every `RA002` text site must carry: the mechanism is a throw.
+#[cfg(test)]
+pub(crate) const RA002_THROWS: &str = "effect cycle";
+
 /// A stable diagnostic code. Codes are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
@@ -129,7 +155,12 @@ impl Code {
                 "A signal is written inside an `effect(...)` argument. An effect re-runs for the \
                  signals it reads, and a write in its body executes as part of that run, so the \
                  write is a side effect of the effect rather than a derived value. When the effect \
-                 also reads the signal it writes, that write causes the next run in turn."
+                 also reads the signal it writes, the write during a run queues that same effect, \
+                 and asking it to run while it is already running does not loop: the runtime \
+                 throws `effect cycle: an effect wrote a signal it reads` (and a wave limit throws \
+                 when effects keep invalidating each other). A write of the value the signal \
+                 already holds notifies nobody — the setter returns early — so it neither re-runs \
+                 nor throws."
             }
             Code::RA006 => {
                 "A component's props parameter is missing an explicit type annotation, or the \
@@ -270,7 +301,8 @@ impl Code {
             Code::RA014 => {
                 "For an import or re-export, inline the value or import it from `\"runai\"`; a \
                  re-export whose source is `\"runai\"` becomes `import { owner } from \"runai\"` \
-                 with the name used or exported here; a \
+                 with the name used here, not exported, because the generated module already \
+                 exports its own names; a \
                  default or namespace `\"runai\"` import is not a form the emitted module writes, \
                  so rewrite it as named imports; write `import x = require(…)` as an `import`, and \
                  `export =` as `export default` or a named export. For a `declare` statement, \
@@ -320,6 +352,74 @@ impl Serialize for Code {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
+}
+
+/// The first `<…>`-shaped placeholder in a user-facing string, if any.
+///
+/// The predicate is *a `<` immediately followed by an ASCII uppercase letter*:
+/// `<Type>`, `<Name>`, `<For>`, `<Parent>`. Text an agent is meant to type must
+/// never carry one, because `<Type>` is not TypeScript — applying it verbatim is
+/// a syntax error, and `<For>` is a construct this milestone refuses.
+///
+/// It takes **any** user-facing string (a fix, an explain, a skill body, a
+/// per-site message) so the same rule can be applied everywhere text is composed.
+/// A message that legitimately *names* a symbol (`<Greeting>` names a component)
+/// still contains one: that is why [`instruction_bracket`] exists.
+pub fn angle_bracket_placeholder(text: &str) -> Option<(usize, &str)> {
+    bracketed(text, |_| true)
+}
+
+/// The first `<…>` in **instruction** text that an agent cannot type.
+///
+/// Same scan, one allowance: a bracketed name that is a plain DOM tag — all
+/// lowercase ASCII, optionally hyphenated (`<div>`, `<td>`, `<my-element>`) — is a
+/// thing to write, not a placeholder. Everything else is a placeholder, including
+/// the runtime's own primitives (`<For>`, `<Show>`, `<When>`), which this
+/// milestone refuses, and a metavariable (`<Type>`, `<Name>`).
+pub fn instruction_bracket(text: &str) -> Option<(usize, &str)> {
+    bracketed(text, |token| {
+        !token.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+    })
+}
+
+/// Scan for `<Name>`, keeping the hits `keep` names.
+///
+/// The returned slice runs from the `<` through the closing `>` when there is
+/// one, so a failure quotes the exact text an agent would type.
+fn bracketed(text: &str, keep: impl Fn(&str) -> bool) -> Option<(usize, &str)> {
+    let bytes = text.as_bytes();
+    for (i, window) in bytes.windows(2).enumerate() {
+        if window[0] != b'<' || !window[1].is_ascii_uppercase() {
+            continue;
+        }
+        // Start **after** the `<`, which is itself not a name character.
+        let end = text[i + 1..]
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.'))
+            .map_or(text.len(), |offset| i + 1 + offset);
+        let name = &text[i + 1..end];
+        if keep(name) {
+            let token_end = if text[end..].starts_with('>') {
+                end + 1
+            } else {
+                end
+            };
+            return Some((i, &text[i..token_end]));
+        }
+    }
+    None
+}
+
+/// The **instruction half** of a diagnostic message.
+///
+/// Every rule writes its message in two parts and joins them with `": "`: the
+/// first names the construct, the second tells the agent what to write. A `<For>`
+/// in the naming half names what the file contains; the same shape in the
+/// instruction half is something the agent is asked to type. A message with no
+/// `": "` is all instruction, so it is returned whole.
+pub fn instruction_text(message: &str) -> &str {
+    message
+        .split_once(": ")
+        .map_or(message, |(_, instruction)| instruction)
 }
 
 /// How loudly a diagnostic should be reported.
@@ -678,41 +778,44 @@ mod tests {
     }
 
     /// A `fix_template` is an instruction, so every character in it must be
-    /// typeable. `<Name>` is fine in a `message`, where it names a symbol; in a
-    /// fix, `<Type>` is a placeholder an agent cannot apply verbatim. The
-    /// predicate: a `<` immediately followed by an ASCII uppercase letter.
+    /// typeable. `<Name>` is fine in a *message*, where it names a symbol; in a
+    /// fix, `<Type>` is a placeholder an agent cannot apply verbatim.
+    ///
+    /// This delegates to [`angle_bracket_placeholder`], the one predicate, so the
+    /// rule here and the corpus-wide check in [`crate::instruction`] cannot
+    /// disagree. The class-level coverage (every per-site message the rules
+    /// compose, every shared refusal composer, every applied repair) lives there;
+    /// this is the fix-only half, beside the text it constrains.
     #[test]
     fn no_fix_template_contains_an_angle_bracket_placeholder() {
         for code in Code::all() {
             let fix = code.fix_template();
-            let bytes = fix.as_bytes();
-            for (i, window) in bytes.windows(2).enumerate() {
-                if window[0] == b'<' && window[1].is_ascii_uppercase() {
-                    panic!(
-                        "{}: fix_template carries a `<…>` placeholder at byte {i}: {}",
-                        code.as_str(),
-                        &fix[i..(i + 12).min(fix.len())]
-                    );
-                }
+            if let Some((at, token)) = angle_bracket_placeholder(fix) {
+                panic!(
+                    "{}: fix_template carries a `<…>` placeholder at byte {at}: {token} in {fix}",
+                    code.as_str()
+                );
             }
         }
     }
 
     /// `RA010` fires wherever the directive sits, not only on line 1: `detect_mode`
     /// accepts a comment above it. A fix that names a line tells the agent to edit
-    /// whatever is on that line, which may be the comment.
+    /// whatever is on that line, which may be the comment — and the next run
+    /// reports the same thing.
+    ///
+    /// The assertion is "mentions no line **at all**", not "does not say `line 1`":
+    /// the earlier form let `the first line` and `line one` through. The six
+    /// per-site directive repairs get the same treatment in
+    /// [`crate::instruction`]'s `every_directive_repair_names_no_line`.
     #[test]
-    fn ra010_fix_names_no_line_number() {
+    fn ra010_fix_names_no_line() {
         let fix = Code::RA010.fix_template();
-        assert!(
-            !fix.to_ascii_lowercase().contains("line 1"),
-            "RA010's fix must not name line 1: {fix}"
-        );
-        let bytes = fix.to_ascii_lowercase().into_bytes();
-        for (i, window) in bytes.windows(5).enumerate() {
-            if window == b"line " && bytes.get(i + 5).is_some_and(u8::is_ascii_digit) {
-                panic!("RA010's fix names a line number at byte {i}: {fix}");
-            }
+        for word in fix.split(|c: char| !c.is_ascii_alphabetic()) {
+            assert!(
+                !word.eq_ignore_ascii_case("line") && !word.eq_ignore_ascii_case("lines"),
+                "RA010's fix must not mention a line at all: {fix}"
+            );
         }
     }
 
@@ -726,6 +829,52 @@ mod tests {
             assert!(
                 !RA009_CONSEQUENCE.to_ascii_lowercase().contains(false_claim),
                 "the shared sentence carries the denied claim `{false_claim}`: {RA009_CONSEQUENCE}"
+            );
+        }
+    }
+
+    /// The RA002 texts must describe what the runtime **does**, not what a loop
+    /// would do. The message, `rules.rs`, and the fix were corrected in an earlier
+    /// round; the explain and the skill still said "that write causes the next run
+    /// in turn" / "each run schedules the next one, which is a loop", and those are
+    /// the two sites an agent reads when the message is not enough.
+    ///
+    /// The runtime throws (`execute`'s `e.running` guard, and `flush`'s wave
+    /// limit), and a same-value write does not even notify (`Object.is` early
+    /// return in the setter). Both facts are asserted, so a rewording cannot drift
+    /// back to the loop claim, and a version that omits the same-value case fails
+    /// too.
+    #[test]
+    fn the_ra002_texts_state_the_throw_and_not_a_loop() {
+        let sites: Vec<(&str, String)> = vec![
+            ("explain", Code::RA002.explain().to_string()),
+            ("skill body", crate::skills::skill_body(Code::RA002)),
+            (
+                "message",
+                crate::analyze::rules::ra002_message_for_test("n"),
+            ),
+        ];
+
+        for (what, text) in &sites {
+            for false_claim in RA002_FALSE_CLAIMS {
+                assert!(
+                    !text.to_ascii_lowercase().contains(false_claim),
+                    "the RA002 {what} still claims a loop (`{false_claim}`): {text}"
+                );
+            }
+        }
+
+        // The mechanism is a throw, and it must be named in both sites that
+        // explain rather than instruct.
+        for what in ["explain", "skill body"] {
+            let text = &sites.iter().find(|(name, _)| *name == what).unwrap().1;
+            assert!(
+                text.contains(RA002_THROWS),
+                "the RA002 {what} must name the throw (`{RA002_THROWS}`): {text}"
+            );
+            assert!(
+                text.to_ascii_lowercase().contains("does not"),
+                "the RA002 {what} must say the same-value write does not notify: {text}"
             );
         }
     }

@@ -658,8 +658,8 @@ fn signature_refusal(params: &oxc_ast::ast::FormalParameters<'_>, reason: &str) 
         Code::RA014,
         (params.span.start, params.span.end),
         format!(
-            "this route signature is not emitted: the generated component is always written as \
-             `function <Name>(props)`, so {reason}. Write the parameter as \
+            "this route signature is not emitted: the generated component is always written with \
+             one `props` parameter, so {reason}. Write the parameter as \
              `(props: Record<never, never>)` when it carries no data, or with the type it \
              actually needs, and read the fields from `props` in the body."
         ),

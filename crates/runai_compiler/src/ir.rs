@@ -672,7 +672,7 @@ impl<'s> Lowerer<'s> {
         let tag = dom_tag(&element.opening_element.name).map_err(|refusal| {
             vec![unsupported(
                 element.opening_element.name.span(),
-                refusal.construct,
+                &refusal.construct,
                 &refusal.repair,
             )]
         })?;
@@ -720,8 +720,7 @@ impl<'s> Lowerer<'s> {
                 return Err(vec![unsupported(
                     attribute.span(),
                     "a spread attribute (`{...expr}`)",
-                    "Write out the attributes it carries, e.g. `<div id={rest.id}>`, or remove \
-                     the spread.",
+                    "Write the attributes it carries out one at a time, or remove the spread.",
                 )]);
             };
 
@@ -758,8 +757,8 @@ impl<'s> Lowerer<'s> {
                     return Err(vec![unsupported(
                         other.span(),
                         "an attribute whose value is itself JSX (`name=<Bar />`)",
-                        "Move the element into the children instead, e.g. \
-                         `<Parent><Bar /></Parent>`.",
+                        "Pass the element as a child instead: write it between the element's \
+                         tags, e.g. `<div><b>…</b></div>`, because an attribute holds a value.",
                     )]);
                 }
             }
@@ -820,8 +819,7 @@ impl<'s> Lowerer<'s> {
                     return Err(vec![unsupported(
                         spread.span,
                         "a spread child (`{...expr}`)",
-                        "Render the value explicitly, e.g. `<For each={items} key={by}>…</For>`, \
-                         or remove the spread.",
+                        crate::analyze::jsx::SPREAD_CHILD_REPAIR,
                     )]);
                 }
             }
@@ -850,8 +848,7 @@ impl<'s> Lowerer<'s> {
                     return Err(vec![unsupported(
                         span,
                         &format!("JSX inside a `{{…}}` expression ({position})"),
-                        "Move the JSX out of `{…}`: it belongs in the children, e.g. \
-                         `<Parent><b/></Parent>`, or in its own `return`.",
+                        crate::analyze::jsx::JSX_IN_EXPRESSION_REPAIR,
                     )]);
                 }
                 Ok(Some(self.slice(other.span())))

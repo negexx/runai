@@ -320,8 +320,9 @@ pub(crate) fn is_page(path: &str) -> bool {
 ///   **A `"runai"` source is refused too**, and not because of the bundler: the
 ///   statement is still excluded from the artifact, so accepting it would drop
 ///   the author's statement with no diagnostic. The repair names the form an
-///   island can write — `import { owner } from "runai"`, then use or export the
-///   written binding.
+///   island can write — `import { owner } from "runai"`, then use the written
+///   binding; exporting it would be a duplicate export, because the island module
+///   already exports every specifier it imports.
 ///
 /// **The two CommonJS spellings TypeScript allows are refused too**, because
 /// [`crate::strip::strip_types`] rewrites them into JavaScript that a `.mjs`
@@ -422,13 +423,14 @@ fn check_import(
 /// none), so if it were also accepted here the author's statement would vanish
 /// from the artifact with no diagnostic — silent data loss, which is worse than
 /// a wrong render. The message names the legal rewrite, which an island can
-/// actually perform: `import { owner } from "runai"` and then use or export the
-/// written binding. `export * from "runai"` has no specifier list an emitter
+/// actually perform: `import { owner } from "runai"` and then use the written
+/// binding, not export it — the island module already exports every specifier it
+/// imports, so re-exporting one is a duplicate export. `export * from "runai"` has no specifier list an emitter
 /// could write, so the same refusal applies.
 ///
 /// The repair therefore differs by source: a foreign module's value has to be
-/// written here, while a `"runai"` value is imported here and used or exported
-/// from the written binding. No repair says "move the statement", which is not
+/// written here, while a `"runai"` value is imported here and used, not exported,
+/// because the island module already exports every specifier it writes. No repair says "move the statement", which is not
 /// something either emitter can do.
 fn check_reexport(module: &oxc_ast::ast::StringLiteral<'_>, source: &str) -> Option<Diagnostic> {
     let written =
@@ -453,7 +455,8 @@ fn check_reexport(module: &oxc_ast::ast::StringLiteral<'_>, source: &str) -> Opt
         (module.span.start, module.span.end),
         format!(
             "{reason} Write the value in this file, or import it from `\"{PRIMITIVE_SOURCE}\"` and \
-             use or export the written binding here."
+             use the written binding here. Do not export it: the generated module already exports \
+             its own names, so an export of an imported one is a duplicate export."
         ),
     ))
 }
@@ -882,8 +885,8 @@ mod tests {
     /// a statement, the artifact had nothing, and no diagnostic said so. Silent
     /// data loss is worse than a wrong render, so the `"runai"` source now gets
     /// the same `RA014` the foreign case gets. The message's repair is legal for
-    /// an island: `import { owner } from "runai"`, then use or export the written
-    /// binding.
+    /// an island: `import { owner } from "runai"`, then use the written binding
+    /// (exporting it would duplicate an export the module already writes).
     #[test]
     fn a_reexport_of_runai_is_refused_and_never_emitted() {
         for statement in [

@@ -174,23 +174,50 @@ use crate::source::{has_line_break, raw_text};
 /// `<When>`'s repair names the `pending` branch on purpose: a design.md
 /// `resource` only has its `pending` branch reachable at build time (§7.1), so
 /// "render the success branch" is not something the agent can apply.
+///
+/// **No repair names a primitive as something to write.** `<For>`/`<Show>`/
+/// `<When>` are all refused by this same file, so a repair that told an agent to
+/// write one would land it in a second `RA014` at the same span. The tag is named
+/// by the *construct* half only ("cannot lower …"); the repair says what compiles
+/// now and that a later plan lifts the limit.
 const RUNTIME: &[(&str, &str)] = &[
     (
         "For",
-        "Render the list one element at a time (spread the items into static markup), or wait \
-         for `<For>` support in a later plan.",
+        "Write the list out one element at a time — one child per value, with no loop. This \
+         milestone has no list primitive; a later plan adds one.",
     ),
     (
         "Show",
-        "Return one of the two elements conditionally from the component, or wait for `<Show>` \
-         support in a later plan.",
+        "Render the branch's markup directly where it belongs — this milestone has no \
+         element-level conditional; a later plan adds one.",
     ),
     (
         "When",
         "Render the `pending` branch directly (it is the only branch a prerendered page can \
-         show), or wait for `<When>` support in a later plan.",
+         show); this milestone has no element-level conditional, and a later plan adds one.",
     ),
 ];
+
+/// The repair for JSX inside a `{…}` expression, shared with lowering.
+///
+/// Every construct it tells the agent to write must be one this milestone
+/// compiles. The old text named `<Show>`/`<When>` for the conditional case, and
+/// both are refused as runtime primitives at the same span — a repair that lands
+/// in a refusal. A slot that holds a text value is the reachable answer, and the
+/// elements belong in the returned tree.
+pub(crate) const JSX_IN_EXPRESSION_REPAIR: &str = "Move the JSX into the returned tree: a `{…}` slot holds a value, so a conditional there \
+     writes a text value (e.g. `{ok ? \"yes\" : \"no\"}`) and the elements it chooses between \
+     belong in the children of the element around them.";
+
+/// The repair for a spread child (`{...items}`), shared with lowering.
+///
+/// It must name a construct **this milestone compiles**. The earlier text named
+/// `<For each={items} key={by}>`, which the same file refuses as a runtime
+/// primitive and again as JSX inside a `{…}` expression — so the fix sent an agent
+/// from one refusal into two more, indefinitely. These are the only two reachable
+/// answers: write each value as an ordinary child, or drop the spread.
+pub(crate) const SPREAD_CHILD_REPAIR: &str =
+    "Write the values out as ordinary children, one element per value, or remove the spread.";
 
 /// Elements that flow inline with their neighbours, so a dropped space is
 /// visible. Everything else is block-level: a newline around it is layout, not
@@ -1118,7 +1145,7 @@ impl JsxChecker<'_> {
                 dropped,
                 "a second JSX return that lowering does not reach",
                 "Return one element from the component body. Move the other markup into \
-                 that element, or split the branch into a component of its own.",
+                 that element so both branches are children of it.",
             ));
         }
 
@@ -1138,9 +1165,10 @@ impl JsxChecker<'_> {
             self.diagnostics.push(unsupported(
                 span,
                 "an early `return` before the route's JSX return",
-                "`render()` returns one string, so the component body cannot exit early. Replace \
-                 the early return with a value computed by a conditional expression, or move the \
-                 conditional into the returned markup.",
+                "`render()` returns one string, so the component body cannot exit early. Remove \
+                 the early return and return one element, writing the markup it selected inside \
+                 that element; a value it chose can be a conditional expression in the returned \
+                 tree.",
             ));
         }
     }
@@ -1199,13 +1227,18 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
         // `RA014`: JSX inside a `{…}` expression becomes JavaScript in the
         // emitted module, where `<b/>` is a syntax error. The check is an AST
         // walk, not a substring search, so `{a < b}` stays legal.
+        //
+        // The repair cannot name a construct this milestone refuses. It used to
+        // offer `<Show when={ok}>`/`<When>` for the conditional case, and both are
+        // refused as runtime primitives: an agent applying the fix met another
+        // `RA014` at the same span. What *is* reachable is a slot holding a text
+        // value — `{ok ? "a" : "b"}` compiles in both modes — with the elements
+        // themselves in the returned tree.
         if let Some(span) = first_jsx(&container.expression) {
             self.diagnostics.push(unsupported(
                 span,
                 "JSX inside a `{…}` expression",
-                "Move the JSX into the children of the element it belongs to. A conditional \
-                 returns one of two elements: `<Show when={ok}>` or two branches of `<When>`; \
-                 an attribute or prop takes a value, not an element.",
+                JSX_IN_EXPRESSION_REPAIR,
             ));
         }
         oxc_ast_visit::walk::walk_jsx_expression_container(self, container);
@@ -1216,7 +1249,7 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
         self.diagnostics.push(unsupported(
             attribute.span,
             "a spread attribute (`{...expr}`)",
-            "Write the attributes out, e.g. `<div id={rest.id}>`.",
+            "Write the attributes it carries out one at a time, or remove the spread.",
         ));
         oxc_ast_visit::walk::walk_jsx_spread_attribute(self, attribute);
     }
@@ -1224,10 +1257,16 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
     fn visit_jsx_spread_child(&mut self, child: &oxc_ast::ast::JSXSpreadChild<'a>) {
         // `RA014`: a spread child renders whatever the value happens to be, which
         // no template can hold.
+        //
+        // The repair must be something this milestone compiles. It used to name
+        // `<For each={items}>`, which is itself refused as a runtime primitive (and
+        // again as JSX in an expression): an agent following the fix landed on two
+        // more `RA014`s, forever. Only "write the children out" or "drop it" are
+        // reachable here.
         self.diagnostics.push(unsupported(
             child.span,
             "a spread child (`{...expr}`)",
-            "Render the value explicitly, e.g. `<For each={items} key={by}>…</For>`.",
+            SPREAD_CHILD_REPAIR,
         ));
         oxc_ast_visit::walk::walk_jsx_spread_child(self, child);
     }
@@ -1239,7 +1278,7 @@ impl JsxChecker<'_> {
         if let Err(refusal) = dom_tag(&element.opening_element.name) {
             self.diagnostics.push(unsupported(
                 element.opening_element.name.span(),
-                refusal.construct,
+                &refusal.construct,
                 &refusal.repair,
             ));
         }
@@ -1325,7 +1364,8 @@ impl JsxChecker<'_> {
                 self.diagnostics.push(unsupported(
                     value.span(),
                     "an attribute whose value is itself JSX (`name=<Bar />`)",
-                    "Pass the element as a child instead, e.g. `<Parent><Bar /></Parent>`.",
+                    "Pass the element as a child instead: write it between the element's tags, \
+                     e.g. `<div><b>…</b></div>`, because an attribute holds a value.",
                 ));
             }
         }
@@ -1460,17 +1500,17 @@ pub(crate) fn dom_tag<'a>(name: &'a JSXElementName<'a>) -> Result<&'a str, Refus
             Err(Refusal::capitalized(identifier.name.as_str()))
         }
         JSXElementName::MemberExpression(_) => Err(Refusal {
-            construct: "a member-expression tag (`<Namespace.Component>`)",
+            construct: "a member-expression tag (`<Namespace.Component>`)".to_string(),
             repair: "Inline the component's markup here; this milestone does not resolve \
                      components across modules or namespaces."
                 .to_string(),
         }),
         JSXElementName::ThisExpression(_) => Err(Refusal {
-            construct: "a `<this>` tag",
+            construct: "a `<this>` tag".to_string(),
             repair: "Write the element out; a `<this>` tag is not a DOM element.".to_string(),
         }),
         JSXElementName::NamespacedName(_) => Err(Refusal {
-            construct: "a namespaced tag (`<svg:rect>`)",
+            construct: "a namespaced tag (`<svg:rect>`)".to_string(),
             repair: "Use the unprefixed element this milestone emits, e.g. `<rect>`.".to_string(),
         }),
     }
@@ -1479,7 +1519,11 @@ pub(crate) fn dom_tag<'a>(name: &'a JSXElementName<'a>) -> Result<&'a str, Refus
 /// Why a tag has no DOM lowering, in the words the diagnostic carries.
 pub(crate) struct Refusal {
     /// What the construct is, for `cannot lower {construct} yet`.
-    pub construct: &'static str,
+    ///
+    /// The **naming** half of the message, so it may carry a bracketed tag
+    /// (`a capitalized tag (\`<Greeting>\`)`): that names what the file contains.
+    /// The repair beside it is the instruction, and must not.
+    pub construct: String,
     /// Where the markup belongs instead.
     pub repair: String,
 }
@@ -1498,9 +1542,13 @@ impl Refusal {
     /// A capitalized tag: a component this milestone cannot inline.
     fn component(tag: &str) -> Self {
         Self {
-            construct: "a capitalized tag (a component)",
+            // The tag belongs in the **naming** half: it is what the file
+            // contains. The instruction below must be typeable, so it never names
+            // a bracketed capitalized tag — that shape is indistinguishable from
+            // a `<Type>` placeholder to the invariant in `crate::instruction`.
+            construct: format!("a capitalized tag (a component, `<{tag}>`)"),
             repair: format!(
-                "`<{tag}>` names a component. Inline its markup here, or ask for component \
+                "`{tag}` names a component. Inline its markup here, or ask for component \
                  inlining in a later plan; this milestone renders DOM elements only."
             ),
         }
@@ -1517,10 +1565,11 @@ impl Refusal {
     fn runtime(tag: &str) -> Option<Self> {
         let (_, repair) = RUNTIME.iter().find(|(name, _)| *name == tag)?;
         Some(Self {
-            construct: "a runtime primitive (`<For>`, `<Show>`, `<When>`)",
-            repair: format!(
-                "`<{tag}>` is a runtime primitive this milestone does not lower. {repair}"
-            ),
+            // Same split as `component`: the tag names what the file contains, so
+            // it belongs in the naming half; the instruction beside it must be
+            // typeable in this milestone.
+            construct: format!("a runtime primitive (`<{tag}>`)"),
+            repair: format!("This milestone does not lower the `{tag}` primitive. {repair}"),
         })
     }
 }
@@ -2332,11 +2381,16 @@ mod tests {
     /// `<When>`'s repair names the `pending` branch, not the success branch: a
     /// design.md `resource` only has `pending` reachable at build time (§7.1), so
     /// "render the success branch" is advice the agent cannot apply.
+    ///
+    /// Every repair here must also be **typeable in this milestone**: an earlier
+    /// `<For>` repair said "spread the items into static markup" and `<Show>`'s said
+    /// "return one of the two elements conditionally", which is `RA011` (not a
+    /// direct JSX return) or `RA014` (a second JSX return) on the next run.
     #[test]
     fn a_runtime_primitive_repair_is_actionable() {
         for (tag, repair) in [
             ("For", "one element at a time"),
-            ("Show", "conditionally"),
+            ("Show", "Render the branch's markup directly"),
             ("When", "`pending` branch"),
         ] {
             let src = format!("const a = <div><{tag} /></div>\n");
