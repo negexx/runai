@@ -132,13 +132,25 @@ fn slow_route(millis: u64) -> String {
     )
 }
 
-/// Whether `root` holds a scratch directory of this build's naming scheme.
-fn has_scratch(root: &Path) -> bool {
+/// The private `--out` of the one test that keeps a build alive while holding the
+/// per-`--out` lock (`a_held_lock_fails_the_next_build_quickly_and_names_the_lock`).
+///
+/// Each test already gets its own tempdir, so this is not what fixed the flake (that was
+/// the lock-release handshake in `a_live_builds_scratch_is_not_swept`; see there). It
+/// makes the file's intent explicit instead: this is the only test that holds a build
+/// open, so it is the only one that may own a long-lived output name. A future test that
+/// copies this shape takes its own name rather than inheriting this one's 30-second hold.
+const LOCK_PROBE_OUT: &str = "lockprobe";
+
+/// Whether `root` holds a scratch directory for `out`'s build naming scheme
+/// (`<out>.tmp.<pid>.<n>`).
+fn has_scratch(root: &Path, out: &str) -> bool {
+    let prefix = format!("{out}.tmp.");
     std::fs::read_dir(root)
         .map(|entries| {
             entries.filter_map(Result::ok).any(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                name.starts_with("dist.tmp.")
+                name.starts_with(&prefix)
             })
         })
         .unwrap_or(false)
@@ -713,6 +725,33 @@ fn a_live_builds_scratch_is_not_swept() {
 
     // Once the owner lets go, the tree is abandoned and the next build sweeps it.
     drop(held);
+    // The release above is a `close` in THIS process; the build that must observe it is
+    // another process, and this suite runs 16 tests at once — including one whose
+    // prerender busy-loops for 30 s. Without a handshake the build can reach its sweep
+    // before this thread's close is visible, and the test then fails on a lock that is
+    // already gone (measured: 4 failures in 100 parallel runs). Wait until the
+    // abandonment is genuinely observable, so the assertions below are about the build's
+    // sweep and not about how fast a close became visible. A marker that never frees is a
+    // fixture bug and fails here, loudly, instead of as a flake.
+    let marker = live.join(".runai-scratch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let free = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .map(|probe| probe.try_lock().is_ok())
+            .unwrap_or(false);
+        if free {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the test never released its own marker lock, so the build cannot be at fault"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
     let again = run(&["build", "--out", "dist"], tmp.path());
     assert_eq!(
         again.status.code(),
@@ -1032,6 +1071,13 @@ fn equivalent_out_spellings_share_one_lock_and_all_publish() {
 // with SIGSTOP, or one looping forever in a user's static module, hangs every later
 // build silently and forever. The second build must fail at about five seconds with a
 // message naming the output and the lock path.
+//
+// This test is the only one in the file that keeps a build alive for 30 seconds while
+// holding the per-`--out` lock, so it builds into its own output name (`lockprobe`)
+// rather than sharing `dist` with every other test. The isolation is deliberate even
+// though each test has its own tempdir: a failure here must be this test's own bounded
+// timeout, never a neighbour's, and `the_long_holding_test_owns_its_out_name` below keeps
+// that promise from silently regressing.
 #[test]
 fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1039,7 +1085,7 @@ fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
 
     let mut first = Kill(
         Command::new(env!("CARGO_BIN_EXE_runai"))
-            .args(["build", "--out", "dist"])
+            .args(["build", "--out", LOCK_PROBE_OUT])
             .current_dir(tmp.path())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1050,7 +1096,7 @@ fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
     // Wait until the build is demonstrably holding the lock: it takes the lock before
     // creating scratch, so a scratch directory means the lock is ours.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !has_scratch(tmp.path()) {
+    while !has_scratch(tmp.path(), LOCK_PROBE_OUT) {
         assert!(
             std::time::Instant::now() < deadline,
             "the first build never got as far as taking the lock"
@@ -1063,7 +1109,7 @@ fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
     }
 
     let started = std::time::Instant::now();
-    let second = run(&["build", "--out", "dist"], tmp.path());
+    let second = run(&["build", "--out", LOCK_PROBE_OUT], tmp.path());
     let elapsed = started.elapsed();
     let stderr = String::from_utf8_lossy(&second.stderr);
 
@@ -1073,7 +1119,7 @@ fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
         "the second build must fail fast, not wait for the first: {elapsed:?}"
     );
     assert!(
-        stderr.contains("dist") && stderr.contains("runai-build-"),
+        stderr.contains(LOCK_PROBE_OUT) && stderr.contains("runai-build-"),
         "the message must name the output and the lock path: {stderr}"
     );
     assert!(
@@ -1081,4 +1127,65 @@ fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
         "the message must say another build holds it: {stderr}"
     );
     let _ = first.0.kill();
+}
+
+// The guard behind the test above: it is the file's one long-holding test, so its output
+// name must be one no other test uses. If a future test copies the shape and reuses
+// `lockprobe`, two 30-second holds would contend on one lock and the loser would wait out
+// the timeout instead of failing honestly. This scans the suite's own source, so a
+// collision fails loudly here, at the definition site.
+#[test]
+fn the_long_holding_test_owns_its_out_name() {
+    // `(test fn, every --out value it passes)` for the whole file.
+    let mut tests: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in include_str!("build.rs").lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("fn ") {
+            tests.push((rest.split(['(', ' ']).next().unwrap_or(""), Vec::new()));
+        }
+        if let Some(index) = trimmed.find("\"--out\", ") {
+            let rest = &trimmed[index + 9..];
+            // A literal (`"dist"`) or the constant's identifier (`LOCK_PROBE_OUT`),
+            // followed by `]`, `,` or `)`. Cut at the first non-token character.
+            let value = if let Some(literal) = rest.strip_prefix('"') {
+                literal.split('"').next().unwrap_or("")
+            } else {
+                rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+            };
+            let value = if value == "LOCK_PROBE_OUT" {
+                LOCK_PROBE_OUT
+            } else {
+                value
+            };
+            if let Some((_, outs)) = tests.last_mut() {
+                outs.push(value);
+            }
+        }
+    }
+
+    let slow = "a_held_lock_fails_the_next_build_quickly_and_names_the_lock";
+    let mine = tests
+        .iter()
+        .find(|(name, _)| *name == slow)
+        .map(|(_, outs)| outs.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        mine,
+        vec![LOCK_PROBE_OUT, LOCK_PROBE_OUT],
+        "the long-holding test must build both times into its own `{LOCK_PROBE_OUT}`"
+    );
+
+    let rivals: Vec<&str> = tests
+        .iter()
+        .filter(|(name, outs)| *name != slow && outs.contains(&LOCK_PROBE_OUT))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        rivals.is_empty(),
+        "`{LOCK_PROBE_OUT}` is reserved for the one test that holds a lock across a \
+         spawn; also used by {rivals:?}. Those tests would wait out the lock timeout \
+         and flake. Give each its own `--out`."
+    );
 }
