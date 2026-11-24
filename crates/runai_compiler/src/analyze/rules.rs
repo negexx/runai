@@ -127,15 +127,16 @@ pub fn check_signal_rules(
     diagnostics
 }
 
-/// Emit `RA010` for every construct a `"use static"` route cannot run.
+/// Emit `RA010` for every construct a `"use static"` route cannot run or ship.
 ///
 /// A static route is prerendered to HTML at build time and ships **zero bytes** of
 /// JavaScript, so there is no runtime on the page: a signal, a derived value, an
-/// effect, a resource, a write, or a JSX event handler would silently do nothing.
-/// This is the compiler-enforced form of that guarantee, not an observation about
-/// build output.
+/// effect, a resource, a write, or a JSX event handler would silently do nothing,
+/// and an inline handler or a literal `<script>` would ship the code the claim
+/// says it does not. This is the compiler-enforced form of that guarantee, not an
+/// observation about build output.
 ///
-/// Three sources, all resolved, never matched by name:
+/// Four sources, all resolved, never matched by name:
 ///
 /// - [`SignalBindings::primitive_calls`] — `signal(…)`, `derived(…)`, `effect(…)`,
 ///   `resource(…)` through the `"runai"` import. A local function that happens to
@@ -143,9 +144,18 @@ pub fn check_signal_rules(
 ///   reads the bindings rather than the text;
 /// - [`AccessorCall::write`] — `count(next)`. The declaration it writes was already
 ///   reported as its own primitive call, at its own span;
-/// - a JSX attribute named `on` followed by an uppercase letter — `onClick`,
-///   `onMount`. A lowercase `on…` name (`onclick`, or an ordinary `once`) is not
-///   the handler naming convention and is not flagged.
+/// - an `on…` JSX attribute that names a listener. Two spellings are handlers and
+///   both are refused: `on` + an uppercase letter (`onClick`, `onMount`, the
+///   existing React-style convention), and `on` + one of the HTML inline-handler
+///   event names ([`INLINE_HANDLER_EVENTS`], e.g. `onclick`) when it carries a
+///   value. An `onclick` attribute is inline JavaScript — the case is a naming
+///   convention, not a semantic difference — so the page would run code the 0 KB
+///   guarantee says it does not ship, whether the value is written literally or
+///   interpolated from a string;
+/// - a literal `<script>` element. A static page ships no JavaScript, so a script
+///   element is refused whether it is inline or pulls a file in. `<style>` is
+///   deliberately **not** refused: CSS is not a runtime, and the guarantee is
+///   about JavaScript, so a prerendered page may carry styles.
 ///
 /// **Plain expressions are allowed.** `{title}` where `title` is a local constant
 /// needs no runtime: it is evaluated once, at build time, and becomes text in the
@@ -182,9 +192,15 @@ pub fn check_static_mode(
             .map(static_write),
     );
 
-    let mut handlers = HandlerCollector::default();
-    handlers.visit_program(program);
-    diagnostics.extend(handlers.spans.iter().map(|&span| static_handler(span)));
+    let mut markup = StaticMarkupCollector::default();
+    markup.visit_program(program);
+    diagnostics.extend(
+        markup
+            .handlers
+            .iter()
+            .map(|&(span, form)| static_handler(span, form)),
+    );
+    diagnostics.extend(markup.scripts.iter().map(|&span| static_script(span)));
 
     diagnostics.sort_by(|left, right| {
         (left.span.0, left.code.as_str()).cmp(&(right.span.0, right.code.as_str()))
@@ -216,42 +232,256 @@ fn static_write(call: &AccessorCall) -> Diagnostic {
 }
 
 /// `RA010_STATIC_VIOLATION`: an event handler in a static route.
-fn static_handler(span: (u32, u32)) -> Diagnostic {
+///
+/// Two sentences, one per mechanism, because one would be false for the other
+/// half: an inline attribute **is** JavaScript the served page would execute, so
+/// saying it "would never run" is wrong; a dropped `onClick={fn}` has no runtime
+/// to attach it, so saying it "ships code" is wrong. Each site gets the true one.
+fn static_handler(span: (u32, u32), form: HandlerForm) -> Diagnostic {
+    let message = match form {
+        HandlerForm::ShipsCode => {
+            "a \"use static\" route ships no JavaScript, so this inline handler is refused: the \
+             served HTML carries it as an `on…` attribute and the browser evaluates it as \
+             JavaScript"
+        }
+        HandlerForm::NeverAttached => {
+            "a \"use static\" route has no runtime, so this event handler would never be \
+             attached or fire"
+        }
+    };
+    Diagnostic::new(Code::RA010, span, message)
+}
+
+/// `RA010_STATIC_VIOLATION`: a literal `<script>` element in a static route.
+fn static_script(span: (u32, u32)) -> Diagnostic {
     Diagnostic::new(
         Code::RA010,
         span,
-        "a \"use static\" route has no runtime, so this event handler would never be \
-         attached or fire",
+        "a \"use static\" route ships no JavaScript, so a `<script>` element in its markup \
+         would load or run code the page promised not to ship",
     )
 }
 
-/// Every `on` + uppercase JSX attribute in the file.
+/// The HTML inline-handler event names: the suffix of every standard `on…`
+/// content attribute (`onclick`, `onchange`, …).
 ///
-/// A walk rather than a name list: the convention is "`on` followed by an
-/// uppercase letter", so `onClick`, `onMount`, and `onKeyDown` are all handlers
-/// without this rule having to enumerate DOM events, and `once` or `onclick` are
-/// not. A namespaced attribute (`foo:onClick`) is not this shape either.
-#[derive(Default)]
-struct HandlerCollector {
-    spans: Vec<(u32, u32)>,
-}
+/// This list exists because the uppercase convention alone is not the whole rule.
+/// A browser runs `onclick="…"` on a static page, so the attribute is code
+/// whatever the case of its name — but `on` + *any* lowercase word would also flag
+/// `once` and `onwards`, which are ordinary attributes. The explicit list is the
+/// honest line: these are the names HTML defines as handlers, and a name outside
+/// it is an attribute. An `on…` name this list has not heard of still falls to the
+/// uppercase rule, which is the project's existing convention.
+const INLINE_HANDLER_EVENTS: &[&str] = &[
+    "abort",
+    "afterprint",
+    "auxclick",
+    "beforeinput",
+    "beforeprint",
+    "beforeunload",
+    "blur",
+    "cancel",
+    "canplay",
+    "canplaythrough",
+    "change",
+    "click",
+    "close",
+    "contextmenu",
+    "copy",
+    "cuechange",
+    "cut",
+    "dblclick",
+    "drag",
+    "dragend",
+    "dragenter",
+    "dragleave",
+    "dragover",
+    "dragstart",
+    "drop",
+    "durationchange",
+    "ended",
+    "error",
+    "focus",
+    "focusin",
+    "focusout",
+    "formdata",
+    "hashchange",
+    "input",
+    "invalid",
+    "keydown",
+    "keypress",
+    "keyup",
+    "languagechange",
+    "load",
+    "loadeddata",
+    "loadedmetadata",
+    "loadstart",
+    "message",
+    "messageerror",
+    "mousedown",
+    "mouseenter",
+    "mouseleave",
+    "mousemove",
+    "mouseout",
+    "mouseover",
+    "mouseup",
+    "offline",
+    "online",
+    "pagehide",
+    "pageshow",
+    "paste",
+    "pause",
+    "play",
+    "playing",
+    "pointercancel",
+    "pointerdown",
+    "pointerenter",
+    "pointerleave",
+    "pointermove",
+    "pointerout",
+    "pointerover",
+    "pointerup",
+    "popstate",
+    "progress",
+    "ratechange",
+    "rejectionhandled",
+    "reset",
+    "resize",
+    "scroll",
+    "scrollend",
+    "securitypolicyviolation",
+    "seeked",
+    "seeking",
+    "select",
+    "selectionchange",
+    "selectstart",
+    "slotchange",
+    "stalled",
+    "storage",
+    "submit",
+    "suspend",
+    "timeupdate",
+    "toggle",
+    "unhandledrejection",
+    "unload",
+    "volumechange",
+    "waiting",
+    "wheel",
+];
 
-impl<'a> Visit<'a> for HandlerCollector {
-    fn visit_jsx_attribute(&mut self, attribute: &oxc_ast::ast::JSXAttribute<'a>) {
-        if let oxc_ast::ast::JSXAttributeName::Identifier(name) = &attribute.name
-            && is_handler_name(name.name.as_str())
-        {
-            self.spans.push((name.span.start, name.span.end));
-        }
-        oxc_ast_visit::walk::walk_jsx_attribute(self, attribute);
+/// Whether this attribute is a handler in a `"use static"` route, and how the
+/// emitted markup treats it.
+///
+/// Two spellings are handlers:
+///
+/// - `on` + an uppercase letter (`onClick`, `onMount`) — the project's existing
+///   convention, refused with any value form;
+/// - `on` + one of [`INLINE_HANDLER_EVENTS`] (`onclick`, `onchange`) — the HTML
+///   inline-handler spelling, refused when it carries a value. A lowercase `on…`
+///   name outside the list (`once`, `onwards`) is an ordinary attribute, which is
+///   why the list is explicit rather than "any lowercase `on…`".
+///
+/// A namespaced attribute (`foo:onClick`, `xml:lang`) is never this shape.
+fn handler_form(attribute: &oxc_ast::ast::JSXAttribute<'_>) -> Option<HandlerForm> {
+    let oxc_ast::ast::JSXAttributeName::Identifier(name) = &attribute.name else {
+        return None;
+    };
+    let spelling = name.name.as_str();
+    let uppercase = is_uppercase_handler_name(spelling);
+    let lowercase_event = inline_handler_event(spelling).is_some();
+    if !uppercase && !lowercase_event {
+        return None;
     }
+
+    let literal = matches!(
+        attribute.value.as_ref(),
+        Some(oxc_ast::ast::JSXAttributeValue::StringLiteral(_))
+    );
+    let expression = matches!(
+        attribute.value.as_ref(),
+        Some(oxc_ast::ast::JSXAttributeValue::ExpressionContainer(_))
+    );
+    // A bare lowercase `onclick` carries nothing and is not refused; a bare
+    // uppercase `onClick` keeps the existing refusal.
+    if !literal && !expression && !uppercase {
+        return None;
+    }
+
+    // The emitter's own split, mirrored: a string literal is a static attribute,
+    // and an expression is a static attribute unless `event_name` makes it a
+    // listener — which needs `on` + a capital. So an uppercase expression is the
+    // one form the prerender emitter drops.
+    let carried = literal || (expression && !uppercase);
+    Some(if carried {
+        HandlerForm::ShipsCode
+    } else {
+        HandlerForm::NeverAttached
+    })
 }
 
-/// Whether `name` is `on` followed by an uppercase letter.
-fn is_handler_name(name: &str) -> bool {
+/// What the emitted markup does with a handler attribute, so the message can say
+/// the true mechanism instead of one sentence that is false for half the shapes.
+#[derive(Clone, Copy)]
+enum HandlerForm {
+    /// The HTML carries the attribute, so the browser evaluates it as JavaScript:
+    /// `onclick="alert(1)"`, `onClick="alert(1)"` (HTML lowercases the name), and
+    /// `onclick={expr}` (the prerender emitter interpolates the value into the
+    /// attribute) all land in the served page as live code.
+    ShipsCode,
+    /// The prerender emitter writes nothing for it (`Binding::Event`), so there is
+    /// no listener on the page: `onClick={fn}` and a bare `onClick`.
+    NeverAttached,
+}
+
+/// Whether `name` is `on` followed by an uppercase letter — the React-style
+/// handler convention this project already uses.
+fn is_uppercase_handler_name(name: &str) -> bool {
     name.strip_prefix("on")
         .and_then(|rest| rest.chars().next())
         .is_some_and(char::is_uppercase)
+}
+
+/// The lowercase event name when `name` is `on` + one of
+/// [`INLINE_HANDLER_EVENTS`].
+fn inline_handler_event(name: &str) -> Option<&str> {
+    name.strip_prefix("on")
+        .filter(|rest| INLINE_HANDLER_EVENTS.contains(rest))
+}
+
+/// Every refused handler attribute and literal `<script>` element in the file.
+///
+/// `script` is matched only as a **lowercase** identifier tag: a capitalized
+/// `<Script>` is a component tag, which `check_jsx` already refuses, and a
+/// namespaced tag is not an HTML element.
+#[derive(Default)]
+struct StaticMarkupCollector {
+    handlers: Vec<((u32, u32), HandlerForm)>,
+    scripts: Vec<(u32, u32)>,
+}
+
+impl<'a> Visit<'a> for StaticMarkupCollector {
+    fn visit_jsx_attribute(&mut self, attribute: &oxc_ast::ast::JSXAttribute<'a>) {
+        if let Some(form) = handler_form(attribute) {
+            let span = match &attribute.name {
+                oxc_ast::ast::JSXAttributeName::Identifier(name) => {
+                    (name.span.start, name.span.end)
+                }
+                // `handler_form` already returns `None` for a namespaced name.
+                oxc_ast::ast::JSXAttributeName::NamespacedName(_) => return,
+            };
+            self.handlers.push((span, form));
+        }
+        oxc_ast_visit::walk::walk_jsx_attribute(self, attribute);
+    }
+
+    fn visit_jsx_element(&mut self, element: &oxc_ast::ast::JSXElement<'a>) {
+        if let oxc_ast::ast::JSXElementName::Identifier(name) = &element.opening_element.name
+            && name.name.as_str() == "script"
+        {
+            self.scripts.push((name.span.start, name.span.end));
+        }
+        oxc_ast_visit::walk::walk_jsx_element(self, element);
+    }
 }
 
 /// The diagnostic, if any, for one accessor call.

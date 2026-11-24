@@ -186,10 +186,13 @@ impl Code {
                 )
             }
             Code::RA010 => {
-                "A `\"use static\"` route uses a signal, a derived value, an effect, a resource, \
-                 a write, or an event handler. Static routes ship zero bytes of JavaScript, so \
-                 there is no runtime on the page to run the feature; it would silently do \
-                 nothing."
+                "A `\"use static\"` route ships a construct that needs JavaScript a prerendered \
+                 page does not have: a signal, a derived value, an effect, a resource, a write, a \
+                 runtime primitive, or code the markup itself carries — an inline `on…` handler, \
+                 a literal `<script>` element. The page ships zero bytes of JavaScript, so a \
+                 runtime feature would silently do nothing, while an inline handler or a script \
+                 element is code the served page would run — neither can be on a page that makes \
+                 the 0 KB claim."
             }
             Code::RA011 => {
                 "A page file's default export is missing, is not a function this milestone can \

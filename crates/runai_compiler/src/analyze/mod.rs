@@ -20,6 +20,7 @@ pub use component::{
     ComponentInfo, ComponentKind, find_components, find_route_component, validate_route_component,
 };
 pub use emitted_names::check_emitted_names;
+pub use entry::DYNAMIC_ROUTE_SEGMENT_MESSAGE;
 pub use entry::analyze;
 pub use jsx::check_jsx;
 pub use props::check_props;

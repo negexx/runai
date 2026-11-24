@@ -52,6 +52,37 @@ fn static_route_html_has_no_script_tag() {
     );
 }
 
+// F1: the two shapes that used to ship and run JavaScript from a static route.
+// Measured before this round: both `check` and `build` were clean, and the HTML
+// carried `onclick="alert(1)"` / one `<script>`. Each is refused now.
+#[test]
+fn a_static_route_cannot_ship_an_inline_handler() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(
+        tmp.path(),
+        "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onclick=\"alert(1)\">x</button> }\n",
+    );
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("RA010"), "{stderr}");
+    assert!(!tmp.path().join("dist").exists(), "nothing is written");
+}
+
+#[test]
+fn a_static_route_cannot_ship_a_literal_script_element() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(
+        tmp.path(),
+        "\"use static\"\nexport default function P(props: Record<never, never>) { return <div><script>alert(2)</script></div> }\n",
+    );
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("RA010"), "{stderr}");
+    assert!(!tmp.path().join("dist").exists(), "nothing is written");
+}
+
 #[test]
 fn island_route_emits_one_script_and_a_runtime() {
     let tmp = tempfile::tempdir().unwrap();

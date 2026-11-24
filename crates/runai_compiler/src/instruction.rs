@@ -261,6 +261,14 @@ mod tests {
                 "RA010 handler in a static route",
                 "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onClick={() => {}}>x</button> }\n",
             ),
+            (
+                "RA010 inline handler in a static route",
+                "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onclick=\"alert(1)\">x</button> }\n",
+            ),
+            (
+                "RA010 script element in a static route",
+                "\"use static\"\nexport default function P(props: Record<never, never>) { return <div><script>alert(2)</script></div> }\n",
+            ),
             // --- analyze::jsx: every construct whose message composes a repair ---
             (
                 "RA014 capitalized tag",

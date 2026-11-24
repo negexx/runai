@@ -52,6 +52,44 @@ fn check_clean_route_exits_0() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
 }
 
+// F2: `check` used to pass a tree `build` refuses. A `[slug]` page is refused by
+// both now, with the same message, so a CI running only `check` cannot green-light
+// a page the builder will not produce.
+#[test]
+fn check_refuses_a_dynamic_route_segment_like_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes/blog")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/blog/[slug].page.tsx"),
+        "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>post</p> }\n",
+    )
+    .unwrap();
+    let out = run(&["check", "--json"], tmp.path());
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed[0]["code"], "RA014_NOT_SUPPORTED_YET");
+    assert_eq!(
+        parsed[0]["message"],
+        "dynamic route segments are not supported yet"
+    );
+}
+
+// The dynamic-segment rule is page-only: a component module under a bracketed
+// directory is not a route and must stay clean.
+#[test]
+fn check_passes_a_component_module_under_a_bracketed_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes/[slug]")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/[slug]/_shell.tsx"),
+        "export default function Shell(props: Record<never, never>) { return <main>{props.children}</main> }\n",
+    )
+    .unwrap();
+    let out = run(&["check", "--json"], tmp.path());
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+}
+
 #[test]
 fn check_missing_route_dir_is_a_clear_error() {
     let tmp = tempfile::tempdir().unwrap();

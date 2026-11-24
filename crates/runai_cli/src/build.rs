@@ -139,7 +139,7 @@ use std::process::Command;
 
 use runai_compiler::analyze::analyze;
 use runai_compiler::codegen::{emit_client_checked, emit_prerender_checked};
-use runai_compiler::diagnostic::{Code, Diagnostic, Severity};
+use runai_compiler::diagnostic::{Diagnostic, Severity};
 
 use crate::USAGE;
 
@@ -912,15 +912,13 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
 
         // This milestone has no router, so a `[param]` segment has no served path:
         // writing `dist/[slug]/index.html` would be a 404 that looks built.
-        if name.split('/').any(|segment| segment.contains(['[', ']'])) {
-            let mut diagnostic = Diagnostic::new(
-                Code::RA014,
-                (0, 0),
-                "dynamic route segments are not supported yet",
-            );
-            diagnostic.locate(&source, &display);
-            refused.push((source.clone(), diagnostic));
-        }
+        //
+        // The refusal itself is `analyze`'s: it runs the same constant on the same
+        // path, which is what makes `check` and `build` agree — a CI running only
+        // `check` used to green-light a tree this branch rejected. A second check
+        // here would print the diagnostic twice, so this comment marks where the
+        // rule used to live and the loop below only prepares what `analyze`
+        // accepted.
 
         // Two routes, one output path: whichever is written last wins and the other
         // silently does not ship. Name both so the author can decide which is right.

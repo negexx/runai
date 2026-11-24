@@ -40,7 +40,8 @@ fn description(code: Code) -> &'static str {
         }
         Code::RA009 => "A signal is written during render, which is a side effect in rendering.",
         Code::RA010 => {
-            "A `\"use static\"` route uses a signal, effect, resource, write, or handler it cannot run."
+            "A `\"use static\"` route uses a signal, effect, resource, write, handler, or script it \
+             cannot ship."
         }
         Code::RA011 => {
             "A page file's default export is missing, is not a component, or cannot render the \
@@ -102,8 +103,14 @@ fn why(code: Code) -> &'static str {
             )
         }
         Code::RA010 => {
-            "Static routes ship zero bytes of JavaScript. There is no runtime on the page to run a \
-             signal or attach a listener, so the feature would silently do nothing."
+            "Static routes ship zero bytes of JavaScript, and this rule is what enforces that \
+             claim rather than observing it. Two costs, and the `message` says which one a site \
+             has. A runtime feature — a signal, an effect, a resource, a write — would silently do \
+             nothing, because there is no runtime on the page to run it. Code the markup carries \
+             is worse: an `on…` attribute the emitted HTML keeps and a literal `<script>` element \
+             are JavaScript the served HTML would execute, so the page would ship exactly what it \
+             promises not to. Both are refused for the same reason: the directive is the decision \
+             that controls the 0 KB guarantee, and a page that needs code is an island."
         }
         Code::RA011 => {
             "The router renders the default export as the route, and it has no other source. Three \

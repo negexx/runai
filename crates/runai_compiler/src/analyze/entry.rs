@@ -87,6 +87,23 @@ pub fn analyze(source: &str, path: &str) -> Vec<Diagnostic> {
 fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
+    // (1) A page's path must be one the build can emit. `build` refuses a
+    // `[param]` segment because this milestone has no router, so the same string
+    // is refused here: a CI that runs only `check` must not green-light a tree
+    // `build` will not produce. Scoped to a page — a component module may live
+    // under a bracketed directory and is not a route.
+    // The span is `(0, 0)`, not an offset into `source`: the defect is in the
+    // file's **name**, so there is no byte of the file to underline. `build` has
+    // always reported it this way, and matching it is what makes the two
+    // recognisably one rule.
+    if is_page(path) && has_dynamic_segment(path) {
+        diagnostics.push(Diagnostic::new(
+            Code::RA014,
+            (0, 0),
+            DYNAMIC_ROUTE_SEGMENT_MESSAGE,
+        ));
+    }
+
     // (2) A page owes a mode and a route. A component module — a `_`-prefixed
     // file, or any `.tsx` that is not a page — owes neither: there is no route to
     // render, so demanding a directive would be advice with no effect.
@@ -293,6 +310,25 @@ pub(crate) fn is_page(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     !name.starts_with('_') && name.ends_with(".page.tsx")
 }
+
+/// Whether any segment of `path` is a `[param]` segment.
+///
+/// Splits on both separators so a Windows path is not one giant segment, and
+/// looks for the bracket in either half of the pair: `[slug]` and a malformed
+/// `[slug` are both refused, because neither names a path the build can emit.
+fn has_dynamic_segment(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|segment| segment.contains(['[', ']']))
+}
+
+/// The one sentence `build` and `check` both report for a `[param]` path segment.
+///
+/// This milestone has no router, so a bracketed segment has no served path:
+/// writing `dist/[slug]/index.html` would be a 404 that looks built. `build` used
+/// to own the refusal, which made `check` green-light a tree the builder rejects;
+/// both now read this constant, so the gate and the builder cannot disagree in
+/// wording either.
+pub const DYNAMIC_ROUTE_SEGMENT_MESSAGE: &str = "dynamic route segments are not supported yet";
 
 /// `RA014` for every module the emitted file cannot resolve or write.
 ///
@@ -2244,11 +2280,50 @@ mod tests {
         assert!(check_static_mode(Mode::Island, program, &bindings).is_empty());
     }
 
-    /// `on` + uppercase is the handler convention; a lowercase name is not one.
-    /// `once` is the near miss that a naive `starts_with("on")` flags.
+    /// A handler is `on` + a known HTML inline-handler event (`onclick`) or the
+    /// existing `on` + uppercase convention (`onClick`). A lowercase `on…` name
+    /// that is not an event (`once`, `onwards`) is an ordinary attribute: the
+    /// explicit list is what keeps `once={x}` from becoming a false positive.
+    ///
+    /// The `onclick="…"` row is the inverted form of the old test, which pinned
+    /// it as clean while the built page shipped `onclick="alert(1)"`.
     #[test]
-    fn only_on_plus_uppercase_is_a_handler() {
-        for attribute in ["once=\"x\"", "onclick=\"x\"", "data-onClick=\"x\""] {
+    fn a_string_inline_handler_in_a_static_route_is_ra010() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onclick=\"alert(1)\">x</button> }\n";
+        let d = analyze(src, "src/routes/index.page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA010);
+        assert!(
+            d[0].message.contains("ships no JavaScript"),
+            "the message must say a static page ships no JavaScript: {}",
+            d[0].message
+        );
+    }
+
+    /// The expression-valued uppercase form is unchanged: it is a handler and a
+    /// static route cannot attach it.
+    #[test]
+    fn an_uppercase_expression_handler_in_a_static_route_is_still_ra010() {
+        for attribute in ["onClick={() => {}}", "onMount={() => {}}", "onclick={1}"] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
+            );
+            let d = analyze(&src, "src/routes/index.page.tsx");
+            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+        }
+    }
+
+    /// `once` is the near miss the explicit event list exists for: it begins with
+    /// `on` but is not a listener, with either value form.
+    #[test]
+    fn once_is_an_attribute_not_a_handler_in_a_static_route() {
+        for attribute in [
+            "once=\"x\"",
+            "once={1}",
+            "onwards=\"x\"",
+            "data-onClick=\"x\"",
+        ] {
             let src = format!(
                 "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
             );
@@ -2257,15 +2332,73 @@ mod tests {
                 "{attribute} is not a handler"
             );
         }
+    }
 
-        for attribute in ["onClick={() => {}}", "onMount={() => {}}"] {
+    /// A literal `<script>` element is JavaScript the static route promised not to
+    /// ship, so it is refused even though the markup is otherwise static.
+    #[test]
+    fn a_literal_script_element_in_a_static_route_is_ra010() {
+        for markup in [
+            "<div><script>alert(2)</script></div>",
+            "<script src=\"/x.js\" />",
+        ] {
             let src = format!(
-                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return <div {attribute}>x</div> }}\n"
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ return {markup} }}\n"
             );
             let d = analyze(&src, "src/routes/index.page.tsx");
-            assert_eq!(d.len(), 1, "{attribute}: {d:?}");
-            assert_eq!(d[0].code, Code::RA010, "{attribute}");
+            assert_eq!(d.len(), 1, "{markup}: {d:?}");
+            assert_eq!(d[0].code, Code::RA010, "{markup}");
+            assert!(
+                d[0].message.contains("ships no JavaScript"),
+                "{markup}: the message must say a static page ships no JavaScript: {}",
+                d[0].message
+            );
         }
+    }
+
+    /// A `<style>` element is CSS, not a runtime: the 0 KB guarantee forbids
+    /// JavaScript, so a static page may carry one. This is the control that keeps
+    /// the `<script>` refusal from becoming "refuse every raw-text element".
+    #[test]
+    fn a_style_element_is_static_content_not_a_runtime() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div><style>{\".a{color:red}\"}</style><p>hi</p></div> }\n";
+        assert!(
+            analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "CSS ships no JavaScript"
+        );
+    }
+
+    /// An island has a runtime, so an inline handler is code that runs: it is not
+    /// the 0 KB claim's concern and `RA010` must stay static-only.
+    #[test]
+    fn an_island_inline_handler_is_not_ra010() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <button onclick=\"alert(1)\">x</button> }\n";
+        assert!(
+            analyze(src, "src/routes/index.page.tsx").is_empty(),
+            "an island ships a runtime, so the handler runs"
+        );
+    }
+
+    /// A `[param]` path segment is refused by `build`; `check` must not pass a
+    /// tree the builder refuses, so `analyze` raises the same diagnostic.
+    #[test]
+    fn a_dynamic_route_segment_in_a_page_path_is_refused() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>post</p> }\n";
+        let d = analyze(src, "src/routes/blog/[slug].page.tsx");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Code::RA014);
+        assert_eq!(d[0].message, super::DYNAMIC_ROUTE_SEGMENT_MESSAGE);
+    }
+
+    /// The dynamic-segment rule is scoped to pages: a component module may
+    /// legitimately live under a bracketed directory and is never a route.
+    #[test]
+    fn a_component_module_under_a_bracketed_directory_is_clean() {
+        let src = "export default function Shell(props: Record<never, never>) { return <main>{props.children}</main> }\n";
+        assert!(
+            analyze(src, "src/routes/[slug]/_shell.tsx").is_empty(),
+            "a `_`-prefixed module is not a route"
+        );
     }
 
     /// The returned list reads top-to-bottom in the file, and no `(code, span)`

@@ -399,12 +399,19 @@ mod tests {
     /// analyzer. A `div` wrapper in a `<dl>`, a script-supporting child in a list,
     /// and a `<menu>` list are all legal HTML, so a static route holding them must
     /// produce an artifact with the markup written verbatim.
+    ///
+    /// The script-supporting child is `<template>`, **not** `<script>`: a static
+    /// route ships no JavaScript, so RA010 now refuses a literal `<script>`
+    /// (measured before this round: `<script>alert(2)</script>` in a static route
+    /// passed `check` and shipped one `<script>`). `<template>` is
+    /// script-supporting in the same content models and carries no script, so it
+    /// still proves the list-child rule without contradicting the 0 KB claim.
     #[test]
     fn the_conforming_list_shapes_emit() {
         for body in [
             "<dl><div><dt>a</dt><dd>b</dd></div></dl>",
             "<dl><div>x</div></dl>",
-            "<ul><script src=\"/a.js\"></script><li>x</li></ul>",
+            "<ul><template><li>x</li></template><li>x</li></ul>",
             "<menu><li>x</li></menu>",
         ] {
             let src = format!("\"use static\"\n{P} {{ return {body} }}\n");
