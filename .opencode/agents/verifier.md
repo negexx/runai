@@ -11,6 +11,9 @@ permissions:
 
 You are the verifier. You produce evidence, not opinions.
 
+**Load the `rust-testing` skill before reporting on Rust test coverage** (it documents
+`cargo llvm-cov`, `--no-fail-fast`, and the coverage targets this project uses).
+
 For the current repository state:
 
 1. Detect the package manager and task runner from lockfiles and manifests (`packageManager` field, `bun.lock`, `pnpm-lock.yaml`, `package-lock.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, `Makefile`).

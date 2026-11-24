@@ -1,6 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
 
+  // Local plugin directory (must be a directory, not a .ts file; this version
+  // does not auto-discover .opencode/plugins/).
+  "plugins": ["./plugins/fix-loop-guard"],
+
   // Project model: everything runs on CommandCode DeepSeek V4.1 Flash.
   "model": "commandcode/deepseek/deepseek-v4.1-flash",
 
@@ -53,6 +57,24 @@
       "description": "Design a feature and produce an implementation plan",
       "agent": "architect",
       "template": "Use superpowers:brainstorming to understand the goal behind $ARGUMENTS, then write a design document under docs/superpowers/specs/ and an implementation plan under docs/superpowers/plans/. Ask before writing either document."
+    },
+
+    // The two commands the controller is required to use instead of debugging
+    // inline. `debug` exists because this repository's worst history is a defect
+    // patched once, then patched again: a second patch means the cause was never
+    // identified. `verify-claim` exists so adjudicating a reviewer's finding stays
+    // one probe and then a ruling, rather than becoming an investigation.
+    "debug": {
+      "description": "Dispatch the debugger for a defect whose cause is unknown (use after one failed fix)",
+      "agent": "debugger",
+      "subagent": true,
+      "template": "A defect has survived at least one fix attempt. Its reproduction evidence: $ARGUMENTS\n\nStart at LOCALIZE, not reproduce. Then state the root cause in ONE sentence a reviewer can verify by reading the code, and do not propose a fix before that sentence exists.\n\nIf the reproduction above is not deterministic, say so and state exactly what you need instead of guessing at a cause.\n\nThis repository has repeatedly fixed one path and left its sibling: a lookup keyed on the wrong thing, a guard on `<out>.old` but not `<out>.tmp`, a rule for files but not directories, a message that names a mechanism the code does not have. If this defect family has been patched before, say what generalisation the earlier patches missed.\n\nMake the smallest correct change, add a regression test that fails without it, and paste both runs (failing, then passing) with the commands."
+    },
+    "verify-claim": {
+      "description": "Adjudicate a claim with one probe, then rule: CONFIRMED / REFUTED / PARTIAL",
+      "agent": "general",
+      "subagent": false,
+      "template": "Adjudicate this claim, do not debug it: $ARGUMENTS\n\n1. Write ONE minimal probe in /tmp/opencode that shows whether the claim is true. Paste the command and raw output.\n2. Rule CONFIRMED, REFUTED, or PARTIAL, citing that output. If PARTIAL, name precisely what is true.\n3. Stop. Fix nothing.\n\nIf it is CONFIRMED and the cause is not already obvious from the probe output, report 'CONFIRMED, cause unknown — use /debug' and stop. Do not write a second probe for the same defect: a second probe is debugging, and debugging is dispatched."
     }
   }
 }
