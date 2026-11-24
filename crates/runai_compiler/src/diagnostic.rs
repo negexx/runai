@@ -179,7 +179,14 @@ impl Code {
                  without part of a node is wrong in a way nothing reports. That first family also \
                  covers four emit-time shapes whose output would differ by mode or not parse: \
                  children inside a void element, a duplicate attribute, an early `return` before \
-                 the route's JSX return, and an `async` or generator route component. A second is \
+                 the route's JSX return, and an `async` or generator route component. It also \
+                 covers markup the HTML parser would reshape, so the emitted HTML text re-parses \
+                 into a different tree than was written: a `<p>` holding a block-level element, a \
+                 tag that closes an open element of its own kind, a child outside its parent's \
+                 content model or bare text outside a table cell, an `<a>` inside an `<a>` or a \
+                 `<form>` inside a `<form>`, a list item with no list, a tag the parser only builds \
+                 under one parent, and — in an island — a dynamic binding inside a text-only \
+                 element, where the marker the island needs is swallowed as text. A second is \
                  a module the emitted file cannot resolve or write: an `import` or re-export of a \
                  module other than `\"runai\"` has no bundler, a default or namespace import of \
                  `\"runai\"` is not a form the client module emits, and `import x = require(…)` or \

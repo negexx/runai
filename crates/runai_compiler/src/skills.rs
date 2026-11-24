@@ -1,16 +1,57 @@
-//! The Markdown body of one diagnostic's skill file.
+//! The Markdown of one diagnostic's skill file.
 //!
-//! `runai skills` (Task 15) writes one file per [`Code`], and the body comes
+//! `runai skills` (Task 15) writes one file per [`Code`], and the text comes
 //! from here so the diagnostic and its skill cannot drift: both describe the
 //! same rule, and the drift test below refuses an empty arm.
 //!
-//! `## What it means` is [`Code::explain`] and `## Fix` is [`Code::fix_template`]
-//! verbatim — the same two functions [`crate::diagnostic::Diagnostic::new`] uses,
-//! so a generated skill cannot disagree with what the compiler reports. Only
-//! `## Why it is an error` is written per code here, because it is the prose that
-//! explains the cost of the mistake rather than the repair.
+//! The file opens with frontmatter (`---`, `name`, `description`, `---`) because
+//! a skill file is loaded by tooling that reads the name and the one-line
+//! description before the prose. `## What it means` is [`Code::explain`] and
+//! `## Fix` is [`Code::fix_template`] verbatim — the same two functions
+//! [`crate::diagnostic::Diagnostic::new`] uses, so a generated skill cannot
+//! disagree with what the compiler reports. Only `## Why it is an error` and the
+//! description are written per code here, because they say what the mistake
+//! costs, which the repair text does not.
 
 use crate::diagnostic::Code;
+
+/// The one-line `description:` in the frontmatter: what the rule rejects, in the
+/// same words the design's strictness table uses.
+///
+/// One line, because YAML frontmatter has no continuation here and a wrapped
+/// value would read as a new key. It names the rule rather than repeating
+/// [`Code::explain`], which is the body's first section.
+fn description(code: Code) -> &'static str {
+    match code {
+        Code::RA001 => {
+            "A signal read in the component body outside any tracking scope freezes at the first \
+             render."
+        }
+        Code::RA002 => {
+            "A signal written inside an `effect` body makes the write its own dependency."
+        }
+        Code::RA006 => {
+            "A component's props parameter has no explicit type, or there is no parameter at all."
+        }
+        Code::RA007 => {
+            "The parser rejected the file, or a line break sits between two inline elements and \
+             deletes a visible space."
+        }
+        Code::RA009 => "A signal is written during render, which is a side effect in rendering.",
+        Code::RA010 => {
+            "A `\"use static\"` route uses a signal, effect, resource, write, or handler it cannot run."
+        }
+        Code::RA011 => {
+            "A page file's default export is missing, is not a component, or cannot render the \
+             route."
+        }
+        Code::RA012 => "The file opens without a `\"use static\"` or `\"use island\"` directive.",
+        Code::RA014 => {
+            "Valid syntax this milestone cannot compile — an unsupported construct, import, \
+             unreachable value, `declare`, or reserved name."
+        }
+    }
+}
 
 /// Why a violation of `code` costs the user something. Paired with
 /// [`Code::explain`] and [`Code::fix_template`] to build the skill body.
@@ -32,7 +73,11 @@ fn why(code: Code) -> &'static str {
         }
         Code::RA006 => {
             "An unannotated parameter leaves the answer unstated, and a propless component leaves \
-             it to prose. The next reader — human or agent — has to guess what may be passed."
+             it to prose. The next reader — human or agent — has to guess what may be passed. The \
+             canonical fix is one sentence for every site, so the per-file half lives in the \
+             diagnostic's `message`: it quotes the exact signature line to write, in the \
+             declaration form the file already uses, naming the binding that exists rather than a \
+             synthesized `function Page(…)`."
         }
         Code::RA007 => {
             "Nothing downstream — lowering, analysis, codegen — can run on a file with a syntax \
@@ -52,16 +97,26 @@ fn why(code: Code) -> &'static str {
              signal or attach a listener, so the feature would silently do nothing."
         }
         Code::RA011 => {
-            "The router renders the default export as the route. An export it cannot call, cannot \
-             fill, or cannot get markup from leaves the route with nothing to render. A second \
-             default export is a parse error."
+            "The router renders the default export as the route, and it has no other source. Three \
+             shapes produce this code, and the `message` says which one the file has: there is no \
+             default export at all; a default export exists but is not a function this milestone \
+             can analyze (a class, a literal, a call, or an identifier that cannot be resolved in \
+             this file); or it is a function whose body does not `return <…/>` directly, or it \
+             takes more than one parameter. Only a direct `return` is recognized, because \
+             resolving what a returned variable or conditional renders needs type information this \
+             compiler does not have yet. An export the router cannot call, cannot fill, or cannot \
+             get markup from leaves the route with nothing to render. The canonical fix is one \
+             sentence for every site, so the per-file half is in the `message`: it names the \
+             existing declaration and, for a named export, quotes the signature line to edit."
         }
         Code::RA012 => {
             "The directive decides whether the route ships JavaScript. Inferring it would hide the \
              decision that controls the 0 KB guarantee."
         }
         Code::RA014 => {
-            "The code covers five families, and each would be wrong silently rather than loudly.\
+            "`RA014` is what the compiler reports when the file parses but this milestone cannot \
+             compile it: each refusal is a limitation of the compiler, not a syntax error. The \
+             code covers five families, and each would be wrong silently rather than loudly.\
              \n\n\
              The first is the JSX constructs it refuses: a capitalized tag or member-expression tag \
              (component inlining comes with a later plan), the runtime's own \
@@ -82,6 +137,25 @@ fn why(code: Code) -> &'static str {
              route component: both modes call the component synchronously and use its return \
              value, so a generator route component's iterator and an `async` one's promise are not \
              the markup either mode inserts.\
+             \n\n\
+             A further group inside that first family is markup the HTML parser would **reshape**, so \
+             an island's emitted HTML text re-parses into a different tree than the author wrote \
+             and a marker would address the wrong node. Each is refused rather than emitted, and \
+             the `message` names the parent, the child, what the parser does, and the repair: a \
+             `<p>` containing a block-level element, which closes the paragraph so the child \
+             becomes a sibling; a tag that **closes an open element of its own kind** (`<li>` in \
+             `<li>`, `<p>` in `<p>`, `<tr>` in `<tr>`, `<td>`/`<th>` in either, any heading in any \
+             other, `<button>`, `<option>`/`<optgroup>`, `<a>`, `<nobr>`); a child that violates its \
+             parent's **content model** (`<table>` holding anything but its table parts, `<ul>`/\
+             `<ol>`/`<menu>` anything but `<li>`, `<dl>` anything but `<dt>`/`<dd>`/`<div>`, and so \
+             on), or bare text fostered out of a table family element; an `<a>` inside an `<a>` or \
+             a `<form>` inside a `<form>`; an `<li>`/`<dt>`/`<dd>` with no list to belong to; a tag \
+             the parser only builds under one parent (`<td>` outside `<tr>`, `<option>` outside \
+             `<select>`, `<figcaption>` outside `<figure>`, …); and, in an island, a dynamic \
+             binding inside a text-only element (`<script>`, `<style>`, `<title>`, `<textarea>`, \
+             `<noscript>`, …), where the `<!>` marker the emitter needs is swallowed as text. The \
+             repair is to move the child to where its content model allows it, or to write the \
+             value as static text or on a sibling element that holds normal content.\
              \n\n\
              An import or re-export the emitted module cannot resolve or write is the second family, \
              refused for one of three reasons. A module other than `\"runai\"` has no bundler yet: \
@@ -144,11 +218,19 @@ fn why(code: Code) -> &'static str {
     }
 }
 
-/// The Markdown body for one code: what it means, why it is an error, and how to
-/// fix it.
+/// The Markdown of one code's skill file: frontmatter, then what it means, why it
+/// is an error, and how to fix it.
+///
+/// `runtime.js` is not the only thing `npm install` has to put on disk — the
+/// `doc` every diagnostic prints names a file in this same package — so the
+/// frontmatter names the code the way [`Code::as_str`] does, and that string is
+/// the one the file is named after.
 pub fn skill_body(code: Code) -> String {
     format!(
-        "## What it means\n\n{means}\n\n## Why it is an error\n\n{why}\n\n## Fix\n\n{fix}\n",
+        "---\nname: {name}\ndescription: {description}\n---\n\n\
+         ## What it means\n\n{means}\n\n## Why it is an error\n\n{why}\n\n## Fix\n\n{fix}\n",
+        name = code.as_str(),
+        description = description(code),
         means = code.explain(),
         why = why(code),
         fix = code.fix_template(),
@@ -174,6 +256,54 @@ mod tests {
             for section in ["## What it means", "## Why it is an error", "## Fix"] {
                 assert!(body.contains(section), "{}: {body}", code.as_str());
             }
+        }
+    }
+
+    /// `runai skills` writes a file per code, and the file is a skill: it opens
+    /// with YAML frontmatter naming the code and carrying a one-line description.
+    /// Both are assertions rather than prose, because a generator that emitted a
+    /// body with no frontmatter would still pass every section test above.
+    ///
+    /// The description must be **one line** and must not contain `: ` outside
+    /// backticks — a colon in a plain YAML scalar starts a new mapping and makes
+    /// the frontmatter unparseable, which fails silently in a loader that ignores
+    /// the error.
+    #[test]
+    fn every_skill_has_frontmatter_naming_its_code() {
+        for code in Code::all() {
+            let body = skill_body(*code);
+            assert!(
+                body.starts_with("---\n"),
+                "{}: no frontmatter: {body}",
+                code.as_str()
+            );
+            let name = format!("name: {}\n", code.as_str());
+            assert!(body.contains(&name), "{}: {body}", code.as_str());
+
+            let rest = body.strip_prefix("---\n").unwrap();
+            let front = &rest[..rest.find("\n---\n").expect("frontmatter must close")];
+            let description = front
+                .lines()
+                .find_map(|line| line.strip_prefix("description: "))
+                .unwrap_or_else(|| panic!("{}: no description: {front}", code.as_str()));
+            assert!(
+                !description.trim().is_empty(),
+                "{}: empty description",
+                code.as_str()
+            );
+            // A second `description:` line would mean one wrapped description was
+            // read as two keys; a `: ` inside the value is the same YAML hazard.
+            assert_eq!(
+                front.matches("description:").count(),
+                1,
+                "{}: one description line: {front}",
+                code.as_str()
+            );
+            assert!(
+                !description.contains(": "),
+                "{}: a plain YAML scalar cannot contain `: `: {description}",
+                code.as_str()
+            );
         }
     }
 
@@ -543,5 +673,212 @@ mod tests {
                 "{label}: the canonical fix must carry a legal repair, missing: {repair}\n{fix}"
             );
         }
+    }
+
+    /// The reparse family is the largest class of `RA014` a route can actually hit:
+    /// every `<p>` holding a block element, every same-kind nesting, every content
+    /// model violation, every nested `<a>`/`<form>`, every stray list item, every
+    /// required-ancestor tag, and the island marker-hostile rule. Task 11/13 added
+    /// all of them and they were named in **neither** the skill nor `explain`, so a
+    /// diagnostic from that family pointed at a skill describing JSX constructs and
+    /// imports the file did not contain. Each anchor below is the phrase the skill
+    /// now gives; deleting a family removes its anchor and fails the test.
+    #[test]
+    fn ra014_names_the_reparse_family_in_skill_and_explain() {
+        let body = skill_body(Code::RA014);
+        for (label, phrase) in [
+            ("heading", "markup the HTML parser would **reshape**"),
+            ("block in p", "a `<p>` containing a block-level element"),
+            ("same kind", "closes an open element of its own kind"),
+            ("content model", "**content model**"),
+            (
+                "bare text",
+                "bare text fostered out of a table family element",
+            ),
+            ("nested anchor", "an `<a>` inside an `<a>`"),
+            ("nested form", "a `<form>` inside a `<form>`"),
+            ("stray item", "with no list to belong to"),
+            ("required parent", "only builds under one parent"),
+            (
+                "marker hostile",
+                "dynamic binding inside a text-only element",
+            ),
+        ] {
+            assert!(
+                body.contains(phrase),
+                "{label}: the reparse family must be named: `{phrase}`\n{body}"
+            );
+        }
+
+        // `explain` is what `runai check` prints, so the same family has to be
+        // reachable there: an agent reading a `<p><div>` diagnostic must not be
+        // told only about component tags.
+        let explain = Code::RA014.explain();
+        for phrase in [
+            "markup the HTML parser would reshape",
+            "holding a block-level element",
+            "closes an open element of its own kind",
+            "content model",
+            "inside an `<a>`",
+            "inside a `<form>`",
+            "with no list",
+            "only builds under one parent",
+            "text-only element",
+        ] {
+            assert!(
+                explain.contains(phrase),
+                "the reparse family must reach `explain` too: `{phrase}`\n{explain}"
+            );
+        }
+    }
+
+    /// Task 3 round 2 rewrote RA007's fix to be cause-agnostic: it no longer
+    /// asserts JSX causes for a parser error that is not about JSX (`const a = 1 =
+    /// 2` is a parse error with no tag in it). The skill quotes `fix_template`
+    /// verbatim, so it inherits that wording — but the skill's own prose is a
+    /// separate paragraph and could reintroduce a JSX-only claim. Both halves are
+    /// asserted here, because the drift test for the fix cannot see the prose.
+    ///
+    /// `tag` is the proxy Task 3's own `source.rs` test uses; `unclosed` and
+    /// `sibling` are the concrete causes. The honest text says *the usual causes*
+    /// and points at `message`, which is what the agent's own file carries.
+    #[test]
+    fn ra007_skill_does_not_assert_a_jsx_cause_for_a_non_jsx_parse_error() {
+        let body = skill_body(Code::RA007);
+        let why = &body[body.find("## Why it is an error").unwrap()..body.find("## Fix").unwrap()];
+        // The prose may name the line-break case (it *is* a JSX cause), but it must
+        // not claim every RA007 is a JSX tag problem. `unclosed` is fine only in
+        // the fix's "usual causes" clause, which is where it belongs — so the
+        // assertion is scoped to the `why` section, which must stay cause-agnostic.
+        assert!(
+            !why.contains("unclosed tag"),
+            "the why section must not claim a JSX cause for every RA007: {why}"
+        );
+        // The fix does name the usual causes, and it must frame them as usual, not
+        // as the cause: "the usual causes are" is the load-bearing phrase.
+        let fix = Code::RA007.fix_template();
+        assert!(
+            fix.contains("the usual causes are"),
+            "the fix must offer JSX causes as usual, not certain: {fix}"
+        );
+        assert!(
+            fix.starts_with("Fix the syntax error the parser reported in `message`"),
+            "the fix must point at the parser's own message first: {fix}"
+        );
+        // And the skill carries the repair that names the parser, so an agent
+        // reading the file has the same instruction the diagnostic printed.
+        assert!(
+            body.contains(fix),
+            "the skill must quote the current fix: {body}"
+        );
+    }
+
+    /// RA011 has three constructors with different wording — no default export, a
+    /// default export that does not return JSX, and one that is not a function this
+    /// milestone can analyze — plus the >1 parameter case. A skill that described
+    /// only "add a default export" would send an agent with an existing export into
+    /// a duplicate-export parse error, which is the repair loop this code exists to
+    /// prevent. So all four shapes are named, and the skill says the `message`
+    /// carries which one the file has.
+    #[test]
+    fn ra011_skill_names_every_constructor() {
+        let body = skill_body(Code::RA011);
+        for (label, phrase) in [
+            ("missing", "there is no default export at all"),
+            (
+                "not a function",
+                "a default export exists but is not a function this milestone can analyze",
+            ),
+            ("no JSX", "does not `return <…/>` directly"),
+            ("too many params", "takes more than one parameter"),
+            ("per site", "the `message` says which one the file has"),
+        ] {
+            assert!(
+                body.contains(phrase),
+                "{label}: RA011's skill must name this shape: `{phrase}`\n{body}"
+            );
+        }
+        // The duplicate-export hazard is stated, because "add a default export" is
+        // the wrong repair for two of the three shapes.
+        assert!(
+            body.contains("existing declaration"),
+            "the skill must say the fix edits the existing declaration: {body}"
+        );
+    }
+
+    /// RA006's and RA011's fixes are static per code: the per-file half (the exact
+    /// signature line, the declaration's name) lives in the diagnostic's `message`,
+    /// because a static skill cannot name a binding it has never seen. This pins
+    /// that split, so a future "improvement" that interpolates `{name}` into
+    /// `fix_template` fails here rather than shipping a skill that says
+    /// `function {name}(…)`.
+    #[test]
+    fn per_site_fixes_are_described_not_quoted() {
+        for code in Code::all() {
+            let fix = code.fix_template();
+            assert!(
+                !fix.contains("{name}") && !fix.contains("{}"),
+                "{}: fix_template must be static; per-site text belongs in `message`: {fix}",
+                code.as_str()
+            );
+        }
+        // And the two codes whose sites differ say where the per-site half is.
+        for (code, what) in [
+            (Code::RA006, "the diagnostic's `message`"),
+            (Code::RA011, "the `message`"),
+        ] {
+            let body = skill_body(code);
+            assert!(
+                body.contains(what),
+                "{}: the skill must point at the per-site text: {body}",
+                code.as_str()
+            );
+        }
+    }
+
+    /// The committed copy under `packages/runai/skills/` is what `npm install`
+    /// ships, and it is the file every diagnostic's `doc` names. If it drifts from
+    /// the generator, an agent reads a skill that describes a rule the compiler no
+    /// longer reports — and nothing else would notice.
+    ///
+    /// Both directions matter and both are asserted: a missing file is a `doc`
+    /// path that 404s, and a stale file is worse, because it *looks* authoritative.
+    #[test]
+    fn committed_skills_match_the_generator() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/runai/skills");
+        for code in Code::all() {
+            let path = dir.join(code.skill_file());
+            let committed = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                panic!(
+                    "missing {}; run `cargo run -p runai_cli -- skills --out packages/runai/skills`",
+                    path.display()
+                )
+            });
+            assert_eq!(
+                committed,
+                skill_body(*code),
+                "stale {}; run `cargo run -p runai_cli -- skills --out packages/runai/skills`",
+                path.display()
+            );
+        }
+
+        // A file for a code that no longer exists is dead documentation an agent
+        // may still reach through an old link, and the count has to be exact: one
+        // file per code in `Code::all()`.
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.ends_with(".md").then_some(name)
+            })
+            .collect();
+        let mut expected: Vec<String> = Code::all().iter().map(Code::skill_file).collect();
+        on_disk.sort();
+        expected.sort();
+        assert_eq!(
+            on_disk, expected,
+            "packages/runai/skills must hold exactly one file per code"
+        );
     }
 }

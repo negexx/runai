@@ -4,6 +4,11 @@
   "type": "module",
   "main": "runtime.js",
   "types": "index.d.ts",
+  "files": [
+    "runtime.js",
+    "index.d.ts",
+    "skills"
+  ],
   "devDependencies": {
     "happy-dom": "^21.0.4"
   }
