@@ -372,6 +372,28 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
+/// The error diagnostics `run` would report for the current working directory.
+///
+/// [`run`] prints its diagnostics and returns a code, which is right for a command whose
+/// product is the exit status. `runai dev` also needs the *structured* form for
+/// `/_runai/status`, and re-derived route analysis would be a second, drifting copy of
+/// the build's gate. So this calls the same [`prepare`] on the same walk: the returned
+/// list is exactly the set `run` prints before exiting `1`.
+///
+/// Not every build failure is a diagnostic — a render that threw, a missing runtime, an
+/// unreadable file, or a refused `--out` is a complete sentence rather than a located
+/// finding. Those return an empty list, which is why the dev server reports `[]` for
+/// them; the failure itself is still visible on the build's stderr.
+pub fn diagnostics() -> Vec<Diagnostic> {
+    match prepare() {
+        Ok(_) => Vec::new(),
+        Err(Refusal::Collected { diagnostics, .. }) => {
+            diagnostics.into_iter().map(|(_, found)| found).collect()
+        }
+        Err(Refusal::Message(_)) => Vec::new(),
+    }
+}
+
 /// Refuse the `--out` values that name the working tree, its parent, or nothing.
 ///
 /// Checked on the argument **as typed**, before resolution: `.` and `..` resolve to
