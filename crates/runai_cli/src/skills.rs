@@ -26,13 +26,26 @@ use crate::USAGE;
 /// `runai skills` writes. Spec §7.9.
 const DEFAULT_OUT: &str = "node_modules/runai/skills";
 
-/// Run `runai skills …` with the arguments that follow `skills`.
+/// Parse the one argument loop `runai build` and `runai skills` share.
 ///
-/// Returns the process exit code: `0` every file was written, `2` the command was
-/// misused, `1` a directory or file could not be written. A `1` names the path
-/// that failed, because the repair for a read-only tree is the path, not the
-/// command.
-pub fn run(args: &[String]) -> i32 {
+/// Both commands take exactly one flag — `--out <dir>` or `--out=<dir>` — and both
+/// refuse anything else with the same three messages and exit code `2`. The loop
+/// lived twice, character for character, which is how the two commands could have
+/// drifted into accepting a spelling the other refused; this is the single copy.
+///
+/// # Returns
+///
+/// - `Ok(None)` — no `--out` was given; the caller supplies its own default.
+/// - `Ok(Some(dir))` — the directory as written, **not** validated: `""`, `.` and
+///   `..` are refused by each caller, because a build output directory and a skill
+///   output directory have different degeneracy rules.
+/// - `Err(2)` — the command was misused. The message and `USAGE` have already been
+///   printed, so a caller returns `2` unchanged.
+///
+/// This lives beside `skills` because `build`'s module cannot be the shared home
+/// from here; it is `pub(crate)` so `crate::build` calls it rather than keeping a
+/// second copy.
+pub(crate) fn parse_out_flag(args: &[String]) -> Result<Option<&str>, i32> {
     let mut out: Option<&str> = None;
     let mut index = 0;
 
@@ -40,13 +53,13 @@ pub fn run(args: &[String]) -> i32 {
         let arg = args[index].as_str();
         index += 1;
         match arg {
-            // `--out skills` and `--out=skills` are the same flag, matching
-            // `runai build`'s spelling so a script can reuse either form.
+            // `--out skills` and `--out=skills` are the same flag, and both
+            // commands accept either form so a script can reuse one spelling.
             "--out" => {
                 let Some(value) = args.get(index) else {
                     eprintln!("error: `--out` needs a directory");
                     eprintln!("{USAGE}");
-                    return 2;
+                    return Err(2);
                 };
                 out = Some(value.as_str());
                 index += 1;
@@ -55,15 +68,32 @@ pub fn run(args: &[String]) -> i32 {
             flag if flag.starts_with('-') => {
                 eprintln!("error: unknown flag `{flag}`");
                 eprintln!("{USAGE}");
-                return 2;
+                return Err(2);
             }
             value => {
                 eprintln!("error: unexpected argument `{value}`");
                 eprintln!("{USAGE}");
-                return 2;
+                return Err(2);
             }
         }
     }
+
+    Ok(out)
+}
+
+/// Run `runai skills …` with the arguments that follow `skills`.
+///
+/// Returns the process exit code: `0` every file was written, `2` the command was
+/// misused, `1` a directory or file could not be written. A `1` names the path
+/// that failed, because the repair for a read-only tree is the path, not the
+/// command.
+pub fn run(args: &[String]) -> i32 {
+    // `?` is not available (this returns `i32`, not `Result`), so the exit code is
+    // propagated explicitly.
+    let out = match parse_out_flag(args) {
+        Ok(out) => out,
+        Err(code) => return code,
+    };
 
     let out = out.unwrap_or(DEFAULT_OUT);
     // An empty value (`--out=`) names no directory; `write` would fail with a
@@ -94,4 +124,37 @@ pub fn run(args: &[String]) -> i32 {
         dir.display()
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_out_flag;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// Every accepted spelling and every refusal, pinned at the parser rather than
+    /// through the binary. `build.rs` used to carry its own copy of this loop; these
+    /// are the cases it had to keep in step by hand.
+    #[test]
+    fn parse_out_flag_accepts_both_spellings_and_refuses_the_rest() {
+        assert_eq!(parse_out_flag(&args(&[])), Ok(None));
+        assert_eq!(parse_out_flag(&args(&["--out", "dist"])), Ok(Some("dist")));
+        assert_eq!(parse_out_flag(&args(&["--out=dist"])), Ok(Some("dist")));
+        // An empty value parses; the caller refuses it, because `build` and `skills`
+        // disagree about which values are degenerate.
+        assert_eq!(parse_out_flag(&args(&["--out="])), Ok(Some("")));
+        // A value that starts with `-` is still the value: `--out -x` names `-x`.
+        assert_eq!(parse_out_flag(&args(&["--out", "-x"])), Ok(Some("-x")));
+        // The last spelling wins, as it did before the loop was shared.
+        assert_eq!(
+            parse_out_flag(&args(&["--out", "a", "--out=b"])),
+            Ok(Some("b"))
+        );
+
+        assert_eq!(parse_out_flag(&args(&["--out"])), Err(2));
+        assert_eq!(parse_out_flag(&args(&["--json"])), Err(2));
+        assert_eq!(parse_out_flag(&args(&["dist"])), Err(2));
+    }
 }

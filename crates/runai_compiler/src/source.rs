@@ -16,7 +16,7 @@ use oxc_ast::ast::{Expression, Program, Statement};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 
-use crate::diagnostic::{Code, Diagnostic};
+use crate::diagnostic::{Code, Diagnostic, excessive_nesting, jsx_too_deep};
 
 /// How a route file renders: prerendered with no JavaScript, or hydrated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,10 +85,27 @@ pub fn parse_tsx<'a>(
 /// [`crate::strip::strip_types`] needs the *owned* program because the
 /// transformer mutates it. Both therefore report a rejection identically, and a
 /// second `RA007` mapping cannot drift from this one.
+///
+/// # The depth ceiling is enforced here, before the parser runs
+///
+/// `oxc_parser` is recursive descent with no depth limit, so a deeply nested file
+/// overflows the stack and **aborts the process** — not a panic, so no caller can
+/// catch it. A guard that lived only in the later AST walks would be useless: the
+/// parser aborts first, before any walk sees a tree. So the ceiling
+/// ([`crate::diagnostic::MAX_JSX_DEPTH`]) is checked against the source's own `<`
+/// nesting here, on the one path every consumer takes — `analyze`, `lower_route`
+/// through [`crate::strip::strip_types`], and therefore both emitters.
+///
+/// [`jsx_too_deep`] is a text scan, not a parse: it is the only thing available
+/// before a parse that could kill the process.
 pub(crate) fn parse_program<'a>(
     alloc: &'a Allocator,
     source: &'a str,
 ) -> Result<oxc_parser::ParserReturn<'a>, Vec<Diagnostic>> {
+    if let Some(span) = jsx_too_deep(source) {
+        return Err(vec![excessive_nesting(span)]);
+    }
+
     let ret = Parser::new(alloc, source, SourceType::tsx()).parse();
 
     if ret.diagnostics.is_empty() {
@@ -159,7 +176,7 @@ pub(crate) fn raw_text(source: &str, span: Span) -> Option<&str> {
 /// Whether `text` contains a line break.
 ///
 /// Both consumers of the JSX whitespace rule need the same answer — [`check_jsx`]
-/// to report the one ambiguous case, [`crate::ir::lower_text`] to collapse the
+/// to report the one ambiguous case, `crate::ir::lower_text` to collapse the
 /// text — and `\r` is a line break too: a classic-Mac file separates its JSX lines
 /// with it. Treating only `\n` would keep a `\r`-separated node verbatim in the IR
 /// and never report the space it deletes.

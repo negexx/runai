@@ -132,8 +132,8 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     diagnostics.extend(check_imports(program, source, mode));
     diagnostics.extend(check_erased_declarations(program, path));
 
-    // One semantic build for the signal rules. A page with a known mode pays one
-    // more later, in stage 5, and only when it has a route component to check.
+    // A semantic build for the signal rules — one of up to four in `analyze`; the
+    // full set and why each is separate is listed at stage 5 below.
     let bindings = find_signal_bindings(program);
     diagnostics.extend(check_signal_rules(program, &bindings));
 
@@ -147,12 +147,32 @@ fn check(program: &Program<'_>, source: &str, path: &str) -> Vec<Diagnostic> {
     // which module would be emitted — and therefore what is reachable — is
     // undecided, so the rule would be guessing.
     //
-    // This is the one second semantic build in the pipeline, and it is deliberate:
-    // `SignalBindings` records accessor calls, not arbitrary identifier
-    // references, and widening it would make the signal pass pay for a question it
-    // never asks. The rule returns immediately for a file with no route component,
-    // so a component module pays nothing here, and a page pays one extra build —
-    // not one per rule.
+    // This is **not** the only extra semantic build, and the detail matters
+    // because a comment that says "one" is a claim about the whole pipeline.
+    // `analyze` runs up to four, in execution order, each answering a question
+    // the others' data cannot, and each gated so a file that cannot have the
+    // problem pays nothing:
+    //
+    //   1. `check_runai_specifier_names`, inside `check_imports` above — island
+    //      mode only, and only when a `"runai"` specifier names one of the type
+    //      exports, because a type-only *use* must be told from a value use.
+    //   2. `find_signal_bindings` (the `bindings` above) — every file, always.
+    //      It records accessor *calls* and the effect scopes around them; it is
+    //      not a general reference table, and widening it to one would make the
+    //      signal pass pay for questions it never asks.
+    //   3. `check_reachable_expressions` — here, for a page with a known mode
+    //      that also has a route component; it returns before building for any
+    //      other file. It needs arbitrary identifier references, which (2) does
+    //      not hold.
+    //   4. `check_emitted_names` — immediately below, behind the same gate. It
+    //      judges a reference against the emitter's reserved names and the route
+    //      component's own scope, which (3) discards once it has an answer.
+    //
+    // So a page with a known mode and a route component pays three, an island
+    // with a type-named specifier pays four, and the cost is per *question*, not
+    // per rule. Merging them is a real change — one `SemanticBuilder::build`
+    // shared through a parameter — and is tracked separately; this comment
+    // describes today, not the target.
     if let Some(mode) = mode {
         diagnostics.extend(check_reachable_expressions(mode, program, &bindings));
         // (6) The names the emitted module declares for itself — `_esc`, `_attr`,
@@ -229,32 +249,28 @@ fn check_erased_declarations(program: &Program<'_>, path: &str) -> Vec<Diagnosti
 /// the identifier would suggest renaming it fixes the problem.
 fn ambient_statement_span(statement: &Statement<'_>) -> Option<(u32, u32)> {
     match statement {
-        Statement::VariableDeclaration(variable) if variable.declare => {
-            Some((variable.span.start, variable.span.end))
-        }
-        Statement::FunctionDeclaration(function) if function.declare => {
-            Some((function.span.start, function.span.end))
-        }
-        Statement::ClassDeclaration(class) if class.declare => {
-            Some((class.span.start, class.span.end))
-        }
-        Statement::TSEnumDeclaration(enumeration) if enumeration.declare => {
-            Some((enumeration.span.start, enumeration.span.end))
-        }
-        Statement::TSNamespaceDeclaration(namespace) if namespace.declare => {
-            Some((namespace.span.start, namespace.span.end))
-        }
         // `declare module "x" { … }` and `declare global { … }` are ambient by
-        // node kind; this syntax has no non-ambient spelling.
+        // node kind, not by a flag: this syntax has no non-ambient spelling.
         Statement::TSExternalModuleDeclaration(module) => {
             Some((module.span.start, module.span.end))
         }
         Statement::TSGlobalDeclaration(global) => Some((global.span.start, global.span.end)),
-        _ => None,
+        // Every other ambient form is a `Declaration`. `as_declaration` is `None`
+        // for a statement that is not one, which is where the walk stops.
+        _ => ambient_declaration_span(statement.as_declaration()?),
     }
 }
 
-/// [`ambient_statement_span`] for the declaration inside an `export …`.
+/// [`ambient_statement_span`] for the declaration inside an `export …`: the five
+/// forms that carry a `declare` flag.
+///
+/// The two flagless forms above are **not** matched here, and that asymmetry is
+/// the behaviour this function has today, not a comment about the parser: Oxc
+/// does parse `export declare module "x" { … }` and `export declare global { … }`
+/// into an `ExportDeclaration` whose `declaration` is one of those two kinds, and
+/// the exported path therefore does not refuse them. Extending this match would
+/// add a diagnostic, so it is a rule change rather than a de-duplication and it
+/// does not belong in this helper.
 fn ambient_declaration_span(declaration: &oxc_ast::ast::Declaration<'_>) -> Option<(u32, u32)> {
     match declaration {
         oxc_ast::ast::Declaration::VariableDeclaration(variable) if variable.declare => {
@@ -1826,6 +1842,10 @@ mod tests {
     /// `declare let`, `declare enum`, `declare namespace`, `declare module`,
     /// `declare global`, and the `export declare` spellings. The reason is the
     /// one thing they share, so it is the one thing the message says.
+    ///
+    /// Two `export declare` spellings are the exception — `export declare module`
+    /// and `export declare global` come back clean; see
+    /// [`the_two_span_walks_agree_on_every_ambient_form`] for the pinned set.
     #[test]
     fn a_declare_statement_is_ra014_because_it_is_erased() {
         for statement in [
@@ -1898,6 +1918,57 @@ mod tests {
             analyze(overloaded, "src/routes/index.page.tsx").is_empty(),
             "an overload signature is erased but its implementation declares the name"
         );
+    }
+
+    /// The two span walks were once five duplicated arms each, and the
+    /// de-duplication is only safe if the exported path and the statement path
+    /// agree about every form. This pins the agreement **by category**, not by
+    /// form count, so a sixth `declare`-flagged kind added to one walk and not
+    /// the other fails here instead of shipping.
+    ///
+    /// It also pins the two forms that agree by *refusing nothing*:
+    /// `export declare module` and `export declare global` parse into an
+    /// `ExportDeclaration` and are not matched by the exported walk, so `check`
+    /// accepts them while `check` refuses the unexported spelling. That gap is
+    /// recorded here as measured behaviour; closing it is a rule change, and a
+    /// test that failed on it would force this refactor to alter a diagnostic.
+    #[test]
+    fn the_two_span_walks_agree_on_every_ambient_form() {
+        for (form, refused) in [
+            ("declare const x: string", true),
+            ("declare let x: string", true),
+            ("declare function f(): string", true),
+            ("declare class C {}", true),
+            ("declare enum E { A }", true),
+            ("declare namespace N { const x: number }", true),
+            ("declare module \"m\" { export const x: number }", true),
+            ("declare global { interface Window { x: number } }", true),
+            ("export declare const x: string", true),
+            ("export declare function f(): string", true),
+            ("export declare class C {}", true),
+            ("export declare enum E { A }", true),
+            ("export declare namespace N { const x: number }", true),
+            (
+                "export declare module \"m\" { export const x: number }",
+                false,
+            ),
+            (
+                "export declare global { interface Window { x: number } }",
+                false,
+            ),
+        ] {
+            for directive in ["\"use static\"", "\"use island\""] {
+                let src = format!(
+                    "{directive}\n{form}\nexport default function Page(props: Record<never, never>) {{ return <p>hi</p> }}\n"
+                );
+                let refused_here =
+                    codes(&analyze(&src, "src/routes/index.page.tsx")).contains(&Code::RA014);
+                assert_eq!(
+                    refused_here, refused,
+                    "{form} ({directive}): expected refused = {refused}"
+                );
+            }
+        }
     }
 
     #[test]

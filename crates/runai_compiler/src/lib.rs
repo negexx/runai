@@ -3,7 +3,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod analyze;
 pub mod codegen;
 pub mod diagnostic;
-pub mod instruction;
+// Test-only: this module's only item is its `tests` module. Publishing it as a
+// public module advertised an empty slice of the crate surface.
+#[cfg(test)]
+mod instruction;
 pub mod ir;
 pub mod skills;
 pub mod source;

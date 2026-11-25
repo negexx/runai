@@ -4,7 +4,14 @@ dist/
 .runai/
 .superpowers/
 *.Zone.Identifier
+*:Zone.Identifier
 .worktrees/
+
+# Claude Code artifacts. This project uses OpenCode; GitNexus can emit
+# CLAUDE.md and .claude/skills/ when analyze runs without --skip-agents-md
+# --skip-skills. Ignored so they cannot be committed by accident.
+.claude/
+CLAUDE.md
 
 # Third-party research documents kept locally
 OpenCode Production Workspace Setup.md

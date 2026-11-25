@@ -74,6 +74,73 @@ fn check_refuses_a_dynamic_route_segment_like_build() {
     );
 }
 
+// F2: `build` refuses a route under a dot-prefixed directory at `build.rs`'s
+// `route_name` (the output path would be `dist/.hidden/index.html`, which many
+// static servers 404), but `check` passes the same tree with `[]` and exit 0. A CI
+// that runs only `runai check` therefore goes green on a tree the builder will not
+// produce. This is the documented check/build asymmetry; the assertion is the
+// builder's own refusal, so `check` cannot pass a tree `build` rejects.
+//
+// Both channels are accepted, because `build` reports this on stderr while a
+// diagnostic-shaped fix would report it on stdout: the pinned facts are the exit
+// code and the reason, not which stream carries it.
+#[test]
+fn check_refuses_a_dot_prefixed_route_directory_like_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes/.hidden")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/.hidden/index.page.tsx"),
+        "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>hidden</p> }\n",
+    )
+    .unwrap();
+    let out = run(&["check", "--json"], tmp.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = format!("{stdout}{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "check must refuse what build refuses, got stdout {stdout:?} stderr {stderr:?}"
+    );
+    assert!(
+        said.contains("dot-prefixed") && said.contains(".hidden"),
+        "the refusal names the dot-prefixed directory, like build does: {said}"
+    );
+}
+
+// F2, second shape: `build` refuses an island route whose asset path is
+// `assets/RUNTIME.js` because the runtime copy overwrites the module and the page
+// mounts nothing (`build.rs`, case-insensitive). `check` passed it with exit 0, so
+// only a build caught it. Pin the same refusal in `check`.
+#[test]
+fn check_refuses_a_reserved_runtime_route_like_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/index.page.tsx"),
+        "\"use static\"\nexport default function P(props: Record<never, never>) { return <p>root</p> }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/RUNTIME.page.tsx"),
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <button onClick={() => {}}>x</button> }\n",
+    )
+    .unwrap();
+    let out = run(&["check", "--json"], tmp.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = format!("{stdout}{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "check must refuse what build refuses, got stdout {stdout:?} stderr {stderr:?}"
+    );
+    assert!(
+        said.contains("reserved for the runtime copy") && said.contains("RUNTIME"),
+        "the refusal names the reserved runtime asset, like build does: {said}"
+    );
+}
+
 // The dynamic-segment rule is page-only: a component module under a bracketed
 // directory is not a route and must stay clean.
 #[test]

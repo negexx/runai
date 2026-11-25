@@ -244,6 +244,28 @@ impl TemplateSites for PrerenderSites {
 /// [`write_node`] for one node, appending to `out`, with the dynamic sites
 /// delegated to `S`.
 pub(crate) fn write_node<S: TemplateSites>(node: &IrNode, out: &mut String) {
+    write_node_at::<S>(node, out, 1);
+}
+
+/// [`write_node`] with the node's nesting level, root = 1.
+///
+/// `depth` is bounded by [`crate::diagnostic::MAX_JSX_DEPTH`]. The IR a lowering
+/// produced can never exceed it — [`crate::ir::lower_route`] refuses first — so
+/// this arm is unreachable through the checked emitters. It exists because both
+/// writers are `pub` and a caller can hand one a tree built some other way: a
+/// stack overflow aborts the process, so the alternative to a guard here is not a
+/// panic but a dead compiler. Past the ceiling the function stops descending and
+/// writes nothing further, which loses markup — deliberately loud in a debug
+/// build, and unreachable in a release one for the reason above.
+fn write_node_at<S: TemplateSites>(node: &IrNode, out: &mut String, depth: usize) {
+    debug_assert!(
+        depth <= crate::diagnostic::MAX_JSX_DEPTH,
+        "a tree deeper than MAX_JSX_DEPTH reached the emitter: lower_route refuses it (RA015)"
+    );
+    if depth > crate::diagnostic::MAX_JSX_DEPTH {
+        return;
+    }
+
     match node {
         IrNode::Text(text) => escape_literal(text, out),
         IrNode::Expr(expr) => S::expr(expr, out),
@@ -304,7 +326,7 @@ pub(crate) fn write_node<S: TemplateSites>(node: &IrNode, out: &mut String) {
             }
 
             for child in children {
-                write_node::<S>(child, out);
+                write_node_at::<S>(child, out, depth + 1);
             }
 
             if !void {
