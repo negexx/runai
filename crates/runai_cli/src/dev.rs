@@ -391,13 +391,7 @@ impl Server {
         }
 
         if method != "GET" && method != "HEAD" {
-            write_response(
-                stream,
-                405,
-                "text/plain; charset=utf-8",
-                b"method not allowed\n",
-                false,
-            );
+            method_not_allowed(stream);
             return;
         }
 
@@ -437,13 +431,7 @@ impl Server {
     fn control(&self, stream: &mut TcpStream, method: &str, path: &str) {
         if path == STATUS {
             if method != "GET" && method != "HEAD" {
-                write_response(
-                    stream,
-                    405,
-                    "text/plain; charset=utf-8",
-                    b"method not allowed\n",
-                    false,
-                );
+                method_not_allowed(stream);
                 return;
             }
             let body = self.status_json();
@@ -460,13 +448,7 @@ impl Server {
         // Shutdown is a POST: a browser prefetch or a stray GET must not stop the
         // server, and `dev stop` is the only intended caller.
         if method != "POST" {
-            write_response(
-                stream,
-                405,
-                "text/plain; charset=utf-8",
-                b"method not allowed\n",
-                false,
-            );
+            method_not_allowed(stream);
             return;
         }
 
@@ -1180,6 +1162,24 @@ fn write_response(
     let _ = stream.flush();
 }
 
+/// The 405 body, shared by the page route and both control endpoints.
+///
+/// All three sites answer the same bytes, and a single helper is what keeps them
+/// the same: a reader reasoning about the control channel only has to read this one
+/// place to know what a refused method returns. `head_only` is `false` at every
+/// site, including for a `HEAD` request — a `HEAD` never reaches here (`GET` and
+/// `HEAD` are the allowed pair on the page and status routes, and the only refused
+/// method on shutdown is one that is not `POST`), so there is no body to suppress.
+fn method_not_allowed(stream: &mut TcpStream) {
+    write_response(
+        stream,
+        405,
+        "text/plain; charset=utf-8",
+        b"method not allowed\n",
+        false,
+    );
+}
+
 /// The 404 body. Deliberately not the path: an error page that echoes the request is
 /// a reflected-content surface, and the request is often a probe.
 fn not_found(stream: &mut TcpStream, method: &str) {
@@ -1632,6 +1632,67 @@ mod tests {
             Answer::Status(_) => panic!("nothing was written, so no status can exist"),
         }
         held.join().unwrap();
+    }
+
+    /// The 405 response is written from three sites (the page route, `/_runai/status`,
+    /// and `/_runai/shutdown`) through one helper. The bytes are the contract: an agent
+    /// reading `runai dev`'s output, and any client that retries on a status code, sees
+    /// exactly these. Pinning them here is what makes the shared helper a refactor
+    /// rather than a rewrite — without it, "the three sites are identical" is only a
+    /// claim about the source text.
+    ///
+    /// Driven through the real `handle`/`control` paths over a loopback pair, not by
+    /// calling the helper directly: a test of the helper would pass even if a call site
+    /// stopped using it.
+    #[test]
+    fn the_405_response_is_byte_identical_at_every_site() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(DIST)).unwrap();
+        let server = Arc::new(Server::new(tmp.path(), 0));
+
+        for (method, target) in [
+            // The page route: anything but GET/HEAD.
+            ("POST", "/index.html"),
+            ("PUT", "/"),
+            ("DELETE", "/assets/index.js"),
+            // `/_runai/status`: anything but GET/HEAD.
+            ("POST", STATUS),
+            // `/_runai/shutdown`: anything but POST.
+            ("GET", SHUTDOWN),
+            ("HEAD", SHUTDOWN),
+        ] {
+            let response = answer_once(&server, method, target);
+            assert_eq!(
+                response,
+                "HTTP/1.1 405 Method Not Allowed\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: 19\r\n\
+                 Cache-Control: no-store\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 method not allowed\n",
+                "{method} {target} must answer the one 405 body"
+            );
+        }
+    }
+
+    /// Run one request through [`Server::handle`] and return everything written.
+    ///
+    /// A real socket pair, because `handle` takes a `TcpStream`: this exercises the
+    /// writer and the header assembly, which a buffer-shaped refactor would not.
+    fn answer_once(server: &Arc<Server>, method: &str, target: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            body
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        server.handle(&mut stream, method, target);
+        drop(stream);
+        client.join().unwrap()
     }
 
     /// The other half: nothing listening is gone, which is the only case `dev stop` may

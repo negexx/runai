@@ -52,6 +52,14 @@ fn description(code: Code) -> &'static str {
             "Valid syntax this milestone cannot compile — an unsupported construct, import, \
              unreachable value, `declare`, reserved name, or a name exported twice."
         }
+        Code::RA015 => {
+            "A JSX tree nests deeper than the compiler can walk, which would overflow the stack \
+             and abort the process."
+        }
+        Code::RA016 => {
+            "A `\"use static\"` route gives an attribute a value the build cannot evaluate, so a \
+             prerendered page and a hydrated island would render different attributes."
+        }
     }
 }
 
@@ -246,6 +254,33 @@ fn why(code: Code) -> &'static str {
              An attribute with an empty expression (`name={}`) is deliberately **not** on this \
              list: that is a parse error, reported as `RA007`, not valid syntax waiting for a later \
              milestone."
+        }
+        Code::RA015 => {
+            "Every pass over the markup is recursive descent, one stack frame per element level: \
+             the parser builds the tree, the whitespace and refusal checks walk it, lowering turns \
+             it into the IR, and the emitters write the template. The stack is finite, so a tree \
+             deep enough exhausts it, and a stack overflow **aborts the process** — it is not a \
+             panic a `Result` can carry, so there is no diagnostic and no file position at all. \
+             The compiler would die with `SIGABRT` on input an agent wrote by accident, for \
+             example a generator that emitted one wrapper too many. The depth ceiling turns that \
+             into an ordinary refusal: the file is reported at the element that crosses it, with a \
+             position the agent can edit. The limit is 512 levels, measured against the smallest \
+             stack this crate runs on (a 2 MiB test thread, where the parser alone aborts between \
+             1000 and 1100 levels); real markup nests far shallower, so the ceiling only refuses a \
+             tree that is already pathological."
+        }
+        Code::RA016 => {
+            "A `\"use static\"` route ships zero bytes of JavaScript: `render()` builds one HTML \
+             string at build time and nothing runs on the page. An attribute value is therefore \
+             either literal text or a value already known at build time, and a function is \
+             neither. A hydrated island's `_setAttr` calls a function value and uses the result, \
+             so the same source would render two different attributes in the two modes — the \
+             function's own source text in a prerendered page, its return value in a hydrated one \
+             — with nothing reported. Refusing the static form is the only honest answer: the \
+             build cannot call the function, because the module it emits has no runtime to call it \
+             with, and evaluating authored code at build time would run it with no DOM anyway. The \
+             repair is to write the value as text the build can see, or to change the directive \
+             when the value genuinely must be computed in the browser."
         }
     }
 }

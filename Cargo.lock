@@ -869,6 +869,9 @@ dependencies = [
 name = "runai_cli"
 version = "0.1.0"
 dependencies = [
+ "oxc_allocator",
+ "oxc_parser",
+ "oxc_span",
  "runai_compiler",
  "serde_json",
  "tempfile",

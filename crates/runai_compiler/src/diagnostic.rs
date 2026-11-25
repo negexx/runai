@@ -88,6 +88,210 @@ pub(crate) const RA002_FALSE_CLAIMS: [&str; 4] = [
 #[cfg(test)]
 pub(crate) const RA002_THROWS: &str = "effect cycle";
 
+/// The deepest JSX element nesting a route file may contain.
+///
+/// Every pass over the markup tree is recursive — the parser, the whitespace and
+/// refusal checks ([`crate::analyze::jsx`]), lowering ([`crate::ir`]), and the
+/// template writer ([`crate::codegen::prerender`]) — one frame per level. Past a
+/// certain depth the walk exhausts the stack, and a stack overflow **aborts the
+/// process**: it is not a panic a `Result` can catch, so the compiler would die
+/// with `SIGABRT` and no diagnostic at all. A depth limit is the only way an
+/// answer exists for every input.
+///
+/// # Why 512, and why the check runs before the parser
+///
+/// Measured on this machine (debug build, `cargo test`'s default 2 MiB thread
+/// stack, `cargo test -p runai_compiler` with a generated `<div>`-nested route):
+/// `oxc_parser` alone — `Parser::parse`, no analysis — completes 1000 levels and
+/// aborts between 1000 and 1100. `analyze` over the same input survives 1000 and
+/// aborts at 1100. On the CLI's 8 MiB main-thread stack the parser survives 4100
+/// levels and aborts at 4150, and the CLI reproduces the abort at 4150 nested
+/// `<div>`s.
+///
+/// 512 is half of the 2 MiB measurement. That headroom matters because the walks
+/// below put **more** frames on the stack per level than the parser does (each
+/// carries a `Vec` of ancestors and several `Result`s), and because a caller
+/// supplies whatever stack it has: a 2 MiB test thread is the smallest one this
+/// crate ever runs on, so the limit has to be safe there, not only on the CLI's
+/// 8 MiB main thread. It is simultaneously far deeper than real markup: a page
+/// nests well under 50, and a full table with sections, rows, and cells is under
+/// 10.
+///
+/// The scan that enforces it ([`jsx_too_deep`]) runs **before**
+/// the parser, because the parser aborts first: a guard that only ran inside the
+/// analysis walks would still let a 4000-level file kill the process before any
+/// walk saw it.
+pub const MAX_JSX_DEPTH: usize = 512;
+
+/// The `RA015` for a tree deeper than [`MAX_JSX_DEPTH`].
+///
+/// `span` is the offending tag, so the position an agent reads is the element
+/// that crossed the ceiling rather than the top of the file. The message names
+/// the ceiling and the element so the repair ("reduce nesting") is actionable at
+/// a real position.
+pub fn excessive_nesting(span: (u32, u32)) -> Diagnostic {
+    Diagnostic::new(
+        Code::RA015,
+        span,
+        format!(
+            "a JSX tree nests deeper than {MAX_JSX_DEPTH} elements: reduce nesting to at most \
+             {MAX_JSX_DEPTH} levels"
+        ),
+    )
+}
+
+/// The span of the first tag that exceeds [`MAX_JSX_DEPTH`], or `None`.
+///
+/// A **text** scan, not a parse, for one reason: it has to run before the parser,
+/// and the parser is what a deep file kills. It counts JSX element `<` nesting
+/// and returns the span of the tag that crosses the ceiling.
+///
+/// # What counts as a tag
+///
+/// Only a `<` immediately followed by an ASCII letter, `_`, `$`, or `>` (a
+/// fragment) opens; only `</` closes; a tag whose final `>` is preceded by `/` is
+/// self-closing and opens nothing. Finding that final `>` needs a small state
+/// machine, because an attribute may contain one: `<p title="a>b">` and
+/// `<p class={x > 1}>` each hold a `>` that does not end the tag, so quotes and
+/// `{}` nesting are tracked.
+///
+/// The scan is deliberately conservative in the safe direction. An ordinary `<`
+/// between two values (`a < b`, `i<n`) does not open a tag because it is not
+/// followed by a tag-name character, so comparison chains never accumulate. A
+/// pathological file can still over-count — 512 unclosed `<Name` sequences inside
+/// strings — and over-counting refuses a file that might have parsed. That is the
+/// right direction: the alternative is aborting the compiler with no diagnostic,
+/// and a refusal at a real span is something an agent can act on. Under-counting
+/// is the direction that would still kill the process, so the scan errs away from
+/// it.
+///
+/// # Why `<` before a type argument is not a false refusal
+///
+/// `<div>` nesting and a type-argument list can both contribute, and a file with
+/// 512 separate generic calls (`foo<A>()` 512 times, not nested) would still be
+/// counted 512 times only if each were left unclosed — which cannot happen,
+/// because `skip_tag` advances past the matching `>` and the next `<` starts from
+/// there. Sequential tags therefore do not accumulate; only genuine nesting does.
+pub fn jsx_too_deep(source: &str) -> Option<(u32, u32)> {
+    let bytes = source.as_bytes();
+    let mut depth: usize = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'<' {
+            index += 1;
+            continue;
+        }
+
+        // `</` closes, whatever the name is. A stray close never drives the
+        // count below zero: a malformed file is the parser's to report, and a
+        // negative count would let it hide real nesting behind the ceiling.
+        if bytes.get(index + 1) == Some(&b'/') {
+            depth = depth.saturating_sub(1);
+            index = skip_tag(bytes, index);
+            continue;
+        }
+
+        // A fragment (`<>`) opens, and so does a name. `<` before a space, a
+        // digit, `=`, or another `<` is a comparison or a shift, not a tag.
+        let opens = match bytes.get(index + 1) {
+            Some(b'>') => true,
+            Some(&byte) if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => true,
+            _ => false,
+        };
+        // A `<` glued to the token before it is a **type argument**, not markup:
+        // `Record<never, never>`, `useMemo<number>(…)`, `Array<Array<T>>`,
+        // `function f<T>()`. Markup never follows an identifier, a closing
+        // bracket, or a quote with no space — `return <div>`, `(<div>)`, and
+        // `<div><div>` are the real shapes, and none of them touch the token
+        // before the `<`. Counting a type argument would add one permanent level,
+        // because its `>` is not a `</` close, and every route in this project
+        // writes `Record<never, never>`.
+        //
+        // Skipping one *text-adjacent* tag (`<p>a<b>`) under-counts by that tag.
+        // That direction is safe here: the shapes that actually reach thousands of
+        // levels are chains like `<div><div><div>`, whose every `<` follows `>`
+        // and is counted, so the abort this scan exists to prevent is still caught.
+        if !opens || preceded_by_type_position(bytes, index) {
+            index += 1;
+            continue;
+        }
+
+        let end = skip_tag(bytes, index);
+        // A self-closing tag (`<br/>`, `<div />`) opens and closes in one go.
+        if end > index + 1 && bytes.get(end - 1) != Some(&b'/') {
+            depth += 1;
+            if depth > MAX_JSX_DEPTH {
+                return Some((index as u32, end as u32));
+            }
+        }
+        index = end;
+    }
+
+    None
+}
+
+/// Whether the `<` at `index` sits where a **type argument** belongs.
+///
+/// TypeScript writes a type argument glued to the token before it —
+/// `Record<never, never>`, `useMemo<number>(…)`, `Array<Array<T>>`,
+/// `function f<T>()` — while JSX markup is preceded by a space, a punctuation
+/// delimiter, or another tag's `>`. So the rule is exactly "no space before the
+/// `<`, and the byte before it belongs to a value expression".
+///
+/// The whitespace is what makes it work: `return <div>` and `= <div>` are markup,
+/// and skipping a space before the check would classify every returned element as
+/// a type argument, making the scan useless. A type argument is glued; a tag is
+/// not.
+///
+/// `<div><div>` is counted at every level, because each `<` follows `>`. The deep
+/// chains that actually exhaust the stack are exactly the chains this scan must
+/// catch, and none of them is glued to a value expression.
+fn preceded_by_type_position(bytes: &[u8], index: usize) -> bool {
+    if index == 0 {
+        return false;
+    }
+    let previous = bytes[index - 1];
+    previous.is_ascii_alphanumeric()
+        || matches!(
+            previous,
+            b'_' | b'$' | b'.' | b')' | b']' | b'}' | b'"' | b'\''
+        )
+}
+
+/// The byte index just past the `>` that ends the tag starting at `start`.
+///
+/// Tracks `"`/`'` strings and `{}` nesting, because either can hold a `>` that
+/// does not end the tag. A tag whose `>` never arrives ends at the end of the
+/// source, so the caller always makes progress and the returned index is never
+/// past `bytes.len()`.
+fn skip_tag(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    let mut braces: usize = 0;
+    let mut quote: Option<u8> = None;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(open) => {
+                if byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'{' => braces += 1,
+                b'}' => braces = braces.saturating_sub(1),
+                b'>' if braces == 0 => return index + 1,
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+
+    bytes.len()
+}
+
 /// A stable diagnostic code. Codes are never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
@@ -100,6 +304,8 @@ pub enum Code {
     RA011,
     RA012,
     RA014,
+    RA015,
+    RA016,
 }
 
 impl Code {
@@ -120,6 +326,8 @@ impl Code {
             Code::RA011 => "RA011_BAD_ROUTE_EXPORT",
             Code::RA012 => "RA012_MISSING_MODE",
             Code::RA014 => "RA014_NOT_SUPPORTED_YET",
+            Code::RA015 => "RA015_EXCESSIVE_NESTING",
+            Code::RA016 => "RA016_STATIC_FUNCTION_ATTRIBUTE",
         }
     }
 
@@ -255,6 +463,23 @@ impl Code {
                  `_attr`, or `render` is refused because the generated module declares those \
                  itself."
             }
+            Code::RA015 => {
+                "A JSX tree nests deeper than the compiler can walk. Every pass over the markup \
+                 — parsing, the whitespace and refusal checks, lowering, and writing the \
+                 template — visits one element per level of recursion, so a tree past a certain \
+                 depth exhausts the stack. A stack overflow aborts the process rather than \
+                 returning an error, which would leave the agent with no diagnostic and no file \
+                 position. The file is therefore refused at the depth limit instead, which is a \
+                 deliberate ceiling on the input rather than a claim about the markup's meaning."
+            }
+            Code::RA016 => {
+                "A `\"use static\"` route gives an attribute a value that cannot be evaluated at \
+                 build time. A static page renders its markup to one HTML string at build time \
+                 and ships no JavaScript, so every attribute value is either written as text or \
+                 interpolated as a value already known then. A value that is a function is not \
+                 text: a hydrated island calls it, so the same source would render the function \
+                 in a prerendered page and its result in a hydrated one."
+            }
         }
     }
 
@@ -347,13 +572,31 @@ impl Code {
                  name (`_esc`, `_attr`, or `render`), rename it, because the emitted module \
                  declares those names itself. For a name the file exports twice, delete one of \
                  the two exports or export one under a different name, because an ES module may \
-                 export a name once."
+                 export a name once. For a route path — a `[slug]` segment, a dot-prefixed \
+                 directory, or an island route named `RUNTIME` — rename the file or directory as \
+                 the message says: a `[slug]` segment needs the router this milestone does not \
+                 have, a dot-prefixed segment produces an output path many static servers refuse \
+                 to serve, and `RUNTIME` collides with the copied runtime module so the page would \
+                 load and mount nothing."
+            }
+            Code::RA015 => {
+                "Reduce the nesting to at most 512 levels by closing elements earlier: move a \
+                 deeply nested subtree into a sibling element, or flatten repeated wrappers that \
+                 carry no attribute. Do not split the markup into another `.tsx` module — this \
+                 milestone has no bundler and no component inlining, so importing one is refused \
+                 with `RA014`."
+            }
+            Code::RA016 => {
+                "Write the attribute value as a string literal (`class=\"a\"`), a template literal \
+                 with no substitutions, or a constant this file defines; a static route evaluates \
+                 its markup at build time and cannot call a function. If the value must be \
+                 computed in the browser, change the directive to \"use island\"."
             }
         }
     }
 }
 
-static ALL: [Code; 9] = [
+static ALL: [Code; 11] = [
     Code::RA001,
     Code::RA002,
     Code::RA006,
@@ -363,6 +606,8 @@ static ALL: [Code; 9] = [
     Code::RA011,
     Code::RA012,
     Code::RA014,
+    Code::RA015,
+    Code::RA016,
 ];
 
 impl Serialize for Code {
@@ -606,7 +851,9 @@ mod tests {
         assert_eq!(Code::RA001.as_str(), "RA001_UNTRACKED_READ");
         assert_eq!(Code::RA010.as_str(), "RA010_STATIC_VIOLATION");
         assert_eq!(Code::RA014.as_str(), "RA014_NOT_SUPPORTED_YET");
-        assert_eq!(Code::all().len(), 9);
+        assert_eq!(Code::RA015.as_str(), "RA015_EXCESSIVE_NESTING");
+        assert_eq!(Code::RA016.as_str(), "RA016_STATIC_FUNCTION_ATTRIBUTE");
+        assert_eq!(Code::all().len(), 11);
     }
 
     #[test]
@@ -766,6 +1013,8 @@ mod tests {
                 "RA011_BAD_ROUTE_EXPORT",
                 "RA012_MISSING_MODE",
                 "RA014_NOT_SUPPORTED_YET",
+                "RA015_EXCESSIVE_NESTING",
+                "RA016_STATIC_FUNCTION_ATTRIBUTE",
             ]
         );
     }
@@ -899,5 +1148,109 @@ mod tests {
                  before notifying), not merely contain a negation: {text}"
             );
         }
+    }
+
+    /// A `<div>`-nested route of `n` levels, the shape that used to abort the
+    /// compiler. Static mode so it lowers on the simplest path.
+    fn nested(n: usize) -> String {
+        format!(
+            "\"use static\"\nexport default function P(props: Record<never, never>) {{ return \
+             {}x{} }}\n",
+            "<div>".repeat(n),
+            "</div>".repeat(n)
+        )
+    }
+
+    /// The ceiling is 512 and is half the measured abort threshold, so this pins
+    /// the number rather than letting a later edit raise it into the danger zone.
+    #[test]
+    fn the_depth_limit_is_512() {
+        assert_eq!(MAX_JSX_DEPTH, 512);
+        // The measurement the doc comment quotes: a 2 MiB thread aborts between
+        // 1000 and 1100 levels. Assert the headroom by reading the constant at
+        // runtime, so raising the limit past half that fails here rather than
+        // being folded away as a constant comparison.
+        let limit = std::hint::black_box(MAX_JSX_DEPTH);
+        assert!(
+            limit * 2 <= 1024,
+            "the limit must stay at or below half the measured 1000-level abort threshold"
+        );
+    }
+
+    /// The scanner counts element nesting, and nothing else. Each case is a shape
+    /// the analysis accepts or refuses for a different reason, and the point is
+    /// that the depth scan is silent on all of them: a guard that fired here would
+    /// refuse legal files.
+    #[test]
+    fn the_depth_scan_ignores_non_nesting_angles() {
+        for source in [
+            // A comparison chain is not a tag: `<` is followed by a space.
+            "const ok = a < b && b < c && c < d",
+            // A shift, a generic call, and a type argument.
+            "const n = x << 2 >> 1",
+            "const v = useMemo<number>(() => 1)",
+            // Self-closing tags nest nothing.
+            "<div><br/><input/></div>",
+            // A `>` inside an attribute or an expression does not end the tag.
+            "<p title=\"a>b\"><span class={n > 1}>x</span></p>",
+            // A `</` closes, so a well-formed tree returns to zero.
+            "<div><div><div></div></div></div>",
+        ] {
+            assert_eq!(
+                jsx_too_deep(source),
+                None,
+                "the scan fired on a legal shape: {source}"
+            );
+        }
+    }
+
+    /// The scan reports the tag that crosses the ceiling, not the top of the file.
+    #[test]
+    fn the_depth_scan_reports_the_offending_tag() {
+        let source = nested(MAX_JSX_DEPTH + 1);
+        let (start, end) = jsx_too_deep(&source).expect("one past the limit must be refused");
+        let tag = &source[start as usize..end as usize];
+        assert_eq!(tag, "<div>", "the span names the offending tag: {tag}");
+    }
+
+    /// **The regression test for the abort.** At the limit the file is clean; one
+    /// past it is `RA015`. Both run through the real `analyze` pipeline on the
+    /// default test thread, which is the smallest stack the crate sees — if the
+    /// guard were missing, or the parser reached first, this test would abort the
+    /// process instead of failing.
+    #[test]
+    fn a_tree_at_the_limit_is_clean_and_one_past_it_is_ra015() {
+        let at = analyze_src(&nested(MAX_JSX_DEPTH));
+        assert!(
+            at.is_empty(),
+            "a tree at exactly the limit must be accepted: {at:?}"
+        );
+
+        let past = analyze_src(&nested(MAX_JSX_DEPTH + 1));
+        assert_eq!(past.len(), 1, "exactly one refusal: {past:?}");
+        assert_eq!(past[0].code, Code::RA015);
+        assert!(
+            past[0].message.contains("512"),
+            "the message names the ceiling: {}",
+            past[0].message
+        );
+        assert!(past[0].line >= 1, "the refusal is located: {:?}", past[0]);
+    }
+
+    /// The reproduction the defect was reported with: 4500 levels used to abort
+    /// the debug binary with `SIGABRT`. It must now be a diagnostic, and this runs
+    /// on the 2 MiB test thread where the unguarded parser aborted at ~1100 — so
+    /// finishing at all is the assertion that the pre-parse guard ran.
+    #[test]
+    fn the_reported_4500_level_file_is_a_diagnostic_not_an_abort() {
+        let diagnostics = analyze_src(&nested(4500));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, Code::RA015);
+    }
+
+    /// `analyze` needs a page path for the page-only rules; this is the one every
+    /// other test in the crate uses.
+    fn analyze_src(source: &str) -> Vec<crate::diagnostic::Diagnostic> {
+        crate::analyze::analyze(source, "src/routes/index.page.tsx")
     }
 }

@@ -1097,26 +1097,118 @@ fn every_accepted_island_builds_a_valid_esm_artifact() {
             continue;
         }
         // Accepted: the artifact must parse. `node --check` is the parser that
-        // defines ESM, so it decides validity rather than a grep over the text. The
-        // file is copied to a `.mjs` name first: `node --check` on a `.js` path with
-        // no `"type": "module"` beside it treats the file as CommonJS and **skips**
-        // the duplicate-export check, which is exactly how D1 hid.
+        // defines ESM, so it decides validity rather than a grep over the text.
         let artifact = tmp.path().join("dist/assets/index.js");
         let text = std::fs::read_to_string(&artifact).expect("the island module");
-        let module = tmp.path().join("built-island.mjs");
-        std::fs::write(&module, &text).expect("write the module as ESM");
-        match Command::new("node").arg("--check").arg(&module).output() {
-            Ok(check) => assert!(
-                check.status.success(),
-                "an accepted route must build valid ESM.\nroute:\n{route}\nmodule:\n{text}\nstderr:\n{}",
-                String::from_utf8_lossy(&check.stderr)
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("node is not installed: the ESM check was skipped");
-            }
-            Err(error) => panic!("could not run node: {error}"),
-        }
+        assert_valid_esm(
+            &text,
+            &format!("an accepted route must build valid ESM.\nroute:\n{route}"),
+        );
     }
+}
+
+/// The diagnostics `oxc_parser` reports for `text` parsed as an ES module.
+///
+/// This is the same parser the compiler uses, pinned to the same version, so the
+/// fallback in [`assert_valid_esm`] checks the grammar the artifact is emitted for
+/// rather than a different one. It is a named function so the premise — that this
+/// parser rejects the duplicate-export shapes — is itself tested
+/// (`the_esm_fallback_rejects_a_duplicate_export`) rather than asserted in a comment.
+fn esm_diagnostics(text: &str) -> Vec<String> {
+    let alloc = oxc_allocator::Allocator::default();
+    let ret = oxc_parser::Parser::new(&alloc, text, oxc_span::SourceType::mjs()).parse();
+    ret.diagnostics
+        .iter()
+        .map(|diagnostic| format!("{diagnostic:?}"))
+        .collect()
+}
+
+/// Assert that `text` is valid ESM — with `node --check` when `node` is installed,
+/// and with an in-process `oxc_parser` parse otherwise.
+///
+/// The fallback is deliberately a *different measurement*, not a skip. This test is
+/// the only build-level assertion that the real island artifact parses, and it exists
+/// to catch duplicate exports; skipping when `node` is absent would leave that class
+/// unpinned on any machine without node. `oxc_parser` reports `Duplicated export '…'`
+/// for every shape this test's fixtures cover (measured: `export const s = 1; export
+/// { s }`, two `export { x }`, `export function f` beside `export { f }`, and an alias
+/// colliding with a declaration), and zero diagnostics for valid ESM.
+///
+/// The file is written to a `.mjs` name first: `node --check` on a `.js` path with no
+/// `"type": "module"` beside it treats the file as CommonJS and **skips** the
+/// duplicate-export check, which is exactly how D1 hid.
+fn assert_valid_esm(text: &str, context: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("built-island.mjs");
+    std::fs::write(&module, text).expect("write the module as ESM");
+    match Command::new("node").arg("--check").arg(&module).output() {
+        Ok(check) => assert!(
+            check.status.success(),
+            "{context}\nmodule:\n{text}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stderr)
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let diagnostics = esm_diagnostics(text);
+            assert!(
+                diagnostics.is_empty(),
+                "node is not installed; the artifact must at least parse as ESM.\n\
+                 {context}\nmodule:\n{text}\ndiagnostics:\n{diagnostics:?}"
+            );
+            eprintln!("node is not installed: asserted the artifact parses as ESM instead");
+        }
+        Err(error) => panic!("could not run node: {error}"),
+    }
+}
+
+/// The premise [`assert_valid_esm`]'s fallback rests on: `oxc_parser`, with the
+/// `SourceType::mjs()` the emit path uses, rejects the duplicate-export shapes this
+/// file exists to catch, and accepts valid ESM.
+///
+/// Without this, the fallback would compile and could still be vacuous — a parser
+/// configured as a script, or one that reports duplicates only during semantic
+/// analysis, would return zero diagnostics for a broken artifact and the fallback
+/// would assert nothing. The cases are the same four shapes as
+/// `every_accepted_island_builds_a_valid_esm_artifact`'s broken fixtures.
+#[test]
+fn the_esm_fallback_rejects_a_duplicate_export() {
+    let broken = [
+        // a declaration beside a specifier for the same name
+        "export const s = 1;\nexport { s };\n",
+        // the same specifier twice
+        "const x = 1;\nexport { x };\nexport { x };\n",
+        // a function declaration beside a specifier
+        "export function f() { return 1 }\nexport { f };\n",
+        // an alias's exported name colliding with a later declaration
+        "export const a = 1;\nexport { a as b };\nexport const b = 2;\n",
+    ];
+    for module in broken {
+        let diagnostics = esm_diagnostics(module);
+        assert!(
+            !diagnostics.is_empty(),
+            "the fallback parser must reject a duplicate export, or it asserts nothing: {module}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Duplicated export")),
+            "the diagnostic names the duplicate export: {diagnostics:?}"
+        );
+    }
+
+    // The control: valid ESM is zero diagnostics, so the assertion above is not
+    // satisfied by a parser that reports everything.
+    let valid = "const a = 1;\nexport { a as b };\nexport default function P() { return b }\n";
+    assert!(
+        esm_diagnostics(valid).is_empty(),
+        "valid ESM must parse clean: {:?}",
+        esm_diagnostics(valid)
+    );
+
+    // A hard syntax error is also rejected, so the parse is not a no-op on garbage.
+    assert!(
+        !esm_diagnostics("export const = ;\n").is_empty(),
+        "a syntax error must not parse clean"
+    );
 }
 
 /// D1 end to end: a route that exports one name twice is refused by `check` and by
@@ -1344,11 +1436,251 @@ fn a_held_lock_fails_the_next_build_quickly_and_names_the_lock() {
     let _ = first.0.kill();
 }
 
-// The guard behind the test above: it is the file's one long-holding test, so its output
-// name must be one no other test uses. If a future test copies the shape and reuses
-// `lockprobe`, two 30-second holds would contend on one lock and the loser would wait out
-// the timeout instead of failing honestly. This scans the suite's own source, so a
-// collision fails loudly here, at the definition site.
+// ============================================================================
+// Batch prerender: one child process per build, not one per static route.
+// ============================================================================
+
+/// A route that renders `head` and then throws, so the module itself is well formed
+/// and the failure happens inside `render()` at build time. `check` is clean for this
+/// file — nothing in the rules can see a `null` dereference — which is exactly the
+/// class the child's three-part check exists for.
+fn throwing_route(head: &str) -> String {
+    format!(
+        "\"use static\"\nexport default function P(props: Record<never, never>) {{\n\
+         const missing = null;\n\
+         return <p>{head}{{missing.value}}</p>\n}}\n"
+    )
+}
+
+/// Batching must not lose the failure: when one module throws, the whole build fails,
+/// and the error names the **route file** that threw rather than an opaque child exit.
+///
+/// This is the assertion the batch refactor is most likely to break. A driver that
+/// renders 20 modules in one process and reports "the child exited 1" would be a
+/// regression against the per-route version, which named the module it ran. The route
+/// here is deliberately the *middle* of three, so an implementation that only names
+/// the first or last route cannot pass.
+#[test]
+fn a_throwing_static_route_fails_the_build_and_names_its_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("alpha"));
+    std::fs::write(
+        tmp.path().join("src/routes/broken.page.tsx"),
+        throwing_route("beta"),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("src/routes/zulu.page.tsx"),
+        static_route("gamma"),
+    )
+    .unwrap();
+
+    // The premise: the analysis accepts all three, so the failure can only come from
+    // executing the module. Without this the test could pass on a diagnostic.
+    let check = run(&["check"], tmp.path());
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "the fixtures must be accepted by `check`, or this test asserts nothing:\n{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("broken.page.tsx"),
+        "the failure must name the route file that threw: {stderr}"
+    );
+    assert!(
+        stderr.contains("TypeError") || stderr.contains("null"),
+        "the runtime's own error must reach the agent: {stderr}"
+    );
+    assert!(
+        !tmp.path().join("dist").exists(),
+        "a failed render must publish nothing"
+    );
+}
+
+/// One child per build, not one per route: the property the refactor exists for.
+///
+/// Counted from outside, by the observation that the build's own stdout/stderr must
+/// not grow a line per route, and — the load-bearing half — that a tree of many static
+/// routes completes in the time one interpreter start plus compilation costs. A
+/// generous ceiling is used on purpose: this asserts the *mechanism* (no per-route
+/// spawn), not a machine's speed, so it cannot flake on a loaded CI box while still
+/// failing by an order of magnitude if the spawns come back.
+///
+/// Measured on this machine before the change: 100 routes took 1.61 s. After: see the
+/// report. The ceiling is 1.2 s for 100 routes, which the per-route version exceeded by
+/// 34% on an idle machine and by much more under load.
+#[test]
+fn many_static_routes_render_in_one_child_process() {
+    // `bun` is what the build would pick; without a runtime there is nothing to measure
+    // and the build's own error path is already covered elsewhere.
+    let have_runtime = Command::new("bun")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+        || Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+    if !have_runtime {
+        eprintln!("neither bun nor node is installed: the batch timing test is skipped");
+        return;
+    }
+
+    const ROUTES: usize = 100;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
+    for index in 0..ROUTES {
+        std::fs::write(
+            tmp.path().join(format!("src/routes/r{index}.page.tsx")),
+            static_route(&format!("route {index}")),
+        )
+        .unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    // Every route shipped its own page, so a faster build did not get there by
+    // rendering fewer routes.
+    for index in [0, ROUTES / 2, ROUTES - 1] {
+        let html = std::fs::read_to_string(tmp.path().join(format!("dist/r{index}/index.html")))
+            .unwrap_or_else(|error| panic!("route r{index} was not written: {error}"));
+        assert!(
+            html.contains(&format!("<p>route {index}</p>")),
+            "r{index} rendered the wrong page: {html}"
+        );
+    }
+    assert!(
+        elapsed < std::time::Duration::from_millis(1200),
+        "{ROUTES} static routes took {elapsed:?}; a per-route child process costs ~1.6 s \
+         on this machine, so anything near that means the spawns are back"
+    );
+}
+
+/// Determinism: the rendered HTML is attached to the route it came from, so batching
+/// cannot pair route 3's HTML with route 7's output path. Each route's page carries its
+/// own text, and every one is checked — an off-by-one in the index mapping would show
+/// up as a page containing a neighbour's text.
+#[test]
+fn batched_render_keeps_each_routes_own_html_under_its_own_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(tmp.path(), &static_route("MARKER-root"));
+    for index in 0..8 {
+        std::fs::write(
+            tmp.path().join(format!("src/routes/r{index}.page.tsx")),
+            static_route(&format!("MARKER-{index}")),
+        )
+        .unwrap();
+    }
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    let root = std::fs::read_to_string(tmp.path().join("dist/index.html")).unwrap();
+    assert!(root.contains("MARKER-root"), "{root}");
+    for index in 0..8 {
+        let html =
+            std::fs::read_to_string(tmp.path().join(format!("dist/r{index}/index.html"))).unwrap();
+        assert!(
+            html.contains(&format!("MARKER-{index}")),
+            "r{index} does not carry its own marker: {html}"
+        );
+        // Exactly one marker: a shifted array would put two pages' text in one file.
+        assert_eq!(
+            html.matches("MARKER-").count(),
+            1,
+            "r{index} carries more than one route's text: {html}"
+        );
+    }
+}
+
+/// A static route's `console` output is not HTML. With one module per child the noise
+/// went into the child's stderr, which failed the render — so a route that logs was
+/// already a build failure. Batching must keep that property rather than letting one
+/// route's log line corrupt the array or leak into a page.
+#[test]
+fn a_static_routes_console_output_fails_the_build_rather_than_reaching_the_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(
+        tmp.path(),
+        "\"use static\"\nconsole.error(\"a route must not write to stderr\")\n\
+         export default function P(props: Record<never, never>) { return <p>noisy</p> }\n",
+    );
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("noisy.page.tsx") || stderr.contains("index.page.tsx"),
+        "the failure must name the route whose module wrote it: {stderr}"
+    );
+    assert!(!tmp.path().join("dist").exists());
+}
+
+/// C3: the copied runtime is the **production** build, not the source file.
+///
+/// The budget is measured on the minified form (`scripts/size-budget.sh`: 6,144 bytes
+/// gzipped) and the build used to copy `packages/runai/runtime.js` byte for byte —
+/// 9,616 bytes gzipped, 57% over a budget this project calls hard. This asserts the
+/// shipped artifact by measurement of the artifact, so it cannot pass by accident: it
+/// must be smaller than the source, must still be ESM exporting the runtime's names,
+/// and must not carry `RUNAI_DEV`.
+#[test]
+fn the_shipped_runtime_is_minified_and_has_no_dev_instrumentation() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_app(
+        tmp.path(),
+        "\"use island\"\nexport default function P(props: Record<never, never>) { return <button onClick={() => {}}>x</button> }\n",
+    );
+
+    let out = run(&["build", "--out", "dist"], tmp.path());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    let shipped = std::fs::read(tmp.path().join("dist/assets/runtime.js")).unwrap();
+    let source = std::fs::read(runtime()).unwrap();
+    assert!(
+        shipped.len() < source.len(),
+        "the shipped runtime is {} bytes and the source is {}: the build copied the \
+         unminified file",
+        shipped.len(),
+        source.len()
+    );
+
+    let text = String::from_utf8(shipped).expect("the runtime is valid UTF-8");
+    assert!(
+        !text.contains("RUNAI_DEV"),
+        "the production runtime still carries dev instrumentation"
+    );
+    // Still a module the browser can import: the entry names must survive.
+    assert!(
+        text.contains("export"),
+        "the minified runtime is not ESM: {text:.200}"
+    );
+    for name in ["signal", "derived", "effect", "owner", "mount"] {
+        assert!(
+            text.contains(name),
+            "the minified runtime lost `{name}`, which an island imports"
+        );
+    }
+}
+
+/// The guard behind the test above: it is the file's one long-holding test, so its output
+/// name must be one no other test uses. If a future test copies the shape and reuses
+/// `lockprobe`, two 30-second holds would contend on one lock and the loser would wait out
+/// the timeout instead of failing honestly. This scans the suite's own source, so a
+/// collision fails loudly here, at the definition site.
 #[test]
 fn the_long_holding_test_owns_its_out_name() {
     // `(test fn, every --out value it passes)` for the whole file.

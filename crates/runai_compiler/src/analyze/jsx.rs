@@ -153,7 +153,7 @@ use oxc_ast::ast::{
 use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
-use crate::diagnostic::{Code, Diagnostic};
+use crate::diagnostic::{Code, Diagnostic, excessive_nesting};
 use crate::ir::VOID_ELEMENTS;
 use crate::source::{has_line_break, raw_text};
 
@@ -1142,6 +1142,7 @@ pub fn check_jsx(program: &Program, source: &str) -> Vec<Diagnostic> {
         diagnostics: Vec::new(),
         ancestors: Vec::new(),
         island,
+        depth: 0,
     };
 
     // The route's render is a separate question from "which elements exist".
@@ -1174,6 +1175,14 @@ struct JsxChecker<'s> {
     /// `"use static"` template interpolates a string and never places a `<!>`
     /// marker, so only an island can be broken by a binding in a text-only element.
     island: bool,
+    /// How deep the element currently being visited sits, outermost root = 1.
+    ///
+    /// The walk is recursive, so this is the recursion depth, and it is bounded
+    /// by [`MAX_JSX_DEPTH`]: past it the visitor stops descending and reports
+    /// `RA015` instead of recursing until the stack is gone. A stack overflow
+    /// aborts the process — it is not a panic a `Result` can carry — so a depth
+    /// ceiling is the only way this pass answers for every input.
+    depth: usize,
 }
 
 impl JsxChecker<'_> {
@@ -1278,6 +1287,19 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
         self.nesting(element);
         self.children(&element.children);
 
+        // `RA015`: stop descending at the depth ceiling instead of recursing
+        // until the stack is gone. Reported once per offending subtree — the
+        // outermost element at the ceiling — because the walk returns there and
+        // never reaches the deeper ones. The count is taken before the descent,
+        // so a file of exactly `MAX_JSX_DEPTH` levels is accepted.
+        self.depth += 1;
+        if self.depth > crate::diagnostic::MAX_JSX_DEPTH {
+            self.depth -= 1;
+            self.diagnostics
+                .push(excessive_nesting((element.span.start, element.span.end)));
+            return;
+        }
+
         // Keep the open-element stack accurate around the recursive walk: push
         // before descending so a child sees this element as its parent, pop after.
         // A non-HTML tag (a component, a namespaced name) is pushed too, so the
@@ -1290,6 +1312,7 @@ impl<'a> Visit<'a> for JsxChecker<'_> {
         } else {
             oxc_ast_visit::walk::walk_jsx_element(self, element);
         }
+        self.depth -= 1;
     }
 
     fn visit_jsx_fragment(&mut self, fragment: &JSXFragment<'a>) {
@@ -2173,6 +2196,20 @@ fn reshaped(span: Span, message: String) -> Diagnostic {
 /// Static text is fine — it is written verbatim either way. Shared with
 /// [`crate::ir::lower_route`] so the rule is one predicate, not two.
 pub(crate) fn element_has_binding(element: &JSXElement<'_>) -> bool {
+    element_has_binding_at(element, 1)
+}
+
+/// [`element_has_binding`] with `depth`, the element's nesting level, root = 1.
+///
+/// Bounded by [`MAX_JSX_DEPTH`]: this is a recursive predicate, so a tree past
+/// the ceiling would overflow the stack here before the walk that reports `RA015`
+/// reached it. Past the limit it stops looking and answers `false` — the element
+/// is refused by the depth rule, so whether it also carries a binding does not
+/// change the file's verdict.
+fn element_has_binding_at(element: &JSXElement<'_>, depth: usize) -> bool {
+    if depth > crate::diagnostic::MAX_JSX_DEPTH {
+        return false;
+    }
     for attribute in &element.opening_element.attributes {
         if let JSXAttributeItem::Attribute(attribute) = attribute
             && matches!(
@@ -2188,20 +2225,27 @@ pub(crate) fn element_has_binding(element: &JSXElement<'_>) -> bool {
             return true;
         }
     }
-    element.children.iter().any(child_has_binding)
+    element
+        .children
+        .iter()
+        .any(|child| child_has_binding(child, depth))
 }
 
 /// Whether `child` is a bare expression, or an element that itself carries a
 /// binding. Static text and plain elements do not.
-fn child_has_binding(child: &JSXChild<'_>) -> bool {
+fn child_has_binding(child: &JSXChild<'_>, depth: usize) -> bool {
     match child {
         JSXChild::ExpressionContainer(container) => {
             !matches!(container.expression, JSXExpression::EmptyExpression(_))
         }
-        JSXChild::Element(element) => element_has_binding(element),
+        JSXChild::Element(element) => element_has_binding_at(element, depth + 1),
         // A fragment's children are spliced into the text-only element, so a
         // binding inside one is the same defect; a spread is refused elsewhere.
-        JSXChild::Fragment(fragment) => fragment.children.iter().any(child_has_binding),
+        // A fragment adds no element level, so `depth` passes through unchanged.
+        JSXChild::Fragment(fragment) => fragment
+            .children
+            .iter()
+            .any(|child| child_has_binding(child, depth)),
         JSXChild::Text(_) | JSXChild::Spread(_) => false,
     }
 }

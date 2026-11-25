@@ -92,15 +92,31 @@
 //!
 //! # The exit status of the child is not a failure signal
 //!
-//! Measured on this machine (Bun 1.4.1, Node v24.20.0): a module with a syntax
+//! Measured on this machine (Bun 1.4.5, Node v22.14.0): a module with a syntax
 //! error, a module that throws while importing, and a module whose `render` is
-//! missing each print to stderr and still exit **0**. Trusting `status.success()`
-//! would write the runtime's error banner into `index.html` and report success —
-//! the silent failure this project exists to prevent. So a render is accepted only
-//! when **all three** hold: the status succeeded, stderr is empty, and stdout is
-//! non-empty. A clean module writes exactly the HTML to stdout and nothing to
-//! stderr. The child's working directory is the directory holding the module,
-//! because both runtimes are invoked with a relative specifier.
+//! missing each print to stderr and can still exit **0**. Trusting
+//! `status.success()` would write the runtime's error banner into `index.html` and
+//! report success — the silent failure this project exists to prevent. So a render
+//! is accepted only when **all three** hold: the status succeeded, stderr is empty,
+//! and stdout is non-empty.
+//!
+//! # One child process per build, not one per static route
+//!
+//! Every static module is written into the scratch directory and rendered by a single
+//! child running [`RENDER_SCRIPT`], which imports each module in route order and writes
+//! one length-prefixed record per page. The cost of the old shape was process start,
+//! not compilation: measured here, 100 separate `bun -e` spawns take 1.44 s and 100
+//! bare `bun -e '1'` spawns take 0.635 s, against 0.03 s for one process that imports
+//! all 100. On a real build (Bun 1.4.5) 100 static routes went from 1.52–1.59 s to
+//! 0.04 s, and 500 routes from 7.86 s to 0.15 s.
+//!
+//! Because `bun -e` and `node -e` may exit 0 after a module throws, the **driver** is
+//! what decides the process status: it stops at the first failing module, prints
+//! nothing to stdout, reports the module's index on stderr, and sets
+//! `process.exitCode = 1`. The parent maps that index back to the route path, so a
+//! failure names the file that threw rather than the child that ran it. The child's
+//! working directory is the scratch module directory, because both runtimes are
+//! invoked with a relative specifier.
 //!
 //! # All-or-nothing, and the previous build survives a failure
 //!
@@ -131,6 +147,16 @@
 //! `runai.json` is `{ "runtime": "<path>" }` and the CLI has no JSON dependency, so
 //! [`runtime_value`] reads that one string with a small escape-aware scanner rather
 //! than pulling a parser into the binary.
+//!
+//! # The shipped runtime is minified, and a failed minify fails the build
+//!
+//! `dist/assets/runtime.js` is the **production** build, not a byte copy of the file
+//! the config names. [`Runner::minify`] folds the dev guards out with bun's bundler
+//! before the copy. Copying the source shipped 9,616 bytes gzipped against the
+//! 6,144-byte budget `scripts/size-budget.sh` calls hard; the minified form is 2,131
+//! bytes gzipped. A minify that fails, does not shrink the file, or leaves `RUNAI_DEV`
+//! in it fails the build loudly — silently shipping the unminified source is exactly
+//! the defect this section exists to prevent.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -140,8 +166,11 @@ use std::process::Command;
 use runai_compiler::analyze::analyze;
 use runai_compiler::codegen::{emit_client_checked, emit_prerender_checked};
 use runai_compiler::diagnostic::{Diagnostic, Severity};
+use runai_compiler::ir::lower_route;
+use runai_compiler::source::Mode;
 
 use crate::USAGE;
+use crate::skills::parse_out_flag;
 
 /// Where routes are read from.
 const ROUTES: &str = "src/routes";
@@ -200,6 +229,101 @@ const SCRATCH: &str = ".modules";
 /// The document shell. `{body}` is the prerendered HTML or an empty string.
 const SHELL_HEAD: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>runai</title></head><body><div id=\"app\">";
 
+/// The script the one prerender child runs: every static module, in route order.
+///
+/// Written into the scratch directory beside the modules and executed as
+/// `bun render.mjs manifest` (or `node render.mjs manifest`), so a build costs **one**
+/// interpreter start rather than one per static route. Measured on this machine
+/// (Bun 1.4.5): 100 separate `bun -e` spawns take 1.44 s and 100 bare `bun -e '1'`
+/// spawns take 0.635 s, against 0.03 s for one process that imports all 100 — the
+/// cost was fork+exec+init, not compilation.
+///
+/// # Why the driver owns the exit code
+///
+/// `bun -e` and `node -e` can exit **0** after a module throws, so the child's status
+/// alone is not a failure signal (see the module docs). This script is the thing that
+/// decides: it stops at the first failing module, writes nothing, and sets
+/// `process.exitCode = 1`. Measured on both runtimes: a `render()` that throws inside
+/// this driver exits 1 with an empty stdout, where the same throw under the old
+/// `-e 'import(…).then(…)'` shape also exited 1 but for the floating-promise reason —
+/// two different mechanisms, and only this one is under our control.
+///
+/// # The stdout protocol
+///
+/// stdout carries one entry per rendered route and nothing else: `<byte length>\n<html>\n`,
+/// repeated. A length prefix rather than JSON because the CLI deliberately has no JSON
+/// dependency, and a delimiter is not safe — HTML may contain any byte. Route output is
+/// diverted: a `console.*` call or a raw `process.stdout.write` inside a module is
+/// rewritten to stderr with the route's index, because one stray byte on stdout would
+/// shift every later record. That is also what forces a failed build to *name the route*:
+/// the index travels to the parent, which knows the path.
+const RENDER_SCRIPT: &str = r#"// runai build: render every "use static" route in this one process.
+import { readFileSync } from "node:fs";
+
+const manifest = readFileSync(process.argv[2], "utf8").split("\n").filter((line) => line !== "");
+
+const toStdout = process.stdout.write.bind(process.stdout);
+const toStderr = process.stderr.write.bind(process.stderr);
+
+// The index of the module being rendered, or null between modules. Route output is
+// only diverted while a module is running, so the driver's own writes are untouched.
+let rendering = null;
+
+const divert = (chunk) => {
+  if (rendering === null) return false;
+  const text = String(chunk);
+  toStderr("runai-route-output " + rendering + "\n" + text + (text.endsWith("\n") ? "" : "\n"));
+  return true;
+};
+
+process.stdout.write = function (chunk, ...rest) {
+  if (divert(chunk)) return true;
+  return toStdout(chunk, ...rest);
+};
+
+for (const name of ["log", "info", "debug", "warn", "error"]) {
+  const original = console[name].bind(console);
+  console[name] = (...args) => {
+    if (divert(args.join(" ") + "\n")) return;
+    original(...args);
+  };
+}
+
+let failed = false;
+for (let index = 0; index < manifest.length; index += 1) {
+  rendering = index;
+  try {
+    const module = await import("./" + manifest[index]);
+    if (typeof module.render !== "function") {
+      throw new Error("the module does not export a `render` function");
+    }
+    const page = module.render();
+    if (typeof page !== "string") {
+      throw new Error("`render()` returned " + typeof page + ", not a string");
+    }
+    toStdout(String(Buffer.byteLength(page, "utf8")) + "\n" + page + "\n");
+  } catch (error) {
+    failed = true;
+    toStderr("runai-render-failed " + index + "\n" + String((error && error.stack) || error) + "\n");
+    break;
+  } finally {
+    rendering = null;
+  }
+}
+
+process.exitCode = failed ? 1 : 0;
+"#;
+
+/// The manifest filename, beside the modules in the scratch directory.
+const RENDER_MANIFEST: &str = "manifest.txt";
+
+/// The script filename, beside the modules in the scratch directory.
+const RENDER_DRIVER: &str = "render.mjs";
+
+/// The prefix the driver writes before the index of the route whose module printed
+/// to stderr, or whose `render()` threw.
+const ROUTE_FAILED_MARKER: &str = "runai-render-failed ";
+
 /// One route, read and analyzed, ready to emit.
 struct Prepared {
     /// The route path with `/` separators: what diagnostics report and `is_page`
@@ -208,6 +332,23 @@ struct Prepared {
     /// The route name, e.g. `""` for `index`, `about`, `blog/post`.
     name: String,
     source: String,
+    /// Which emitter writes this route, decided once here instead of by trial in
+    /// [`emit`].
+    ///
+    /// The old shape ran the prerender emitter, read its `Err` as "not static", and
+    /// then ran the client emitter — which re-ran the analysis, both strips, and a
+    /// lowering the first attempt had already thrown away, and which meant a failed
+    /// static emit could silently become an island emit. The dispatch below is a
+    /// decision, not a search.
+    ///
+    /// **Measured, and smaller than it looks:** this removes one whole analyse + strip +
+    /// lower pass per route, but a 400-route island tree is 58 ms of `build` against
+    /// 14 ms of `check` **either way** (measured before and after), because the wall
+    /// clock there is per-route output I/O, not mode detection. At 8000 island routes the
+    /// change is ~2% (3906 ms before, 3825 ms after). The reason to keep it is
+    /// correctness and coupling, not the stopwatch: a comment that claimed a 3.8x win
+    /// here would be false.
+    mode: Mode,
 }
 
 /// A build failure and the exit status it owes the process.
@@ -242,37 +383,13 @@ enum Refusal {
 /// a runtime that would not render, a missing runtime, an unreadable file), `2`
 /// the command was misused. Every `1` and `2` leaves `<out>` as it was.
 pub fn run(args: &[String]) -> i32 {
-    let mut out: Option<&str> = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        let arg = args[index].as_str();
-        index += 1;
-        match arg {
-            // `--out dist` and `--out=dist` are the same flag; both are supported
-            // because a script that builds a path often writes the second form.
-            "--out" => {
-                let Some(value) = args.get(index) else {
-                    eprintln!("error: `--out` needs a directory");
-                    eprintln!("{USAGE}");
-                    return 2;
-                };
-                out = Some(value.as_str());
-                index += 1;
-            }
-            flag if flag.starts_with("--out=") => out = Some(&flag["--out=".len()..]),
-            flag if flag.starts_with('-') => {
-                eprintln!("error: unknown flag `{flag}`");
-                eprintln!("{USAGE}");
-                return 2;
-            }
-            value => {
-                eprintln!("error: unexpected argument `{value}`");
-                eprintln!("{USAGE}");
-                return 2;
-            }
-        }
-    }
+    // The flag loop is shared with `runai skills`: one copy, so the two commands cannot
+    // drift into accepting different spellings. `parse_out_flag` has already printed its
+    // message and `USAGE` on misuse, so its exit code propagates unchanged.
+    let out = match parse_out_flag(args) {
+        Ok(out) => out,
+        Err(code) => return code,
+    };
 
     let raw = out.unwrap_or(DEFAULT_OUT).to_string();
 
@@ -752,8 +869,6 @@ fn is_stamped(dir: &Path) -> bool {
     dir.join(STAMP).is_file()
 }
 
-/// Whether `dir` has no entries.
-///
 /// Whether `dir` has no entries, or `None` when it has vanished.
 ///
 /// An unreadable directory is a failure rather than a guess: assuming it is empty
@@ -859,7 +974,23 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
 
     let mut files = Vec::new();
     walk(root, &mut files).map_err(Refusal::Message)?;
-    files.sort_by_key(|path| path.to_string_lossy().replace('\\', "/"));
+
+    // Sorted by the `/`-normalised spelling, with the raw path as the secondary key.
+    // The primary key is precomputed once per path rather than rebuilt per comparison:
+    // the old `sort_by_key(|p| p.to_string_lossy().replace('\\', "/"))` allocated two
+    // strings on **every** comparison, so sorting *n* routes cost O(n log n)
+    // allocations. The comparison below normalises without allocating.
+    //
+    // The secondary key keeps the order deterministic where two paths share a
+    // normalised key. With `/`-separated paths that is not reachable on a POSIX
+    // filesystem, but the sort must not depend on that: `a\b` and `a/b` are one
+    // normalised spelling and two distinct `PathBuf`s, and a comparator that returned
+    // `Equal` for them would leave their order to whatever order `read_dir` produced.
+    files.sort_by(|left, right| {
+        normalised(left)
+            .cmp(&normalised(right))
+            .then_with(|| left.cmp(right))
+    });
 
     if files.is_empty() {
         return Err(Refusal::Message(format!(
@@ -936,10 +1067,28 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
         }
         claimed.insert(name.to_ascii_lowercase(), (display.clone(), name.clone()));
 
+        // The mode is decided here, once, so `emit` dispatches on it instead of
+        // discovering it by trial. `analyze` above already reported any reason there
+        // is no mode — a parse failure is `RA007`, a missing directive is `RA012`,
+        // both as errors — so a failure here is the compiler's own invariant and is
+        // collected as a message naming the file rather than silently dropping it.
+        let mode = match route_mode(&source) {
+            Ok(mode) => mode,
+            Err(diagnostics) => {
+                let mut message = format!("`{display}` could not be lowered:\n");
+                for diagnostic in diagnostics {
+                    message.push_str(&diagnostic.render_human(&source));
+                }
+                messages.push(message.trim_end().to_string());
+                continue;
+            }
+        };
+
         prepared.push(Prepared {
             display,
             name,
             source,
+            mode,
         });
     }
 
@@ -950,6 +1099,46 @@ fn prepare() -> Result<Vec<Prepared>, Refusal> {
         });
     }
     Ok(prepared)
+}
+
+/// `path` with every `\` folded to `/`, borrowing when it already is.
+///
+/// The sort key for [`prepare`]. `to_string_lossy` borrows a valid-UTF-8 path, and the
+/// replace only runs on a path that actually contains a backslash, so a POSIX tree
+/// sorts with **no heap allocation at all** — the previous
+/// `to_string_lossy().replace('\\', "/")` allocated two `String`s per comparison.
+fn normalised(path: &Path) -> std::borrow::Cow<'_, str> {
+    let text = path.to_string_lossy();
+    if text.contains('\\') {
+        std::borrow::Cow::Owned(text.replace('\\', "/"))
+    } else {
+        text
+    }
+}
+
+/// The mode `source` declares, or a message naming why it could not be determined.
+///
+/// The answer comes from the compiler, not from a rule written here: [`lower_route`]
+/// is the public entry that carries `RouteIr::mode`, and it is [`detect_mode`]'s own
+/// verdict on the type-stripped source, so `build` and the emitters cannot disagree
+/// about which module a route gets.
+///
+/// # Why not `detect_mode` directly
+///
+/// [`detect_mode`] takes a parsed `Program`, and a `Program` needs an `Allocator` from
+/// `oxc_allocator` — which `runai_cli` does not depend on. `lower_route` is the public
+/// API that reaches the same verdict without that dependency, and this module owns no
+/// other file to add one to.
+///
+/// # `Err` is an internal inconsistency, not a route refusal
+///
+/// [`prepare`] runs `analyze` before this. A parse failure (`RA007`) or a missing
+/// directive (`RA012`) is an **error** there, so the build is already returning that
+/// diagnostic and this `Err` is never reached for it. It is reached only for a file
+/// `analyze` accepted whose lowering then failed — a compiler invariant, which
+/// [`prepare`] reports as a message naming the file rather than dropping the route.
+fn route_mode(source: &str) -> Result<Mode, Vec<Diagnostic>> {
+    lower_route(source).map(|route| route.mode)
 }
 
 /// Every route file under `dir`, recursively.
@@ -1159,25 +1348,47 @@ impl Runner {
         }
     }
 
-    /// Run `module` in `dir`, returning the HTML it wrote to stdout.
+    /// Render every static module in `dir` in **one** child process.
     ///
-    /// The three-part check is the point: see the module docs. `stderr` is printed
-    /// by the caller, so a failing route's real error reaches the agent instead of
-    /// being written into `index.html`.
-    fn render(self, dir: &Path, module: &str) -> Result<String, String> {
-        let script = format!(
-            "import('./{module}').then(m => process.stdout.write(m.render()))",
-            module = module
-        );
-        let mut command = Command::new(match self {
-            Runner::Bun => "bun",
-            Runner::Node => "node",
-        });
+    /// `modules` is the manifest: the module filenames in route order. The returned
+    /// `Vec<String>` is index-aligned with it, so the caller attaches each HTML string
+    /// to the route it came from. One spawn per build, not one per route — see
+    /// [`RENDER_SCRIPT`] for the measurement and why the driver owns the exit code.
+    ///
+    /// # The three-part acceptance check, preserved
+    ///
+    /// A render is accepted only when the status succeeded, stderr is empty, and stdout
+    /// is non-empty. The middle condition is not decoration: `bun` and `node` can exit
+    /// **0** after a module throws, and the driver here sets the status *and* writes the
+    /// error to stderr, so either signal alone would still catch a failure — but a
+    /// module that writes to stderr without failing is a route this project treats as
+    /// broken (it was already a failed render when each route had its own child), and
+    /// that is stderr's job to catch.
+    ///
+    /// # Attribution
+    ///
+    /// A failure names the **route file**, not a module index. The driver reports the
+    /// index of the module that failed ([`ROUTE_FAILED_MARKER`]), the parent maps it
+    /// through `routes`, and the message carries both the file and the runtime's own
+    /// error text. A failure with no index — the child could not start, or the driver
+    /// itself broke — is reported against `routes` as a whole rather than guessed at.
+    fn render_all(
+        self,
+        dir: &Path,
+        modules: &[String],
+        routes: &[&str],
+    ) -> Result<Vec<String>, String> {
+        let manifest = modules.join("\n");
+        std::fs::write(dir.join(RENDER_MANIFEST), format!("{manifest}\n"))
+            .map_err(|error| format!("cannot write {}: {error}", RENDER_MANIFEST))?;
+        std::fs::write(dir.join(RENDER_DRIVER), RENDER_SCRIPT)
+            .map_err(|error| format!("cannot write {}: {error}", RENDER_DRIVER))?;
+
+        let mut command = Command::new(self.binary());
         if self == Runner::Node {
-            command.args(["--input-type=module", "-e", &script]);
-        } else {
-            command.args(["-e", &script]);
+            command.arg("--input-type=module");
         }
+        command.arg(RENDER_DRIVER).arg(RENDER_MANIFEST);
 
         let output = command
             .current_dir(dir)
@@ -1185,32 +1396,210 @@ impl Runner {
             .map_err(|error| format!("cannot run {}: {error}", self.name()))?;
 
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        // A failing module still exits 0 on both runtimes, so the status alone says
-        // nothing: an empty stderr and a non-empty stdout are the real signals.
-        if !output.status.success() || !stderr.is_empty() {
-            return Err(format!(
-                "{} could not render the route:\n{}",
-                self.name(),
-                stderr.trim_end()
-            ));
+        if !output.status.success() || !stderr.is_empty() || output.stdout.is_empty() {
+            return Err(self.explain_failure(&stderr, routes));
         }
-        if output.stdout.is_empty() {
+
+        let mut pages = Vec::with_capacity(modules.len());
+        let mut rest = output.stdout.as_slice();
+        for index in 0..modules.len() {
+            let (page, remaining) = next_record(rest).ok_or_else(|| {
+                format!(
+                    "{} stopped after {index} of {} routes: {} reads a length-prefixed \
+                     record for every route and the output ended early",
+                    self.name(),
+                    modules.len(),
+                    self.name()
+                )
+            })?;
+            pages.push(page);
+            rest = remaining;
+        }
+
+        Ok(pages)
+    }
+
+    /// The message for a child that failed, naming the route when the driver said which.
+    ///
+    /// The driver writes `runai-render-failed <index>` before the stack trace of a module
+    /// that threw, and `runai-route-output <index>` before anything a module printed. Both
+    /// name an index into `routes`; anything else is a failure of the child itself.
+    fn explain_failure(&self, stderr: &str, routes: &[&str]) -> String {
+        let failed = marker_index(stderr, ROUTE_FAILED_MARKER);
+        let noisy = marker_index(stderr, "runai-route-output ");
+
+        let (index, what) = match (failed, noisy) {
+            (Some(index), _) => (Some(index), "could not render"),
+            (None, Some(index)) => (
+                Some(index),
+                "wrote to stderr while rendering, and `render()` must be silent",
+            ),
+            (None, None) => (None, "could not render"),
+        };
+
+        let detail = strip_markers(stderr);
+
+        match index {
+            Some(index) => format!(
+                "{} {what} `{}`:\n{}",
+                self.name(),
+                routes.get(index).copied().unwrap_or("<unknown route>"),
+                detail
+            ),
+            None => format!(
+                "{} could not render the static routes:\n{}",
+                self.name(),
+                detail
+            ),
+        }
+    }
+
+    /// Minify `source` into `out` with this runtime's bundler, for the runtime copy.
+    ///
+    /// The runtime the build ships must be the **production** build: the source carries
+    /// dev-only guards that name `RUNAI_DEV`, and `scripts/size-budget.sh` measures the
+    /// minified form at 6,144 bytes gzipped. Copying the source shipped 9,616 bytes
+    /// gzipped — 57% over a budget this project calls hard — so the build runs the same
+    /// fold the gate does.
+    ///
+    /// `bun build --minify` is used rather than the gate's `bunx esbuild` because it needs
+    /// no package resolution at build time: `bunx` downloads or resolves `esbuild` on
+    /// every invocation, which is a network dependency a build must not have. The
+    /// `--define` is the load-bearing flag — without it `bun build --minify` leaves the
+    /// guards in place (measured: 2,598 bytes gzipped and `RUNAI_DEV` still present,
+    /// against 2,131 bytes and none with it), so the production intent is stated
+    /// explicitly instead of relying on a bundler default.
+    ///
+    /// # Errors
+    ///
+    /// Any failure is returned rather than falling back to the unminified source. A build
+    /// that silently shipped 9,616 bytes would pass every test that reads the page and
+    /// fail the only one that measures the artifact, which is the shape of defect this
+    /// function exists to close.
+    fn minify(self, source: &Path, out: &Path) -> Result<(), String> {
+        // The fold is a JavaScript-bundler convention, not a `bun`-only one; `node` alone
+        // has no bundler, so the message says what is missing rather than blaming a flag.
+        if self != Runner::Bun {
             return Err(format!(
-                "{} printed no HTML for the route: `render()` must write the page",
+                "the runtime must be minified before it ships, and only `bun` can do that \
+                 here (`{}` was detected and `bun` is not on PATH). Install bun, or add a \
+                 pre-minified runtime.",
                 self.name()
             ));
         }
 
-        String::from_utf8(output.stdout)
-            .map_err(|error| format!("{} printed invalid UTF-8: {error}", self.name()))
+        let output = Command::new("bun")
+            .arg("build")
+            .arg(source)
+            .args(["--minify", "--format=esm", "--target=browser"])
+            .args(["--define", "process.env.NODE_ENV=\"production\""])
+            .arg(format!("--outfile={}", out.display()))
+            .output()
+            .map_err(|error| format!("cannot run bun to minify the runtime: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "bun could not minify the runtime at {}:\n{}",
+                source.display(),
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            ));
+        }
+
+        // Assert the artifact instead of trusting the tool's exit status: a build that
+        // produced an empty or unshrunk file must fail here, loudly.
+        let minified = std::fs::read(out).map_err(|error| {
+            format!(
+                "cannot read the minified runtime {}: {error}",
+                out.display()
+            )
+        })?;
+        let original = std::fs::metadata(source)
+            .map_err(|error| format!("cannot read the runtime {}: {error}", source.display()))?
+            .len();
+        if minified.is_empty() {
+            return Err(format!(
+                "bun produced an empty file for the runtime at {}: refusing to ship it",
+                out.display()
+            ));
+        }
+        if minified.len() as u64 >= original {
+            return Err(format!(
+                "the minified runtime is {} bytes and the source is {original}: it did not \
+                 shrink, so it is not a production build. Refusing to ship it.",
+                minified.len()
+            ));
+        }
+        if contains(&minified, b"RUNAI_DEV") {
+            return Err(format!(
+                "the minified runtime still carries `RUNAI_DEV` dev instrumentation, so the \
+                 production fold did not run. Refusing to ship {}.",
+                out.display()
+            ));
+        }
+
+        Ok(())
     }
 
-    fn name(self) -> &'static str {
+    /// The executable name.
+    fn binary(self) -> &'static str {
         match self {
             Runner::Bun => "bun",
             Runner::Node => "node",
         }
     }
+
+    fn name(self) -> &'static str {
+        self.binary()
+    }
+}
+
+/// Whether `haystack` contains `needle`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The index after `marker` in `text`, when the marker starts a line.
+///
+/// Line-anchored on purpose: a stack trace of a module that printed the marker's text
+/// is not the driver speaking, and an unanchored `find` would read it as one.
+fn marker_index(text: &str, marker: &str) -> Option<usize> {
+    text.lines().find_map(|line| {
+        line.strip_prefix(marker)
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}
+
+/// `text` without the driver's index markers, trimmed.
+///
+/// The markers are the parent's protocol, not part of the error an agent should read;
+/// the route they name is reported separately, in words.
+fn strip_markers(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            !line.starts_with(ROUTE_FAILED_MARKER) && !line.starts_with("runai-route-output ")
+        })
+        .collect();
+    kept.join("\n").trim_end().to_string()
+}
+
+/// One `<length>\n<page>\n` record from the front of `bytes`, and the remainder.
+///
+/// The length is in **bytes**, written by the driver with `Buffer.byteLength(page, "utf8")`,
+/// so a page containing multi-byte characters is not truncated. `None` means the output
+/// ended before a whole record, which the caller reports as a truncated render rather
+/// than as a short page.
+fn next_record(bytes: &[u8]) -> Option<(String, &[u8])> {
+    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let length: usize = std::str::from_utf8(&bytes[..newline]).ok()?.parse().ok()?;
+    let start = newline + 1;
+    let end = start.checked_add(length)?;
+    let page = bytes.get(start..end)?;
+    // The record's own trailing newline, when it is there.
+    let rest = bytes.get(end..).unwrap_or_default();
+    let rest = rest.strip_prefix(b"\n").unwrap_or(rest);
+    Some((String::from_utf8(page.to_vec()).ok()?, rest))
 }
 
 /// Whether `binary --version` runs successfully.
@@ -1228,22 +1617,29 @@ enum Emitted {
     Island(String),
 }
 
-/// The module for one route, whichever emitter its directive calls for.
+/// The module for one route, from the emitter its mode names.
 ///
-/// The checked emitters are the gate, and exactly one of them accepts a page whose
-/// analysis passed: the other returns the mode refusal. So this asks the prerender
-/// emitter first and treats its `Err` as "not static", which means the directive
-/// rule is never re-derived here. If the client emitter also refuses, the prerender
-/// error is returned — the analysis already passed, so that is the informative one.
+/// The mode was decided once in [`prepare`] and is carried on [`Prepared`], so this is a
+/// dispatch, not a search. It used to be a search: call [`emit_prerender_checked`], read
+/// its `Err` as "not static", then call [`emit_client_checked`]. That re-ran the whole
+/// analysis, both strips, and a lowering the first attempt had already thrown away, and
+/// it made a failed static emit silently become an island emit.
+///
+/// The win is one full compiler pass per route, not a change in the wall clock: measured
+/// at 400 island routes, `build` is ~58 ms either way because per-route output I/O
+/// dominates; at 8000 routes the change is ~2%. See [`Prepared::mode`].
+///
+/// The checked emitters are still the gate. They run `analyze` again — one pass, not
+/// four — and that is deliberate: an emitter that trusts an earlier pass is an artifact
+/// path with a mutable verdict in the middle, and the emitters' contract is that they
+/// cannot produce an artifact from a file they did not check themselves.
 fn emit(prepared: &Prepared) -> Result<Emitted, Vec<Diagnostic>> {
-    match emit_prerender_checked(&prepared.source, &prepared.display) {
-        Ok(module) => Ok(Emitted::Static(module)),
-        Err(static_error) => {
-            match emit_client_checked(&prepared.source, &prepared.display, RUNTIME_URL) {
-                Ok(module) => Ok(Emitted::Island(module)),
-                Err(_) => Err(static_error),
-            }
+    match prepared.mode {
+        Mode::Static => {
+            emit_prerender_checked(&prepared.source, &prepared.display).map(Emitted::Static)
         }
+        Mode::Island => emit_client_checked(&prepared.source, &prepared.display, RUNTIME_URL)
+            .map(Emitted::Island),
     }
 }
 
@@ -1401,8 +1797,8 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
         // The asset path `assets/runtime.js` is where the runtime is copied, so an
         // island route that derives it would have its own module overwritten and the
         // page would load and mount nothing. This check is here, not in `prepare`,
-        // because only here is the mode known: a static route emits no asset at all,
-        // so a static `runtime` route is harmless and must build.
+        // because only here is the emitted kind known: a static route emits no asset at
+        // all, so a static `runtime` route is harmless and must build.
         //
         // Compared case-insensitively: on macOS and Windows `assets/Runtime.js` IS
         // `assets/runtime.js`, so a byte-exact guard would pass on Linux and silently
@@ -1421,32 +1817,60 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
         rendered.push((index, module));
     }
 
-    let mut runner: Option<Runner> = None;
+    // Every static module is written first, then rendered by **one** child, then
+    // written out. Splitting the loop this way is what makes the build cost one
+    // interpreter start instead of one per static route; see [`RENDER_SCRIPT`].
+    //
+    // The modules are written even when there is exactly one, so there is one code
+    // path and the driver always has a manifest to read.
+    let mut static_modules: Vec<(usize, String)> = Vec::new();
+    for (index, module) in &rendered {
+        if let Emitted::Static(module) = module {
+            static_modules.push((*index, module.clone()));
+        }
+    }
+
+    let mut pages: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    if !static_modules.is_empty() {
+        let runtime = Runner::detect().ok_or_else(|| {
+            "neither `bun` nor `node` is on PATH: a static route is prerendered by \
+             executing its module, so the build cannot continue"
+                .to_string()
+        })?;
+
+        std::fs::create_dir_all(&modules)
+            .map_err(|error| format!("cannot create {}: {error}", modules.display()))?;
+
+        let mut filenames = Vec::with_capacity(static_modules.len());
+        let mut routes = Vec::with_capacity(static_modules.len());
+        for (position, (index, module)) in static_modules.iter().enumerate() {
+            let filename = format!("route{position}.mjs");
+            std::fs::write(modules.join(&filename), module)
+                .map_err(|error| format!("cannot write {filename}: {error}"))?;
+            filenames.push(filename);
+            routes.push(prepared[*index].display.as_str());
+        }
+
+        let html = runtime.render_all(&modules, &filenames, &routes)?;
+        for ((index, _), page) in static_modules.iter().zip(html) {
+            pages.insert(*index, page);
+        }
+    }
+
     let mut has_island = false;
 
     for (index, module) in &rendered {
         let route = &prepared[*index];
         match module {
-            Emitted::Static(module) => {
-                let runtime = match runner {
-                    Some(runner) => runner,
-                    None => {
-                        let detected = Runner::detect().ok_or_else(|| {
-                            "neither `bun` nor `node` is on PATH: a static route is prerendered by \
-                             executing its module, so the build cannot continue"
-                                .to_string()
-                        })?;
-                        runner = Some(detected);
-                        detected
-                    }
-                };
-
-                std::fs::create_dir_all(&modules)
-                    .map_err(|error| format!("cannot create {}: {error}", modules.display()))?;
-                let filename = format!("route{index}.mjs");
-                std::fs::write(modules.join(&filename), module)
-                    .map_err(|error| format!("cannot write {filename}: {error}"))?;
-                let html = runtime.render(&modules, &filename)?;
+            Emitted::Static(_) => {
+                // Present by construction: every static index was rendered above.
+                let html = pages.get(index).ok_or_else(|| {
+                    format!(
+                        "`{}` was emitted as static but has no rendered page: this is a bug \
+                         in `runai build`, not in the route",
+                        route.display
+                    )
+                })?;
 
                 let file = output_path(tmp, &route.name);
                 verify_under(tmp, &file)?;
@@ -1475,16 +1899,27 @@ fn assemble_into(tmp: &Path, prepared: &[Prepared]) -> Result<(), String> {
         let root = std::env::current_dir()
             .map_err(|error| format!("cannot read the working directory: {error}"))?;
         let runtime = runtime_path(&root)?;
-        let bytes = std::fs::read(&runtime).map_err(|error| {
+        // The source must exist before a minifier is asked to read it, so this probe
+        // keeps the message that names the path the config actually named.
+        std::fs::metadata(&runtime).map_err(|error| {
             format!(
                 "cannot read the runtime named by `{CONFIG}` at {}: {error}",
                 runtime.display()
             )
         })?;
+
         let path = tmp.join("assets").join("runtime.js");
         verify_under(tmp, &path)?;
-        std::fs::write(&path, bytes)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        // The shipped runtime is the **production** build, not the source: the dev
+        // guards behind `RUNAI_DEV` are folded out and the result is what the size
+        // budget measures. See [`Runner::minify`] for why a failure here fails the
+        // build instead of falling back to the source.
+        let minifier = Runner::detect().ok_or_else(|| {
+            "this app has an island route, so its runtime must be minified before it ships, \
+             and neither `bun` nor `node` is on PATH"
+                .to_string()
+        })?;
+        minifier.minify(&runtime, &path)?;
     }
 
     // The scratch modules are not part of the site.
@@ -1890,6 +2325,143 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The length-prefixed record is the parent's whole read path for a batch render, and
+    // a length that is bytes rather than characters is what keeps a multi-byte page
+    // whole. A `chars().count()` implementation would truncate `<p>héllo 🚀</p>` and every
+    // later record would be read from the middle of the previous page.
+    #[test]
+    fn a_length_prefixed_record_is_read_by_bytes_not_characters() {
+        let page = "<p>héllo 🚀</p>";
+        let bytes = page.len();
+        let stream = format!("{bytes}\n{page}\n3\nabc\n");
+        let (first, rest) = next_record(stream.as_bytes()).unwrap();
+        assert_eq!(first, page);
+        let (second, rest) = next_record(rest).unwrap();
+        assert_eq!(second, "abc");
+        assert!(rest.is_empty(), "the whole stream is consumed: {rest:?}");
+    }
+
+    // An empty page is a real render (`render()` returning ""), and it must not be read
+    // as a truncated stream: its record is `0\n\n`.
+    #[test]
+    fn an_empty_page_is_a_record_not_a_truncation() {
+        let stream = "0\n\n5\nhello\n";
+        let (first, rest) = next_record(stream.as_bytes()).unwrap();
+        assert_eq!(first, "");
+        let (second, _) = next_record(rest).unwrap();
+        assert_eq!(second, "hello");
+    }
+
+    // A truncated stream must be `None` rather than a short or spliced page: the caller
+    // reports "stopped after N routes", and a short page would be written to `dist/`.
+    #[test]
+    fn a_truncated_record_is_rejected() {
+        // Header promises 100 bytes, the stream has 3.
+        assert!(next_record(b"100\nabc").is_none());
+        // No length line at all.
+        assert!(next_record(b"abc").is_none());
+        // A non-numeric length is not a record.
+        assert!(next_record(b"x\nabc").is_none());
+    }
+
+    // A failure names the route by path, and the marker that carried the index is not
+    // left in the message an agent reads.
+    #[test]
+    fn a_failed_render_names_the_route_and_not_the_marker() {
+        let routes = [
+            "src/routes/a.page.tsx",
+            "src/routes/b.page.tsx",
+            "src/routes/c.page.tsx",
+        ];
+        let stderr =
+            "runai-render-failed 1\nTypeError: null is not an object\n    at render (b.mjs:4:11)\n";
+        let message = Runner::Bun.explain_failure(stderr, &routes);
+        assert!(message.contains("src/routes/b.page.tsx"), "{message}");
+        assert!(message.contains("TypeError"), "{message}");
+        assert!(
+            !message.contains("runai-render-failed"),
+            "the protocol marker is not part of the error: {message}"
+        );
+        assert!(
+            !message.contains("src/routes/a.page.tsx") && !message.contains("c.page.tsx"),
+            "only the failing route is named: {message}"
+        );
+    }
+
+    // A route that prints to stderr without throwing is its own failure, and it names
+    // the route too — a batch renderer that swallowed the noise would turn it into a
+    // page.
+    #[test]
+    fn a_route_that_writes_to_stderr_fails_and_is_named() {
+        let routes = ["src/routes/quiet.page.tsx", "src/routes/noisy.page.tsx"];
+        let stderr = "runai-route-output 1\nsome console output\n";
+        let message = Runner::Bun.explain_failure(stderr, &routes);
+        assert!(message.contains("src/routes/noisy.page.tsx"), "{message}");
+        assert!(message.contains("stderr"), "{message}");
+        assert!(!message.contains("runai-route-output"), "{message}");
+    }
+
+    // The marker is line-anchored: a module that happens to print the marker's text is
+    // not the driver, and reading it as one would name an innocent route.
+    #[test]
+    fn the_failure_marker_must_start_a_line() {
+        assert_eq!(
+            marker_index("runai-render-failed 2\n", ROUTE_FAILED_MARKER),
+            Some(2)
+        );
+        assert_eq!(
+            marker_index("note: runai-render-failed 2\n", ROUTE_FAILED_MARKER),
+            None
+        );
+        assert_eq!(
+            marker_index("runai-render-failed\n", ROUTE_FAILED_MARKER),
+            None
+        );
+    }
+
+    // The sort key normalises without allocating on a POSIX path, and still folds a
+    // backslash when one appears. The allocation count is not observable from a test, so
+    // what is pinned is the behaviour: both separators sort as one and the borrowed form
+    // is what a plain path takes.
+    #[test]
+    fn the_sort_key_folds_backslashes_and_borrows_a_plain_path() {
+        assert_eq!(
+            normalised(Path::new("src/routes/a.page.tsx")),
+            "src/routes/a.page.tsx"
+        );
+        assert!(matches!(
+            normalised(Path::new("src/routes/a.page.tsx")),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(normalised(Path::new("a\\b.page.tsx")), "a/b.page.tsx");
+    }
+
+    // Determinism where two paths share a normalised key: the raw path breaks the tie,
+    // so the order does not depend on directory read order.
+    #[test]
+    fn ties_on_the_normalised_key_are_broken_by_the_raw_path() {
+        let mut paths = vec![
+            PathBuf::from("a\\b.page.tsx"),
+            PathBuf::from("a/b.page.tsx"),
+        ];
+        let sort = |paths: &mut Vec<PathBuf>| {
+            paths.sort_by(|left, right| {
+                normalised(left)
+                    .cmp(&normalised(right))
+                    .then_with(|| left.cmp(right))
+            })
+        };
+        sort(&mut paths);
+        let forwards = paths.clone();
+        paths.reverse();
+        sort(&mut paths);
+        assert_eq!(
+            paths, forwards,
+            "the same input must sort to the same order"
+        );
+        assert_eq!(paths[0], PathBuf::from("a/b.page.tsx"));
+    }
 
     // The route → output path contract. `index` is the root, anything else is a
     // directory, and a nested route keeps its nesting — the shape a static server

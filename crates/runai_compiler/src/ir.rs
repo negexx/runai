@@ -61,7 +61,7 @@ use crate::analyze::jsx::{
     route_render, self_closing_refusal, text_refusal,
 };
 use crate::analyze::{ComponentInfo, find_route_component, validate_route_component};
-use crate::diagnostic::{Code, Diagnostic};
+use crate::diagnostic::{Code, Diagnostic, MAX_JSX_DEPTH, excessive_nesting};
 use crate::source::{Mode, detect_mode, has_line_break, lines, parse_tsx, raw_text};
 use crate::strip::strip_types;
 
@@ -697,7 +697,7 @@ impl<'s> Lowerer<'s> {
     /// rather than this one.
     fn root(&self, root: &'s Expression<'s>) -> Result<IrNode, Vec<Diagnostic>> {
         match root {
-            Expression::JSXElement(element) => self.element(element, &[]),
+            Expression::JSXElement(element) => self.element(element, &[], 1),
             Expression::JSXFragment(fragment) => Err(vec![unsupported(
                 fragment.span,
                 "a fragment as the route's returned JSX",
@@ -716,11 +716,25 @@ impl<'s> Lowerer<'s> {
     /// [`crate::analyze::jsx::ancestor_refusal`]) can be repeated here as the
     /// invariant the analysis first enforces. A caller that skips the analysis gets
     /// a diagnostic rather than a template the browser will reshape.
+    ///
+    /// `depth` is this element's nesting level, root = 1. It is a parameter rather
+    /// than `ancestors.len() + 1` because a **fragment** child splices into the
+    /// parent without adding an ancestor, so the two would disagree about a file
+    /// that nests fragments. Past [`MAX_JSX_DEPTH`] this refuses instead of
+    /// recursing further: a stack overflow aborts the process, so it is not a
+    /// failure a `Result` can report after the fact.
     fn element(
         &self,
         element: &'s JSXElement<'s>,
         ancestors: &[String],
+        depth: usize,
     ) -> Result<IrNode, Vec<Diagnostic>> {
+        if depth > MAX_JSX_DEPTH {
+            return Err(vec![excessive_nesting((
+                element.span.start,
+                element.span.end,
+            ))]);
+        }
         // The one tag rule, shared with `check_jsx`: `<div>` is a DOM element,
         // anything else has no DOM lowering and this milestone cannot inline it.
         // `check_jsx` reports the refusal first; this is the invariant that keeps
@@ -822,7 +836,7 @@ impl<'s> Lowerer<'s> {
 
         let mut nested = ancestors.to_vec();
         nested.push(name.clone());
-        let children = self.children(&element.children, &nested)?;
+        let children = self.children(&element.children, &nested, depth)?;
 
         Ok(IrNode::Element {
             tag: name,
@@ -846,6 +860,7 @@ impl<'s> Lowerer<'s> {
         &self,
         children: &'s [JSXChild<'s>],
         ancestors: &[String],
+        depth: usize,
     ) -> Result<Vec<IrNode>, Vec<Diagnostic>> {
         let mut nodes = Vec::new();
 
@@ -856,15 +871,32 @@ impl<'s> Lowerer<'s> {
                         nodes.push(IrNode::Text(text));
                     }
                 }
-                JSXChild::Element(element) => nodes.push(self.element(element, ancestors)?),
+                JSXChild::Element(element) => {
+                    nodes.push(self.element(element, ancestors, depth + 1)?);
+                }
                 JSXChild::Fragment(fragment) => {
-                    nodes.extend(self.children(&fragment.children, ancestors)?);
+                    nodes.extend(self.children(&fragment.children, ancestors, depth)?);
                 }
                 JSXChild::ExpressionContainer(container) => {
                     // `{}` and `{/* a comment */}` both parse to an empty
                     // expression. There is nothing to render, so they contribute
                     // no node — and the comment's text must not become an
                     // expression.
+                    if matches!(container.expression, JSXExpression::EmptyExpression(_)) {
+                        continue;
+                    }
+                    // A **constant** slot is text, not a binding. `{" "}` is the
+                    // framework's own repair for `RA007`, and compiling it into a
+                    // template marker, a full TreeWalker pass, and an effect would
+                    // make the documented fix cost runtime budget for a value that
+                    // never changes. Folding it here means both emitters write it as
+                    // template text with no marker, which needs no emitter change:
+                    // `IrNode::Text` is already literal template text to both
+                    // writers.
+                    if let Some(text) = constant_child_text(container.expression.to_expression()) {
+                        nodes.push(IrNode::Text(text));
+                        continue;
+                    }
                     let Some(expr) = self.expression_source(&container.expression, "child slot")?
                     else {
                         continue;
@@ -911,6 +943,77 @@ impl<'s> Lowerer<'s> {
             }
         }
     }
+}
+
+/// The rendered text of a **constant** child slot, or `None` if the expression is
+/// not a compile-time constant.
+///
+/// Three shapes are constant, and each is a value the build already knows:
+///
+/// - a string literal — `{" "}`, `{"a b"}`;
+/// - a numeric literal — `{42}`;
+/// - a template literal with **no substitutions** — `` {`a b`} ``.
+///
+/// A template literal with a substitution (`` {`a${b}`} ``) is not constant, and
+/// neither is any other expression; those stay [`IrNode::Expr`] and keep their
+/// binding.
+///
+/// # Why the value is escaped, not copied
+///
+/// A string literal's value is **text**, not markup. Today a slot goes through
+/// `_esc` (static) or `_setText` (island), both of which render `<b>` as the text
+/// `<b>` — the four characters — rather than as an element. Copying the literal
+/// into the template verbatim would turn `{"<b>"}` into real markup, which is a
+/// different page. So the value is escaped exactly as [`crate::codegen::prerender`]
+/// escapes a dynamic slot, which is what keeps a folded slot byte-identical to the
+/// unfolded one.
+///
+/// The escaping is the `_esc` table applied at **build** time: `&`, `<`, `>`, `"`,
+/// and `'`. A `&` in a string value is a literal ampersand (`{"&amp;"}` means the
+/// five characters), so it escapes to `&amp;` and renders as `&` — the same result
+/// `_esc` gives at render time. JSX **text** is deliberately not escaped this way
+/// (entities there are the author's own), which is why this helper exists rather
+/// than reusing [`lower_text`]: the two inputs mean different things.
+fn constant_child_text(expression: &Expression<'_>) -> Option<String> {
+    match expression {
+        // `{"a"}`. The span slice is escaped below, not the parsed value, because
+        // the parsed value has already had its escapes resolved and would render
+        // the wrong characters for `{"\n"}`.
+        Expression::StringLiteral(literal) => Some(escape_text(literal.value.as_str()?)),
+        // `{42}`. Rust's `f64` formatting matches JavaScript's `String(number)` for
+        // every value checked (integers, `0.1`, `1e21`, `1e-7`,
+        // `0.30000000000000004`), so a folded number renders what the island's
+        // `String(v)` writes.
+        Expression::NumericLiteral(literal) => Some(literal.value.to_string()),
+        // `` {`a b`} `` with no `${…}`.
+        Expression::TemplateLiteral(template) if template.expressions.is_empty() => {
+            let quasi = template.quasis.first()?;
+            Some(escape_text(quasi.value.cooked.as_ref()?.as_str()?))
+        }
+        _ => None,
+    }
+}
+
+/// Append-time HTML escaping of a constant's text, the same table `_esc` uses.
+///
+/// Deliberately the **same five characters** as [`crate::codegen::prerender`]'s
+/// `_esc`, so a folded value and an unfolded one produce identical markup. Quotes
+/// are included because the same table is used in text and an attribute would use
+/// a narrower one; over-escaping a quote in text is harmless, and matching `_esc`
+/// exactly is what makes the folded output indistinguishable.
+fn escape_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The standard JSX whitespace rule, applied to one text node.

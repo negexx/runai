@@ -13,3 +13,9 @@ runai_compiler = { path = "../runai_compiler" }
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
+# The ESM-artifact test parses the artifact with oxc when `node` is absent, so the
+# duplicate-export class stays pinned on a machine without node. Same pinned
+# versions the compiler uses; a mismatched parser would check a different grammar.
+oxc_parser = "=0.159.0"
+oxc_allocator = "=0.159.0"
+oxc_span = "=0.159.0"

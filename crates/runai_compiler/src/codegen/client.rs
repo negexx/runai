@@ -247,6 +247,16 @@ pub(crate) fn used_helpers(node: &IrNode) -> Vec<&'static str> {
 }
 
 fn collect_helpers(node: &IrNode, out: &mut Vec<&'static str>) {
+    collect_helpers_at(node, out, 1);
+}
+
+/// [`collect_helpers`] with `depth`, bounded by
+/// [`crate::diagnostic::MAX_JSX_DEPTH`] for the same reason as the emitter's walk:
+/// this recurses once per element, and a stack overflow aborts the process.
+fn collect_helpers_at(node: &IrNode, out: &mut Vec<&'static str>, depth: usize) {
+    if depth > crate::diagnostic::MAX_JSX_DEPTH {
+        return;
+    }
     match node {
         IrNode::Text(_) => {}
         IrNode::Expr(_) => out.push("_setText"),
@@ -260,13 +270,23 @@ fn collect_helpers(node: &IrNode, out: &mut Vec<&'static str>) {
                 }
             }
             for child in children {
-                collect_helpers(child, out);
+                collect_helpers_at(child, out, depth + 1);
             }
         }
     }
 }
 
 fn collect_sites<'a>(node: &'a IrNode, out: &mut Vec<Site<'a>>) {
+    collect_sites_at(node, out, 1);
+}
+
+/// [`collect_sites`] with `depth`, bounded by
+/// [`crate::diagnostic::MAX_JSX_DEPTH`] for the same reason as the template
+/// writer: one frame per element level, and a stack overflow aborts the process.
+fn collect_sites_at<'a>(node: &'a IrNode, out: &mut Vec<Site<'a>>, depth: usize) {
+    if depth > crate::diagnostic::MAX_JSX_DEPTH {
+        return;
+    }
     match node {
         IrNode::Text(_) => {}
         IrNode::Expr(expr) => out.push(Site {
@@ -298,7 +318,7 @@ fn collect_sites<'a>(node: &'a IrNode, out: &mut Vec<Site<'a>>) {
                 });
             }
             for child in children {
-                collect_sites(child, out);
+                collect_sites_at(child, out, depth + 1);
             }
         }
     }
@@ -459,6 +479,87 @@ mod tests {
             !js.contains("_c("),
             "no markers means no collector call: {js}"
         );
+    }
+
+    /// The mirror of [`static_text_is_in_the_template_not_the_runtime`] for a slot
+    /// the author wrote as an **expression**: a constant folds to template text, so
+    /// `{" "}` and `{"a b"}` cost no marker, no TreeWalker, and no effect.
+    ///
+    /// `{" "}` is the framework's own repair for `RA007`, so compiling it into a
+    /// runtime binding made the documented fix cost the budget it protects. This is
+    /// the assertion that the repair is now free.
+    #[test]
+    fn a_constant_slot_is_template_text_not_a_runtime_binding() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>a{\" \"}b</p> }\n";
+        let route = lower_route(src).unwrap();
+        let js = emit_client(&route, "/assets/runtime.js", &imports_for(src));
+        assert!(
+            js.contains("<p>a b</p>"),
+            "the literal is in the template, with its space: {js}"
+        );
+        assert!(!js.contains("_setText"), "{js}");
+        assert!(!js.contains("_c ="), "no marker, so no collector: {js}");
+        // The IR is the boundary the fold happens at, so assert it directly too: a
+        // test that only greps the artifact would pass on an emitter that dropped
+        // the slot entirely.
+        let IrNode::Element { children, .. } = &route.tree else {
+            panic!("expected element")
+        };
+        assert!(
+            children
+                .iter()
+                .all(|child| matches!(child, IrNode::Text(_))),
+            "every child of a constant-only element is text: {children:?}"
+        );
+    }
+
+    /// A string literal's value is **text**, not markup. `{"<b>"}` renders the four
+    /// characters `<b>` in both modes, because a slot goes through `_esc` /
+    /// `_setText`; folding it must therefore escape it. Copying the literal into
+    /// the template verbatim would turn it into a real element — a different page
+    /// from the one the author wrote.
+    #[test]
+    fn a_constant_slot_is_escaped_so_it_stays_text() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>{\"<b>\"}</p> }\n";
+        let js = emit_client(
+            &lower_route(src).unwrap(),
+            "/assets/runtime.js",
+            &imports_for(src),
+        );
+        assert!(
+            js.contains("&lt;b&gt;"),
+            "the literal is escaped, so it renders as text: {js}"
+        );
+        assert!(!js.contains("<b>"), "it must not become real markup: {js}");
+    }
+
+    /// A numeric literal and a substitution-free template literal are constants too.
+    /// The number matters: `{42}` must render `42`, not `42.0` and not `_setText(42)`.
+    #[test]
+    fn numeric_and_template_literal_slots_fold() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) { return <p>{42}{`lit`}</p> }\n";
+        let js = emit_client(
+            &lower_route(src).unwrap(),
+            "/assets/runtime.js",
+            &imports_for(src),
+        );
+        assert!(js.contains("42lit"), "{js}");
+        assert!(!js.contains("_setText"), "{js}");
+    }
+
+    /// The control: a slot with a **substitution** is not a constant, so it keeps
+    /// its binding. A fold that swallowed `` {`a${n()}`} `` would render the literal
+    /// text and drop the signal — silently.
+    #[test]
+    fn a_template_literal_with_a_substitution_is_still_a_binding() {
+        let src = "\"use island\"\nimport { signal } from \"runai\"\nexport default function P(props: Record<never, never>) { const n = signal(1); return <p>{`a${n()}`}</p> }\n";
+        let js = emit_client(
+            &lower_route(src).unwrap(),
+            "/assets/runtime.js",
+            &imports_for(src),
+        );
+        assert!(js.contains("_setText"), "{js}");
+        assert!(js.contains("n()"), "{js}");
     }
 
     #[test]

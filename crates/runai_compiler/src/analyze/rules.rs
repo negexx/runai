@@ -192,7 +192,14 @@ pub fn check_static_mode(
             .map(static_write),
     );
 
-    let mut markup = StaticMarkupCollector::default();
+    let functions = FunctionBindings::collect(program);
+    let markup = StaticMarkupCollector {
+        functions: &functions.0,
+        ..StaticMarkupCollector::default()
+    };
+    // The walker is `Visit`, which needs `&mut`; the collector is built first so
+    // `functions` outlives it.
+    let mut markup = markup;
     markup.visit_program(program);
     diagnostics.extend(
         markup
@@ -201,6 +208,16 @@ pub fn check_static_mode(
             .map(|&(span, form)| static_handler(span, form)),
     );
     diagnostics.extend(markup.scripts.iter().map(|&span| static_script(span)));
+
+    // `RA016`: an attribute value the build cannot evaluate. Runs only for a static
+    // route, and only over attribute expressions, because that is the one place a
+    // function value reaches the emitted HTML string.
+    diagnostics.extend(
+        markup
+            .function_attributes
+            .iter()
+            .map(|&(span, kind)| static_function_attribute(span, kind)),
+    );
 
     diagnostics.sort_by(|left, right| {
         (left.span.0, left.code.as_str()).cmp(&(right.span.0, right.code.as_str()))
@@ -497,12 +514,102 @@ fn is_uppercase_handler_name(name: &str) -> bool {
 /// `<Script>` is a component tag, which `check_jsx` already refuses, and a
 /// namespaced tag is not an HTML element.
 #[derive(Default)]
-struct StaticMarkupCollector {
+struct StaticMarkupCollector<'f> {
     handlers: Vec<((u32, u32), HandlerForm)>,
     scripts: Vec<(u32, u32)>,
+    /// `RA016`: attribute expressions whose value is a function, with the kind of
+    /// expression it was, so the message can name the repair for that shape.
+    ///
+    /// Only non-literal expressions reach here — a string, a template with no
+    /// substitutions, and a numeric or boolean literal are all values the build
+    /// knows, so they are not collected. A bare identifier is resolved against
+    /// `functions`, because `const cls = () => "hello"` is exactly the reported
+    /// defect and a syntactic "is it a function here" test misses it.
+    function_attributes: Vec<((u32, u32), FunctionValueKind)>,
+    /// The names bound to a function expression anywhere in the file.
+    ///
+    /// Filled by [`FunctionBindings`] before the markup walk, so resolution does
+    /// not depend on source order: `const cls = …` above the markup and a hoisted
+    /// `function cls() {}` below it resolve the same way.
+    functions: &'f [String],
 }
 
-impl<'a> Visit<'a> for StaticMarkupCollector {
+/// What kind of expression produced a function-valued attribute.
+///
+/// The two shapes need different repairs, so the message says which one the file
+/// has rather than one sentence that is wrong for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionValueKind {
+    /// `cls={…}` where the value is an inline arrow or function expression:
+    /// `class={() => "a"}`.
+    Inline,
+    /// `cls={name}` where `name` is bound to a function expression in this file.
+    Binding,
+}
+
+/// Collect every name bound to a function expression in the file.
+///
+/// One walk, no semantic build: the declarator's initializer is enough to answer
+/// "is this name a function value", and `RA016` is static-mode only, so the
+/// precision a `SymbolId` would buy is not worth a semantic build on every static
+/// route. A shadowed name therefore resolves to the outer binding's answer in the
+/// rare case — worst case one extra refusal, never a silent wrong page.
+struct FunctionBindings(Vec<String>);
+
+impl FunctionBindings {
+    fn collect(program: &oxc_ast::ast::Program<'_>) -> Self {
+        let mut collector = FunctionBindingCollector(Vec::new());
+        collector.visit_program(program);
+        FunctionBindings(collector.0)
+    }
+}
+
+struct FunctionBindingCollector(Vec<String>);
+
+impl<'a> Visit<'a> for FunctionBindingCollector {
+    fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if declarator
+            .init
+            .as_ref()
+            .is_some_and(|init| is_function_expression(init))
+            && let Some(binding) = declarator.id.get_binding_identifier()
+        {
+            self.0.push(binding.name.as_str().to_string());
+        }
+        oxc_ast_visit::walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_function(
+        &mut self,
+        function: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        // A `function cls() {}` declaration (not an expression) also binds a
+        // function value, and it hoists, so it must be found even when the markup
+        // above it is what refers to it.
+        if let Some(id) = &function.id {
+            self.0.push(id.name.as_str().to_string());
+        }
+        oxc_ast_visit::walk::walk_function(self, function, flags);
+    }
+}
+
+/// Whether `expression` is a function value — the thing `_setAttr` calls.
+///
+/// Parentheses are seen through, because `class={(cls)}` is the same value as
+/// `class={cls}`.
+fn is_function_expression(expression: &oxc_ast::ast::Expression<'_>) -> bool {
+    match expression {
+        oxc_ast::ast::Expression::ArrowFunctionExpression(_)
+        | oxc_ast::ast::Expression::FunctionExpression(_) => true,
+        oxc_ast::ast::Expression::ParenthesizedExpression(parenthesized) => {
+            is_function_expression(&parenthesized.expression)
+        }
+        _ => false,
+    }
+}
+
+impl<'f, 'a> Visit<'a> for StaticMarkupCollector<'f> {
     fn visit_jsx_attribute(&mut self, attribute: &oxc_ast::ast::JSXAttribute<'a>) {
         if let Some(form) = handler_form(attribute) {
             let span = match &attribute.name {
@@ -513,6 +620,14 @@ impl<'a> Visit<'a> for StaticMarkupCollector {
                 oxc_ast::ast::JSXAttributeName::NamespacedName(_) => return,
             };
             self.handlers.push((span, form));
+        } else {
+            // `RA016`: a non-handler attribute whose value cannot be evaluated at
+            // build time. A handler is `RA010`'s row and is skipped here, so one
+            // root cause stays one diagnostic.
+            if let Some(kind) = self.function_attribute(attribute) {
+                self.function_attributes
+                    .push(((attribute.span.start, attribute.span.end), kind));
+            }
         }
         oxc_ast_visit::walk::walk_jsx_attribute(self, attribute);
     }
@@ -525,6 +640,73 @@ impl<'a> Visit<'a> for StaticMarkupCollector {
         }
         oxc_ast_visit::walk::walk_jsx_element(self, element);
     }
+}
+
+impl StaticMarkupCollector<'_> {
+    /// The kind of function-valued attribute `attribute` carries, if any.
+    ///
+    /// Four literal shapes are values the build already knows and are therefore
+    /// **not** refused, because refusing them would break legal static routes:
+    /// a string (`class="a"`), a numeric literal (`tabindex={0}`), a boolean
+    /// literal, and a template literal with no substitutions. Everything else is
+    /// either a function value (refused) or a plain expression the prerender
+    /// module evaluates at build time (`class={tone}`) — the second is
+    /// `RA010`/`rechable`'s question, not this rule's.
+    fn function_attribute(
+        &self,
+        attribute: &oxc_ast::ast::JSXAttribute<'_>,
+    ) -> Option<FunctionValueKind> {
+        let oxc_ast::ast::JSXAttributeValue::ExpressionContainer(container) =
+            attribute.value.as_ref()?
+        else {
+            return None;
+        };
+        let expression = container.expression.to_expression();
+        if is_function_expression(expression) {
+            return Some(FunctionValueKind::Inline);
+        }
+        // A bare identifier is the reported shape: `const cls = () => "hello"`,
+        // then `class={cls}`. `_setAttr` in an island calls it; a static template
+        // would write the function's own source text.
+        if let oxc_ast::ast::Expression::Identifier(identifier) = expression
+            && self
+                .functions
+                .iter()
+                .any(|name| name == identifier.name.as_str())
+        {
+            return Some(FunctionValueKind::Binding);
+        }
+        None
+    }
+}
+
+/// `RA016_STATIC_FUNCTION_ATTRIBUTE`: an attribute value the build cannot
+/// evaluate.
+///
+/// The static emitter writes one HTML string at build time, so a function value is
+/// not text, and writing the function's source into the attribute is a page whose
+/// class is `() => "hello"`. A hydrated island calls it and writes the result, so
+/// the same source would render two different attributes with nothing reported.
+/// The message names the shape the file has, because the repair differs: an inline
+/// function is deleted, a binding is replaced with a literal.
+fn static_function_attribute(span: (u32, u32), kind: FunctionValueKind) -> Diagnostic {
+    let construct = match kind {
+        FunctionValueKind::Inline => {
+            "gives an attribute an inline function value, which a \"use static\" route cannot \
+             call at build time"
+        }
+        FunctionValueKind::Binding => {
+            "gives an attribute a function value, which a \"use static\" route cannot call at \
+             build time"
+        }
+    };
+    Diagnostic::new(
+        Code::RA016,
+        span,
+        format!(
+            "{construct}: a prerendered page writes the function's own source as the attribute"
+        ),
+    )
 }
 
 /// The diagnostic, if any, for one accessor call.
@@ -1050,5 +1232,115 @@ mod tests {
         let diagnostics = check_signal_rules(program, &b);
         let span = diagnostics[0].span;
         assert_eq!(&src[span.0 as usize..span.1 as usize], "n()");
+    }
+
+    /// The `RA016` fixtures, driven through `check_static_mode` on the original
+    /// source — the same path `analyze` takes.
+    fn function_attribute_codes(src: &str) -> Vec<String> {
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        check_static_mode(crate::source::Mode::Static, program, &b)
+            .iter()
+            .filter(|d| d.code == Code::RA016)
+            .map(|d| d.code.as_str().to_string())
+            .collect()
+    }
+
+    /// The reported defect, verbatim: `const cls = () => "hello"` then
+    /// `class={cls}` in a `"use static"` route was accepted and shipped
+    /// `class="() =&gt; &quot;hello&quot;"`.
+    #[test]
+    fn a_function_valued_attribute_is_refused_in_a_static_route() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) {\n  const cls = () => \"hello\"\n  return <div class={cls}>x</div>\n}\n";
+        assert_eq!(
+            function_attribute_codes(src),
+            vec!["RA016_STATIC_FUNCTION_ATTRIBUTE"]
+        );
+    }
+
+    /// An inline function is the same value with no name to resolve, so the rule
+    /// cannot depend on finding a binding.
+    #[test]
+    fn an_inline_function_attribute_is_refused() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div class={() => \"x\"}>y</div> }\n";
+        assert_eq!(
+            function_attribute_codes(src),
+            vec!["RA016_STATIC_FUNCTION_ATTRIBUTE"]
+        );
+    }
+
+    /// A `function` declaration hoists, so it can be referred to above its
+    /// definition; the binding scan therefore cannot be source-order dependent.
+    #[test]
+    fn a_hoisted_function_binding_is_refused_too() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <div class={cls}>x</div> }\nfunction cls() { return \"a\" }\n";
+        assert_eq!(
+            function_attribute_codes(src),
+            vec!["RA016_STATIC_FUNCTION_ATTRIBUTE"]
+        );
+    }
+
+    /// The control that keeps the rule honest: every attribute form the existing
+    /// static tests cover must still pass, or the refusal has broken a legal page.
+    /// Each of these is a value the build evaluates — a string, a template with no
+    /// substitutions, numeric and boolean literals, and a plain expression naming a
+    /// local constant.
+    #[test]
+    fn legal_static_attribute_forms_are_not_refused() {
+        for body in [
+            "<div class=\"a\">x</div>",
+            "<div title={`lit`}>x</div>",
+            "<div tabindex={0}>x</div>",
+            "<div hidden={true}>x</div>",
+            "<div class={tone}>x</div>",
+            "<div data-n={n}>x</div>",
+            "<input disabled/>",
+        ] {
+            let src = format!(
+                "\"use static\"\nexport default function P(props: Record<never, never>) {{ const tone = \"warm\"; const n = 3; return {body} }}\n"
+            );
+            assert_eq!(
+                function_attribute_codes(&src),
+                Vec::<String>::new(),
+                "a legal static attribute was refused: {body}"
+            );
+        }
+    }
+
+    /// An island calls a function value through `_setAttr`, so the same source is
+    /// correct there. This is the half that must **not** be refused: refusing it
+    /// would make the framework's documented accessor pattern (`class={tone}`)
+    /// depend on the value's kind.
+    #[test]
+    fn an_island_accepts_a_function_valued_attribute() {
+        let src = "\"use island\"\nexport default function P(props: Record<never, never>) {\n  const cls = () => \"hello\"\n  return <div class={cls}>x</div>\n}\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        let diagnostics = check_static_mode(crate::source::Mode::Island, program, &b);
+        assert!(
+            diagnostics.iter().all(|d| d.code != Code::RA016),
+            "an island calls the function, so this is not a refusal: {diagnostics:?}"
+        );
+    }
+
+    /// A handler is `RA010`'s row. `RA016` must not add a second row for the same
+    /// attribute, or one root cause reports twice.
+    #[test]
+    fn a_handler_attribute_is_ra010_and_not_also_ra016() {
+        let src = "\"use static\"\nexport default function P(props: Record<never, never>) { return <button onClick={() => {}}>x</button> }\n";
+        let alloc = oxc_allocator::Allocator::default();
+        let program = parse_tsx(&alloc, src).unwrap();
+        let b = find_signal_bindings(program);
+        let diagnostics = check_static_mode(crate::source::Mode::Static, program, &b);
+        assert!(
+            diagnostics.iter().any(|d| d.code == Code::RA010),
+            "the handler is RA010: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().all(|d| d.code != Code::RA016),
+            "the handler must not also be RA016: {diagnostics:?}"
+        );
     }
 }
